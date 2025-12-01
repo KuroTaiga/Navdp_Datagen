@@ -2,7 +2,7 @@
 """Batch renderer / verifier for InteriorGS datasets.
 
 For each dataset directory (up to a limit of 100) under
-    NavDP/navdp_api/gaussian_splatting/data/InteriorGS
+    NavDP/navdp_api/gaussian_splatting/data/scenes
 the script renders an orthographic image using the Gaussian-splatting renderer
 and writes the result to
     NavDP/navdp_api/gaussian_splatting/data/results
@@ -16,6 +16,7 @@ side-by-side comparison between the occupancy map and the rendered result in
 from __future__ import annotations
 
 import json
+import math
 import os
 from argparse import ArgumentParser
 from pathlib import Path
@@ -28,12 +29,18 @@ import torch
 from arguments import PipelineParams
 from gaussian_renderer import render_or
 from scene import GaussianModel
+from scene.cameras import MiniCam
+from utils.graphics_utils import getProjectionMatrix
 
 
 BASE_DIR = Path(__file__).resolve().parent
-INTERIOR_GS_DIR = BASE_DIR / "data" / "InteriorGS"
+INTERIOR_GS_DIR = BASE_DIR / "data" / "scenes"
 RESULTS_DIR = BASE_DIR / "data" / "results"
 VERIFICATION_DIR = BASE_DIR / "data" / "verification"
+VIDEO_FRAMES_DIR = BASE_DIR / "data" / "video_frames"
+DEFAULT_VIDEO_STEP_DEG = 10
+DEFAULT_VIDEO_FOV_DEG = 60.0
+VIDEO_FRAME_RESOLUTION = 100
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
@@ -130,6 +137,147 @@ class OrthoMiniCam:
         return self._half_width, self._half_height, self.full_proj_transform
 
 
+def _generate_video_angles(step_deg: int) -> list[tuple[int, int]]:
+    frames: list[tuple[int, int]] = []
+    for pitch in range(180, 90 - step_deg, -step_deg):
+        frames.append((pitch, 0))
+    for yaw in range(step_deg, 360 + step_deg, step_deg):
+        frames.append((90, yaw))
+    return frames
+
+
+def _rotation_y(angle: float) -> np.ndarray:
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return np.array(
+        [
+            [c, 0.0, s],
+            [0.0, 1.0, 0.0],
+            [-s, 0.0, c],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _rotation_z(angle: float) -> np.ndarray:
+    c = math.cos(angle)
+    s = math.sin(angle)
+    return np.array(
+        [
+            [c, -s, 0.0],
+            [s, c, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _compose_view_matrix(position: np.ndarray, rotation: np.ndarray) -> np.ndarray:
+    view = np.eye(4, dtype=np.float32)
+    rot_t = rotation.transpose()
+    view[:3, :3] = rot_t
+    view[:3, 3] = -rot_t @ position
+    return view
+
+
+def render_video_frames(
+    dataset_name: str,
+    meta: dict,
+    gaussians: GaussianModel,
+    pipeline: PipelineParams,
+    device: torch.device,
+    bg_color: torch.Tensor,
+    *,
+    step_deg: int = DEFAULT_VIDEO_STEP_DEG,
+    fov_deg: float = DEFAULT_VIDEO_FOV_DEG,
+) -> None:
+    width = meta["width"]
+    height = meta["height"]
+    left_world = meta["left"]
+    right_world = meta["right"]
+    top_world = meta["top"]
+    bottom_world = meta["bottom"]
+    lower_z = meta["lower_z"]
+    upper_z = meta["upper_z"]
+
+    cx = (left_world + right_world) * 0.5
+    cy = (top_world + bottom_world) * 0.5
+    cz = upper_z + 1.0
+    camera_pos = np.array([cx, cy, cz], dtype=np.float32)
+
+    span_xy = max(right_world - left_world, top_world - bottom_world)
+    span_z = max(upper_z - lower_z, 0.0)
+    extent = max(span_xy, span_z, 1.0)
+    znear = 0.01
+    zfar = extent * 4.0
+
+    frame_width = VIDEO_FRAME_RESOLUTION
+    frame_height = VIDEO_FRAME_RESOLUTION
+
+    fovy = math.radians(fov_deg)
+    aspect = max(frame_width / frame_height, 1e-6)
+    fovx = 2.0 * math.atan(math.tan(fovy * 0.5) * aspect)
+
+    frames_dir = VIDEO_FRAMES_DIR / dataset_name
+    frames_dir.mkdir(parents=True, exist_ok=True)
+
+    frame_params = _generate_video_angles(step_deg)
+    if not frame_params:
+        return
+
+    print(
+        f"    Rendering video frames ({len(frame_params)} frames, step {step_deg}°)…",
+        flush=True,
+    )
+
+    projection_matrix = getProjectionMatrix(
+        znear=znear,
+        zfar=zfar,
+        fovX=fovx,
+        fovY=fovy,
+    ).to(device).transpose(0, 1)
+
+    for idx, (pitch_deg, yaw_deg) in enumerate(frame_params, start=1):
+        pitch_rad = math.radians(pitch_deg)
+        yaw_rad = math.radians(yaw_deg)
+
+        rotation = _rotation_z(yaw_rad) @ _rotation_y(pitch_rad)
+        view_np = _compose_view_matrix(camera_pos, rotation)
+        world_view_transform = torch.from_numpy(view_np).to(device).transpose(0, 1)
+        full_proj_transform = (
+            world_view_transform.unsqueeze(0) @ projection_matrix.unsqueeze(0)
+        ).squeeze(0)
+
+        camera = MiniCam(
+            width=frame_width,
+            height=frame_height,
+            fovy=fovy,
+            fovx=fovx,
+            znear=znear,
+            zfar=zfar,
+            world_view_transform=world_view_transform,
+            full_proj_transform=full_proj_transform,
+        )
+
+        img_pkg = render_or(
+            camera,
+            gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=False,
+        )
+
+        render = img_pkg["render"].detach().cpu().numpy()
+        render_uint8 = (
+            np.clip(render, 0.0, 1.0) * 255.0
+        ).astype(np.uint8).transpose(1, 2, 0)
+        render_uint8 = np.rot90(render_uint8, k=-1)
+
+        frame_path = frames_dir / f"frame_{idx:03d}_pitch{pitch_deg:03d}_yaw{yaw_deg:03d}.png"
+        imageio.imwrite(frame_path, render_uint8)
+
+    print(f"    Video frames saved to {frames_dir}", flush=True)
+
 def find_ply_file(dataset_dir: Path) -> Path:
     """Return the first plausible .ply file inside the dataset directory."""
 
@@ -220,11 +368,21 @@ def render_dataset(
     img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color, orthographic=True)
     rendered = img_pkg["render"].detach().cpu().numpy()
     render_uint8 = (np.clip(rendered, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+    render_uint8 = np.rot90(render_uint8, k=-1)
 
     dataset_name = dataset_dir.name
     results_dir.mkdir(parents=True, exist_ok=True)
     render_path = results_dir / f"{dataset_name}.png"
     imageio.imwrite(render_path, render_uint8)
+
+    render_video_frames(
+        dataset_name,
+        meta,
+        gaussians,
+        pipeline,
+        device,
+        bg_color,
+    )
 
     if not verification:
         return
@@ -235,6 +393,7 @@ def render_dataset(
     occ_for_concat = occ_img
     if occ_for_concat.ndim == 2:
         occ_for_concat = np.stack([occ_for_concat] * 3, axis=-1)
+    occ_for_concat = np.rot90(occ_for_concat, k=-1)
     if occ_for_concat.shape[0] != render_uint8.shape[0] or occ_for_concat.shape[1] != render_uint8.shape[1]:
         raise ValueError(
             f"Dimension mismatch for {dataset_name}: occupancy {occ_for_concat.shape[:2]}, render {render_uint8.shape[:2]}"

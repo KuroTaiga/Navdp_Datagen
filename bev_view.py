@@ -280,7 +280,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render top-down image from Gaussian point cloud.")
     parser.add_argument("--in_pcd", required=True, help="Input point-cloud path (.ply / .npy).")
     parser.add_argument("--out_img", required=True, help="Output PNG path.")
-    parser.add_argument("--res", type=int, nargs=2, default=(345, 312), metavar=("W", "H"),
+    parser.add_argument("--res", type=int, nargs=2, default=(690,624), metavar=("W", "H"),
                         help="Image resolution (width height).")
     parser.add_argument("--size", type=float, default=1.5, help="Dot size.")
     parser.add_argument("--up_axis", choices=["y", "z"], default="z",

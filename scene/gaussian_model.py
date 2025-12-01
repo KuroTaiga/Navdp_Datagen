@@ -410,7 +410,7 @@ class GaussianModel:
             opacity_tensor = self.inverse_opacity_activation(alpha_tensor)
 
             colors_tensor = torch.tensor(colors, dtype=torch.float, device="cuda")
-            colors_tensor = torch.clamp(colors_tensor, 0.0, 1.0)
+            # colors_tensor = torch.clamp(colors_tensor, 0.0, 1.0)
             features_dc = RGB2SH(colors_tensor).unsqueeze(-1)
 
             if features_extra.shape[2] > 0:
