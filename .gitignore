@@ -10,4 +10,5 @@ screenshots
 *.gif
 *.ply
 *.log
-assets/
+*.svg
+storage_remote_config.sh

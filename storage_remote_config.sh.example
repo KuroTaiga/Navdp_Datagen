@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Copy this file to storage_remote_config.sh (same directory) and adjust values.
+# The gitignore already excludes the real file so credentials stay local.
+
+# Remote SSH target (user@host or host from ~/.ssh/config).
+REMOTE_SSH_TARGET="lenovo@192.168.151.40"
+
+# Directory root on the remote training PC where results will be synced.
+# Each runner appends its output folder name automatically.
+REMOTE_OUTPUT_DIR="/mnt/DATA/navdp"
+
+# Optional: SSH private key path (recommended instead of passwords).
+# REMOTE_SSH_KEY="$HOME/.ssh/id_ed25519_navdp"
+
+# Optional: Non-default SSH port.
+# REMOTE_SSH_PORT=22
+
+# Optional: Extra rsync flags (quoted string).
+# REMOTE_RSYNC_EXTRA_OPTS="--bwlimit=100m"
