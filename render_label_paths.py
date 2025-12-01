@@ -20,6 +20,7 @@ import json
 import math
 from argparse import ArgumentParser, BooleanOptionalAction
 from dataclasses import dataclass
+from collections import defaultdict
 from pathlib import Path
 from typing import Sequence, TextIO
 

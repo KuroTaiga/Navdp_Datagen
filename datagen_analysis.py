@@ -6,18 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
-import os
 
+from analysis_utils import (
+    DEFAULT_TASKS_DIR,
+    FRAME_STEP_WORLD,
+    FRAME_THRESHOLDS,
+    describe,
+    resolve_label_directory,
+)
 
-_MPL_CACHE = Path(__file__).resolve().parent / ".matplotlib-cache"
-_MPL_CACHE.mkdir(parents=True, exist_ok=True)
-os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CACHE))
 
 try:  # matplotlib is only needed for chart generation
     import matplotlib
@@ -31,9 +32,6 @@ except Exception:  # pragma: no cover - matplotlib is optional
     _HAVE_MPL = False
 
 
-DEFAULT_TASKS_DIR = Path(__file__).resolve().parent / "data" / "selected_33w"
-
-
 @dataclass(frozen=True)
 class PathMetrics:
     scene_id: str
@@ -45,52 +43,7 @@ class PathMetrics:
     raster_steps: int | None
     displacement: float
     tortuosity: float | None
-
-
-def resolve_label_directory(scene_dir: Path) -> Path | None:
-    """Mirror the logic used in render_label_paths.py."""
-
-    label_dir = scene_dir / "label_paths"
-    if label_dir.is_dir():
-        return label_dir
-    if scene_dir.is_dir() and any(scene_dir.glob("*.json")):
-        return scene_dir
-    return None
-
-
-def _percentile(sorted_vals: Sequence[float], q: float) -> float | None:
-    if not sorted_vals:
-        return None
-    if len(sorted_vals) == 1:
-        return float(sorted_vals[0])
-    pos = (len(sorted_vals) - 1) * q
-    lower = math.floor(pos)
-    upper = math.ceil(pos)
-    if lower == upper:
-        return float(sorted_vals[int(pos)])
-    lower_val = sorted_vals[lower]
-    upper_val = sorted_vals[upper]
-    fraction = pos - lower
-    return float(lower_val + (upper_val - lower_val) * fraction)
-
-
-def describe(values: Iterable[float]) -> dict:
-    seq = [float(v) for v in values if v is not None]
-    if not seq:
-        return {"count": 0}
-    sorted_seq = sorted(seq)
-    result = {
-        "count": len(sorted_seq),
-        "min": float(sorted_seq[0]),
-        "max": float(sorted_seq[-1]),
-        "mean": statistics.fmean(sorted_seq),
-        "median": statistics.median(sorted_seq),
-        "p10": _percentile(sorted_seq, 0.10),
-        "p90": _percentile(sorted_seq, 0.90),
-    }
-    if len(sorted_seq) > 1:
-        result["stddev"] = statistics.pstdev(sorted_seq)
-    return result
+    estimated_frames: float
 
 
 def load_path_metrics(scene_id: str, json_path: Path) -> PathMetrics | None:
@@ -117,6 +70,7 @@ def load_path_metrics(scene_id: str, json_path: Path) -> PathMetrics | None:
     )
     displacement = math.hypot(coords[-1][0] - coords[0][0], coords[-1][1] - coords[0][1])
     tortuosity = (path_length / displacement) if displacement > 0 else None
+    estimated_frames = path_length / FRAME_STEP_WORLD if FRAME_STEP_WORLD > 0 else float("nan")
 
     raster_steps = None
     raster_pixels = path_section.get("raster_pixel")
@@ -137,6 +91,7 @@ def load_path_metrics(scene_id: str, json_path: Path) -> PathMetrics | None:
         raster_steps=raster_steps,
         displacement=displacement,
         tortuosity=tortuosity,
+        estimated_frames=estimated_frames,
     )
 
 
@@ -147,6 +102,7 @@ def build_charts(
     scene_summaries: list[dict],
     top_scenes: int,
     hist_bins: int,
+    frame_thresholds: dict[int, float],
 ) -> dict[str, str]:
     if not _HAVE_MPL:
         return {}
@@ -161,6 +117,16 @@ def build_charts(
         plt.title("Path length distribution")
         plt.xlabel("Path length (world units)")
         plt.ylabel("Count")
+        for frames, threshold_len in sorted(frame_thresholds.items()):
+            plt.axvline(
+                threshold_len,
+                color="#ef4444",
+                linestyle="--",
+                linewidth=1.2,
+                label=f">= {frames} frames",
+            )
+        if frame_thresholds:
+            plt.legend(loc="upper right")
         plt.grid(alpha=0.2, linestyle="--")
         hist_path = charts_dir / "path_length_histogram.png"
         plt.tight_layout()
@@ -288,6 +254,10 @@ def main() -> None:
         displacements = [item.displacement for item in scene_paths]
         raster_steps = [item.raster_steps for item in scene_paths if item.raster_steps is not None]
         tortuosity = [item.tortuosity for item in scene_paths if item.tortuosity is not None]
+        thresholds_map: dict[str, int] = {}
+        for frames in FRAME_THRESHOLDS:
+            length_threshold = frames * FRAME_STEP_WORLD
+            thresholds_map[str(frames)] = sum(1 for item in scene_paths if item.path_length >= length_threshold)
         summary = {
             "scene_id": scene_id,
             "path_count": len(scene_paths),
@@ -295,6 +265,7 @@ def main() -> None:
             "displacement_stats": describe(displacements),
             "raster_step_stats": describe(raster_steps),
             "tortuosity_stats": describe(tortuosity),
+            "paths_ge_frames": thresholds_map,
         }
         scene_summaries.append(summary)
 
@@ -302,6 +273,22 @@ def main() -> None:
     displacements_all = [item.displacement for item in path_records]
     raster_steps_all = [item.raster_steps for item in path_records if item.raster_steps is not None]
     tortuosity_all = [item.tortuosity for item in path_records if item.tortuosity is not None]
+
+    frame_threshold_details: list[dict] = []
+    frame_threshold_len_map: dict[int, float] = {}
+    for frames in FRAME_THRESHOLDS:
+        threshold_len = frames * FRAME_STEP_WORLD
+        frame_threshold_len_map[frames] = threshold_len
+        total_paths_ge = sum(1 for item in path_records if item.path_length >= threshold_len)
+        per_scene_counts = [summary["paths_ge_frames"].get(str(frames), 0) for summary in scene_summaries]
+        frame_threshold_details.append(
+            {
+                "frames": frames,
+                "min_length_world": threshold_len,
+                "total_paths": total_paths_ge,
+                "per_scene_stats": describe(per_scene_counts),
+            }
+        )
 
     analysis = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -315,6 +302,7 @@ def main() -> None:
         "overall_tortuosity_stats": describe(tortuosity_all),
         "scene_path_count_stats": describe([entry["path_count"] for entry in scene_summaries]),
         "per_scene": scene_summaries,
+        "frame_thresholds": frame_threshold_details,
         "failures": failures,
     }
 
@@ -348,6 +336,7 @@ def main() -> None:
         scene_summaries=scene_summaries,
         top_scenes=args.top_scenes,
         hist_bins=args.hist_bins,
+        frame_thresholds=frame_threshold_len_map,
     )
     analysis["charts"] = charts
 
@@ -384,6 +373,22 @@ def main() -> None:
                 max=fmt_stat("max", length_stats),
             )
         )
+    for threshold_entry in analysis["frame_thresholds"]:
+        stats = threshold_entry["per_scene_stats"]
+        if stats.get("count", 0) == 0:
+            continue
+        print(
+            "Paths >= {frames} frames (~{length:.2f} units) -> total={total}, min={min}, mid={median}, ave={mean}, max={max}".format(
+                frames=threshold_entry["frames"],
+                length=threshold_entry["min_length_world"],
+                total=threshold_entry["total_paths"],
+                min=fmt_stat("min", stats),
+                median=fmt_stat("median", stats),
+                mean=fmt_stat("mean", stats),
+                max=fmt_stat("max", stats),
+            )
+        )
+
     if charts:
         print("Charts written to: ")
         for label, path in charts.items():
