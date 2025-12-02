@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -180,6 +181,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Plan jobs and write the report but skip spawning render_label_paths.py.",
     )
+    parser.add_argument(
+        "--skip-completed-log",
+        type=Path,
+        default=None,
+        help="Optional log whose [SUCCESS] entries list scene/actor pairs that have already completed.",
+    )
     return parser.parse_args()
 
 
@@ -321,6 +328,22 @@ def build_job_plans(tasks: Sequence[LabelTask]) -> list[JobPlan]:
             )
         )
     return plans
+
+
+SUCCESS_LINE_RE = re.compile(r"\[SUCCESS\]\s+scene=(?P<scene>\S+)\s+actor=(?P<actor>\S+)")
+
+
+def load_completed_jobs_from_log(log_path: Path) -> set[tuple[str, str]]:
+    if not log_path.is_file():
+        raise FileNotFoundError(f"Resume log not found: {log_path}")
+    completed: set[tuple[str, str]] = set()
+    with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
+        for raw_line in handle:
+            match = SUCCESS_LINE_RE.search(raw_line)
+            if not match:
+                continue
+            completed.add((match.group("scene"), match.group("actor")))
+    return completed
 
 
 def filter_tasks_by_scene_shard(
@@ -511,6 +534,21 @@ def main() -> None:
 
     plans = build_job_plans(tasks)
     plans.sort(key=lambda p: (p.scene, p.actor_id))
+    skipped_jobs_from_log = 0
+    if args.skip_completed_log is not None:
+        completed_pairs = load_completed_jobs_from_log(args.skip_completed_log)
+        if completed_pairs:
+            before = len(plans)
+            plans = [plan for plan in plans if (plan.scene, plan.actor_id) not in completed_pairs]
+            skipped_jobs_from_log = before - len(plans)
+            print(
+                f"[RESUME] Loaded {len(completed_pairs)} completed jobs from {args.skip_completed_log}.",
+                flush=True,
+            )
+            if skipped_jobs_from_log:
+                print(f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.", flush=True)
+        else:
+            print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
     print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
 
     results: list[dict] = []
@@ -573,6 +611,8 @@ def main() -> None:
         "executed_jobs": sum(1 for r in results if r["status"] not in ("dry-run",)),
         "successful_jobs": sum(1 for r in results if r["status"] == "success"),
         "failed_jobs": sum(1 for r in results if r["status"] == "failed"),
+        "skip_completed_log": str(args.skip_completed_log) if args.skip_completed_log else None,
+        "jobs_skipped_via_log": skipped_jobs_from_log,
         "path_assignments": [
             {
                 "scene": task.assignment.scene,

@@ -4,6 +4,47 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/storage_targets.sh"
 
+PYTHON_BIN=${PYTHON_BIN:-python3}
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN=python
+  else
+    echo "[ERROR] python3 is required but was not found in PATH." >&2
+    exit 1
+  fi
+fi
+
+show_usage_and_exit() {
+  echo "Usage: $(basename "$0") [RESUME <log-file>]" >&2
+  exit 1
+}
+
+RESUME_MODE=false
+RESUME_LOG_PATH=""
+if [ $# -gt 0 ]; then
+  if [ "$1" = "RESUME" ]; then
+    RESUME_MODE=true
+    shift
+    if [ $# -lt 1 ]; then
+      echo "[RESUME] ERROR: log file path missing." >&2
+      show_usage_and_exit
+    fi
+    RESUME_LOG_PATH="$1"
+    shift
+  else
+    echo "[ERROR] Unknown argument: $1" >&2
+    show_usage_and_exit
+  fi
+fi
+if [ $# -gt 0 ]; then
+  echo "[ERROR] Unexpected arguments: $*" >&2
+  show_usage_and_exit
+fi
+
+abspath() {
+  "$PYTHON_BIN" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
+}
+
 # Storage toggles (set env vars to true/false/yes/no)
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
@@ -31,8 +72,108 @@ REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
-WORKERS=${WORKERS:-3}
+WORKERS=${WORKERS:-6}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
+RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-4}
+if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
+  echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
+  exit 1
+fi
+
+VRAM_RESERVATION_PID=""
+reserve_vram() {
+  local reserve_gb="$1"
+  if [ -z "$reserve_gb" ]; then
+    return
+  fi
+  local bytes=$((reserve_gb * 1024 * 1024 * 1024))
+  if [ "$bytes" -le 0 ]; then
+    return
+  fi
+  echo "[VRAM] Reserving approximately ${reserve_gb} GiB of GPU memory (set RESERVE_VRAM_GB=0 to disable)."
+  RESERVE_VRAM_BYTES="$bytes" conda run --no-capture-output -n "$CONDA_ENV" python - <<'PY' &
+import os
+import sys
+import time
+
+try:
+    import torch
+except Exception as exc:  # pylint: disable=broad-except
+    print(f"[VRAM] ERROR: Unable to import torch: {exc}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+target_bytes = int(os.environ.get("RESERVE_VRAM_BYTES", "0"))
+if target_bytes <= 0:
+    sys.exit(0)
+
+device = torch.device("cuda")
+tensors = []
+float_elems = target_bytes // 4
+if float_elems:
+    tensors.append(torch.empty((float_elems,), dtype=torch.float32, device=device))
+remainder = target_bytes % 4
+if remainder:
+    tensors.append(torch.empty((remainder,), dtype=torch.uint8, device=device))
+
+reserved = sum(t.element_size() * t.numel() for t in tensors)
+dev_index = torch.cuda.current_device()
+dev_name = torch.cuda.get_device_name(dev_index)
+print(f"[VRAM] Reserved {reserved / (1024 ** 3):.2f} GiB on cuda:{dev_index} ({dev_name}).", flush=True)
+try:
+    while True:
+        time.sleep(30)
+except KeyboardInterrupt:
+    pass
+PY
+  VRAM_RESERVATION_PID=$!
+  sleep 1
+  if ! kill -0 "$VRAM_RESERVATION_PID" >/dev/null 2>&1; then
+    echo "[VRAM] ERROR: Failed to start reservation helper." >&2
+    exit 1
+  fi
+}
+
+release_vram() {
+  if [ -n "$VRAM_RESERVATION_PID" ]; then
+    kill "$VRAM_RESERVATION_PID" >/dev/null 2>&1 || true
+    wait "$VRAM_RESERVATION_PID" >/dev/null 2>&1 || true
+    echo "[VRAM] Released reserved GPU memory."
+    VRAM_RESERVATION_PID=""
+  fi
+}
+
+trap release_vram EXIT
+
+RESUME_LOG_ABS=""
+if $RESUME_MODE; then
+  RESUME_LOG_ABS=$(abspath "$RESUME_LOG_PATH")
+  if [ ! -f "$RESUME_LOG_ABS" ]; then
+    echo "[RESUME] ERROR: Log file not found: $RESUME_LOG_PATH" >&2
+    exit 1
+  fi
+  manifest_line=$(grep -m1 "Assignment manifest generated at" "$RESUME_LOG_ABS" || true)
+  if [ -z "$manifest_line" ]; then
+    echo "[RESUME] ERROR: Could not locate assignment manifest line in $RESUME_LOG_PATH" >&2
+    exit 1
+  fi
+  resume_manifest_path="${manifest_line#*Assignment manifest generated at }"
+  resume_manifest_path="${resume_manifest_path%% *}"
+  if [ -z "$resume_manifest_path" ]; then
+    echo "[RESUME] ERROR: Failed to parse assignment manifest path from log." >&2
+    exit 1
+  fi
+  if [[ "$resume_manifest_path" != /* ]]; then
+    resume_manifest_path="${resume_manifest_path#./}"
+    resume_manifest_path="${SCRIPT_DIR}/${resume_manifest_path}"
+  fi
+  ASSIGNMENTS_OUT=$(abspath "$resume_manifest_path")
+  if [ ! -f "$ASSIGNMENTS_OUT" ]; then
+    echo "[RESUME] ERROR: Assignment manifest missing: $ASSIGNMENTS_OUT" >&2
+    exit 1
+  fi
+  echo "[RESUME] Using manifest $ASSIGNMENTS_OUT (derived from $RESUME_LOG_PATH)"
+  CLEAR_LOCAL_OUTPUT_DIR=false
+fi
 
 ensure_writable_dir() {
   local target="$1"
@@ -75,15 +216,23 @@ echo "[CONFIG] ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE}"
 echo "[CONFIG] ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE}"
 echo "[CONFIG] ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE}"
 
-echo "[RUN] Random human data generation, seed ${SEED}"
-conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
-  --actor-root "${ACTOR_ROOT}" \
-  --ban-list "${BAN_LIST}" \
-  --assignments-out "${ASSIGNMENTS_OUT}" \
-  --scenes-dir "${SCENES_DIR}" \
-  --tasks-dir "${TASKS_DIR}" \
-  --seed "${SEED}"
-echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
+if [ "$RESERVE_VRAM_GB" -gt 0 ]; then
+  reserve_vram "$RESERVE_VRAM_GB"
+fi
+
+if $RESUME_MODE; then
+  echo "[RESUME] Skipping assignment generation and reusing ${ASSIGNMENTS_OUT}"
+else
+  echo "[RUN] Random human data generation, seed ${SEED}"
+  conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
+    --actor-root "${ACTOR_ROOT}" \
+    --ban-list "${BAN_LIST}" \
+    --assignments-out "${ASSIGNMENTS_OUT}" \
+    --scenes-dir "${SCENES_DIR}" \
+    --tasks-dir "${TASKS_DIR}" \
+    --seed "${SEED}"
+  echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
+fi
 
 render_extra_snippets=(
   "--overwrite --stabilize --gpu-only --show-BEV --no-rgb-frames --navdp-ply-per-scene"
@@ -101,6 +250,9 @@ parallel_cmd=(
   --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
 )
+if [ -n "$RESUME_LOG_ABS" ]; then
+  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_ABS")
+fi
 for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")
 done
