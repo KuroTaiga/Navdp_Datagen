@@ -31,7 +31,7 @@ REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
-WORKERS=${WORKERS:-6}
+WORKERS=${WORKERS:-3}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 
 ensure_writable_dir() {
@@ -105,7 +105,14 @@ for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")
 done
 
+render_status=0
+set +e
 "${parallel_cmd[@]}"
+render_status=$?
+set -e
+if [ $render_status -ne 0 ]; then
+  echo "[WARN] parallel_render_paths.py exited with status ${render_status}, continuing per request."
+fi
 
 if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
   storage_sync_remote "$OUTPUT_DIR" "$REMOTE_TARGET_DIR"
@@ -117,3 +124,5 @@ if ! storage_bool_true "$ENABLE_LOCAL_STORAGE"; then
     rm -rf "$OUTPUT_DIR"
   fi
 fi
+
+exit $render_status

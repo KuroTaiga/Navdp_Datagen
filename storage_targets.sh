@@ -86,14 +86,14 @@ storage_sync_remote() {
   fi
   local ssh_cmd=()
   storage_make_ssh_cmd ssh_cmd || return 1
-  local ssh_cmd_str
-  ssh_cmd_str=$(_storage_join_cmd "${ssh_cmd[@]}")
+  local ssh_base_cmd=("${ssh_cmd[@]:0:${#ssh_cmd[@]}-1}")
+  local ssh_base_str
+  ssh_base_str=$(_storage_join_cmd "${ssh_base_cmd[@]}")
   local remote_path_cmd="mkdir -p $(printf '%q' "$remote_dir") && rsync"
 
   echo "[STORAGE] Syncing ${source_dir} -> ${remote_host}:${remote_dir} via rsync ..."
-  local -a rsync_cmd=(rsync -az --partial --inplace --info=stats2,progress2)
+  local -a rsync_cmd=(-az --partial --inplace --info=stats2,progress2 -e "$ssh_base_str")
   if [ -n "${REMOTE_RSYNC_EXTRA_OPTS:-}" ]; then
-    # shellcheck disable=SC2206
     local -a extra_opts=(${REMOTE_RSYNC_EXTRA_OPTS})
     rsync_cmd+=("${extra_opts[@]}")
   fi
@@ -102,7 +102,7 @@ storage_sync_remote() {
     "${source_dir}/"
     "${remote_host}:${remote_dir}/"
   )
-  RSYNC_RSH="$ssh_cmd_str" "${rsync_cmd[@]}"
+  rsync "${rsync_cmd[@]}"
 }
 
 storage_test_remote_connection() {
@@ -120,4 +120,51 @@ storage_test_remote_connection() {
   storage_make_ssh_cmd ssh_cmd || return 1
   echo "[STORAGE] Probing remote ${remote_host}:${remote_dir} ..."
   "${ssh_cmd[@]}" "mkdir -p $(printf '%q' "$remote_dir") && echo '[STORAGE] Remote path ready: ${remote_dir}'"
+}
+
+storage_measure_transfer_speed() {
+  local direction="$1"
+  local remote_dir="$2"
+  local size_mb="${3:-100}"
+  local block_size=$((1024 * 1024))
+  local tmp_file
+  tmp_file=$(mktemp "${TMPDIR:-/tmp}/storage_speed.XXXXXX")
+  dd if=/dev/urandom of="$tmp_file" bs=$block_size count="$size_mb" status=none
+
+  local remote_host="${REMOTE_SSH_TARGET:-}"
+  if [ -z "$remote_host" ]; then
+    echo "[STORAGE] ERROR: REMOTE_SSH_TARGET is not set." >&2
+    rm -f "$tmp_file"
+    return 1
+  fi
+
+  local ssh_cmd=()
+  storage_make_ssh_cmd ssh_cmd || { rm -f "$tmp_file"; return 1; }
+  local ssh_base_cmd=("${ssh_cmd[@]:0:${#ssh_cmd[@]}-1}")
+  local ssh_base_str
+  ssh_base_str=$(_storage_join_cmd "${ssh_base_cmd[@]}")
+  local remote_file="${remote_dir%/}/storage_speed_test.bin"
+
+  local start end duration speed
+  if [[ "$direction" == "upload" ]]; then
+    echo "[STORAGE] Measuring upload speed to ${remote_host}:${remote_file}"
+    "${ssh_cmd[@]}" "mkdir -p $(printf '%q' "${remote_dir}")"
+    start=$(date +%s.%N)
+    rsync -az --info=stats2 -e "$ssh_base_str" "$tmp_file" "${remote_host}:${remote_file}"
+    end=$(date +%s.%N)
+  else
+    echo "[STORAGE] Measuring download speed from ${remote_host}:${remote_file}"
+    "${ssh_cmd[@]}" "mkdir -p $(printf '%q' "${remote_dir}") && dd if=/dev/urandom of=$(printf '%q' "${remote_file}") bs=$block_size count=$size_mb status=none"
+    local local_copy="${tmp_file}.dl"
+    start=$(date +%s.%N)
+    rsync -az --info=stats2 -e "$ssh_base_str" "${remote_host}:${remote_file}" "$local_copy"
+    end=$(date +%s.%N)
+    rm -f "$local_copy"
+  fi
+
+  duration=$(python3 -c "import sys; start=float(sys.argv[1]); end=float(sys.argv[2]); print(max(1e-7, end-start))" "$start" "$end")
+  speed=$(python3 -c "import sys; size=float(sys.argv[1]); duration=float(sys.argv[2]); print(size/duration)" "$size_mb" "$duration")
+  echo "[STORAGE] ${direction} speed: ${size_mb}MB in ${duration}s -> ${speed} MB/s"
+  "${ssh_cmd[@]}" "rm -f $(printf '%q' "${remote_file}")" || true
+  rm -f "$tmp_file"
 }
