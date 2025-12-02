@@ -92,7 +92,18 @@ storage_sync_remote() {
   local remote_path_cmd="mkdir -p $(printf '%q' "$remote_dir") && rsync"
 
   echo "[STORAGE] Syncing ${source_dir} -> ${remote_host}:${remote_dir} via rsync ..."
-  local -a rsync_cmd=(-az --partial --inplace --info=stats2,progress2 -e "$ssh_base_str")
+  local info_flags="${REMOTE_RSYNC_INFO:-stats1}"
+  if storage_bool_true "${REMOTE_RSYNC_PROGRESS:-false}"; then
+    if [ -n "$info_flags" ]; then
+      info_flags+=",progress2"
+    else
+      info_flags="progress2"
+    fi
+  fi
+  local -a rsync_cmd=(-az --partial --inplace -e "$ssh_base_str")
+  if [ -n "$info_flags" ]; then
+    rsync_cmd+=(--info="${info_flags}")
+  fi
   if [ -n "${REMOTE_RSYNC_EXTRA_OPTS:-}" ]; then
     local -a extra_opts=(${REMOTE_RSYNC_EXTRA_OPTS})
     rsync_cmd+=("${extra_opts[@]}")

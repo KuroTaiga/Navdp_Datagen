@@ -330,20 +330,30 @@ def build_job_plans(tasks: Sequence[LabelTask]) -> list[JobPlan]:
     return plans
 
 
-SUCCESS_LINE_RE = re.compile(r"\[SUCCESS\]\s+scene=(?P<scene>\S+)\s+actor=(?P<actor>\S+)")
+RESUME_STATUS_RE = re.compile(
+    r"\[(?P<status>SUCCESS|FAILED)\]\s+scene=(?P<scene>\S+)\s+actor=(?P<actor>\S+)"
+)
 
 
-def load_completed_jobs_from_log(log_path: Path) -> set[tuple[str, str]]:
+def load_resume_statuses_from_log(log_path: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     if not log_path.is_file():
         raise FileNotFoundError(f"Resume log not found: {log_path}")
     completed: set[tuple[str, str]] = set()
+    failed: set[tuple[str, str]] = set()
     with log_path.open("r", encoding="utf-8", errors="ignore") as handle:
         for raw_line in handle:
-            match = SUCCESS_LINE_RE.search(raw_line)
+            match = RESUME_STATUS_RE.search(raw_line)
             if not match:
                 continue
-            completed.add((match.group("scene"), match.group("actor")))
-    return completed
+            key = (match.group("scene"), match.group("actor"))
+            status = match.group("status")
+            if status == "SUCCESS":
+                completed.add(key)
+                failed.discard(key)
+            else:
+                if key not in completed:
+                    failed.add(key)
+    return completed, failed
 
 
 def filter_tasks_by_scene_shard(
@@ -536,7 +546,7 @@ def main() -> None:
     plans.sort(key=lambda p: (p.scene, p.actor_id))
     skipped_jobs_from_log = 0
     if args.skip_completed_log is not None:
-        completed_pairs = load_completed_jobs_from_log(args.skip_completed_log)
+        completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
         if completed_pairs:
             before = len(plans)
             plans = [plan for plan in plans if (plan.scene, plan.actor_id) not in completed_pairs]
@@ -549,6 +559,11 @@ def main() -> None:
                 print(f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.", flush=True)
         else:
             print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
+        if failed_pairs:
+            print(
+                f"[RESUME] {len(failed_pairs)} jobs recorded as FAILED in the log will be retried.",
+                flush=True,
+            )
     print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
 
     results: list[dict] = []

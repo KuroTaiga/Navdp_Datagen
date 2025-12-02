@@ -82,9 +82,10 @@ REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
+REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
 WORKERS=${WORKERS:-3}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
-RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-4}
+RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
 if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
   echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
@@ -204,8 +205,86 @@ release_vram() {
   fi
 }
 
-# Always tear down the VRAM hog helper even on errors.
-trap release_vram EXIT
+REMOTE_SYNC_WORKER_PID=""
+REMOTE_SYNC_DONE_FILE=""
+
+remote_sync_worker_loop() {
+  local source_dir="$1"
+  local remote_dir="$2"
+  local done_flag="$3"
+  local interval_secs="$4"
+  if [ -z "$interval_secs" ] || [ "$interval_secs" -le 0 ]; then
+    interval_secs=60
+  fi
+  echo "[STORAGE] Remote sync worker started for ${source_dir} -> ${REMOTE_SSH_TARGET:-?}:${remote_dir} (interval ${interval_secs}s)"
+  local iteration=0
+  while true; do
+    iteration=$((iteration + 1))
+    storage_sync_remote "$source_dir" "$remote_dir"
+    local sync_status=$?
+    if [ $sync_status -ne 0 ]; then
+      echo "[STORAGE] WARN: Remote sync worker pass ${iteration} failed with status ${sync_status}." >&2
+    fi
+    if [ -f "$done_flag" ] && [ $sync_status -eq 0 ]; then
+      echo "[STORAGE] Remote sync worker confirmed final sync after ${iteration} pass(es)."
+      break
+    fi
+    sleep "$interval_secs"
+  done
+  echo "[STORAGE] Remote sync worker exiting."
+}
+
+start_remote_sync_worker() {
+  local source_dir="$1"
+  local remote_dir="$2"
+  local interval_secs="$3"
+  REMOTE_SYNC_DONE_FILE=$(mktemp "${TMPDIR:-/tmp}/remote_sync_done.XXXXXX") || return 1
+  rm -f "$REMOTE_SYNC_DONE_FILE"
+  remote_sync_worker_loop "$source_dir" "$remote_dir" "$REMOTE_SYNC_DONE_FILE" "$interval_secs" &
+  REMOTE_SYNC_WORKER_PID=$!
+}
+
+signal_remote_sync_completion() {
+  if [ -n "$REMOTE_SYNC_DONE_FILE" ]; then
+    : > "$REMOTE_SYNC_DONE_FILE"
+  fi
+}
+
+wait_remote_sync_worker() {
+  if [ -n "$REMOTE_SYNC_WORKER_PID" ]; then
+    wait "$REMOTE_SYNC_WORKER_PID" || true
+    REMOTE_SYNC_WORKER_PID=""
+  fi
+  if [ -n "$REMOTE_SYNC_DONE_FILE" ]; then
+    rm -f "$REMOTE_SYNC_DONE_FILE"
+    REMOTE_SYNC_DONE_FILE=""
+  fi
+}
+
+cleanup_run() {
+  release_vram
+  wait_remote_sync_worker
+}
+
+# Always tear down helpers even on errors.
+trap cleanup_run EXIT
+
+RESUME_LOG_ABS=""
+# Assignment manifest generation helper.
+generate_assignment_manifest() {
+  local manifest_dir
+  manifest_dir="$(dirname "$ASSIGNMENTS_OUT")"
+  mkdir -p "$manifest_dir"
+  echo "[RUN] Random human data generation, seed ${SEED}"
+  conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
+    --actor-root "${ACTOR_ROOT}" \
+    --ban-list "${BAN_LIST}" \
+    --assignments-out "${ASSIGNMENTS_OUT}" \
+    --scenes-dir "${SCENES_DIR}" \
+    --tasks-dir "${TASKS_DIR}" \
+    --seed "${SEED}"
+  echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
+}
 
 RESUME_LOG_ABS=""
 # Resume bookkeeping: we reuse the assignment manifest referenced inside the
@@ -234,8 +313,12 @@ if $RESUME_MODE; then
   fi
   ASSIGNMENTS_OUT=$(abspath "$resume_manifest_path")
   if [ ! -f "$ASSIGNMENTS_OUT" ]; then
-    echo "[RESUME] ERROR: Assignment manifest missing: $ASSIGNMENTS_OUT" >&2
-    exit 1
+    echo "[RESUME] WARN: Assignment manifest missing at $ASSIGNMENTS_OUT; regenerating."
+    generate_assignment_manifest
+    if [ ! -f "$ASSIGNMENTS_OUT" ]; then
+      echo "[RESUME] ERROR: Failed to regenerate assignment manifest at $ASSIGNMENTS_OUT." >&2
+      exit 1
+    fi
   fi
   echo "[RESUME] Using manifest $ASSIGNMENTS_OUT (derived from $RESUME_LOG_PATH)"
   CLEAR_LOCAL_OUTPUT_DIR=false
@@ -297,15 +380,7 @@ fi
 if $RESUME_MODE; then
   echo "[RESUME] Skipping assignment generation and reusing ${ASSIGNMENTS_OUT}"
 else
-  echo "[RUN] Random human data generation, seed ${SEED}"
-  conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
-    --actor-root "${ACTOR_ROOT}" \
-    --ban-list "${BAN_LIST}" \
-    --assignments-out "${ASSIGNMENTS_OUT}" \
-    --scenes-dir "${SCENES_DIR}" \
-    --tasks-dir "${TASKS_DIR}" \
-    --seed "${SEED}"
-  echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
+  generate_assignment_manifest
 fi
 
 render_extra_snippets=(
@@ -335,6 +410,10 @@ for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")
 done
 
+if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
+  start_remote_sync_worker "$OUTPUT_DIR" "$REMOTE_TARGET_DIR" "$REMOTE_SYNC_INTERVAL_SECS"
+fi
+
 render_status=0
 set +e
 "${parallel_cmd[@]}"
@@ -345,9 +424,8 @@ if [ $render_status -ne 0 ]; then
 fi
 
 if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
-  # Offload finished results to the remote training PC via rsync/SSH when
-  # enabled. Keeps the local disk tidy while ensuring central storage has copies.
-  storage_sync_remote "$OUTPUT_DIR" "$REMOTE_TARGET_DIR"
+  signal_remote_sync_completion
+  wait_remote_sync_worker
 fi
 
 if ! storage_bool_true "$ENABLE_LOCAL_STORAGE"; then
