@@ -82,7 +82,7 @@ REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
-WORKERS=${WORKERS:-6}
+WORKERS=${WORKERS:-3}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-4}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
@@ -127,7 +127,7 @@ target_bytes = int(os.environ.get("RESERVE_VRAM_TARGET_BYTES", "0"))
 headroom_bytes = int(os.environ.get("RESERVE_VRAM_HEADROOM_BYTES", str(512 * 1024 * 1024)))
 if target_bytes <= 0:
     sys.exit(0)
-device = torch.device("cuda")
+device = torch.device("cuda:0")
 torch.cuda.set_device(device)
 dev_index = torch.cuda.current_device()
 dev_name = torch.cuda.get_device_name(dev_index)
