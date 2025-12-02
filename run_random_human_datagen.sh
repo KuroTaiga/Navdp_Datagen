@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/storage_targets.sh"
 
+# Ensure we have a Python interpreter available (needed for path resolution helper below).
+
 PYTHON_BIN=${PYTHON_BIN:-python3}
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python >/dev/null 2>&1; then
@@ -14,11 +16,15 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+# Tiny helper for consistent usage errors so RESUME mode is easy to discover.
 show_usage_and_exit() {
   echo "Usage: $(basename "$0") [RESUME <log-file>]" >&2
   exit 1
 }
 
+# CLI parsing: optional leading "RESUME <log>" pair switches to resume mode and
+# consumes the following logfile argument so the remainder of the script can lean
+# on env vars only.
 RESUME_MODE=false
 RESUME_LOG_PATH=""
 if [ $# -gt 0 ]; then
@@ -41,11 +47,13 @@ if [ $# -gt 0 ]; then
   show_usage_and_exit
 fi
 
+# Convenience wrapper so we can expand relative paths and keep the script POSIX-ish.
 abspath() {
   "$PYTHON_BIN" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
-# Storage toggles (set env vars to true/false/yes/no)
+# Storage toggles (set env vars to true/false/yes/no) so the same runner can ship
+# data to different targets (local/NAS/remote SSH).
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
 ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-true}
@@ -58,6 +66,8 @@ if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" \
   exit 1
 fi
 
+# Core configuration for assignment planning + rendering. Most callers just tweak
+# DATA roots or seeds via environment variables.
 SEED=${SEED:-12345}
 CONDA_ENV=${CONDA_ENV:-cuda121}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
@@ -80,6 +90,9 @@ if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
+# VRAM throttling: spawn a small Python helper that grabs a configurable chunk of
+# GPU memory so other users do not over-subscribe the card while this run is in
+# flight. The tensor holder stays alive until we exit (trap below).
 VRAM_RESERVATION_PID=""
 reserve_vram() {
   local reserve_gb="$1"
@@ -142,9 +155,13 @@ release_vram() {
   fi
 }
 
+# Always tear down the VRAM hog helper even on errors.
 trap release_vram EXIT
 
 RESUME_LOG_ABS=""
+# Resume bookkeeping: we reuse the assignment manifest referenced inside the
+# provided log file and disable destructive cleanup so partially-generated data is
+# preserved.
 if $RESUME_MODE; then
   RESUME_LOG_ABS=$(abspath "$RESUME_LOG_PATH")
   if [ ! -f "$RESUME_LOG_ABS" ]; then
@@ -175,6 +192,8 @@ if $RESUME_MODE; then
   CLEAR_LOCAL_OUTPUT_DIR=false
 fi
 
+# Utility: guarantee output dir exists + is writable before we drop a ton of
+# frames in there.
 ensure_writable_dir() {
   local target="$1"
   if [ ! -d "$target" ]; then
@@ -189,6 +208,8 @@ ensure_writable_dir() {
   fi
 }
 
+# Optionally wipe previous contents to keep runs deterministic unless resume
+# mode disabled the cleanup step earlier.
 prepare_local_output_dir() {
   local target="$1"
   ensure_writable_dir "$target"
@@ -200,6 +221,8 @@ prepare_local_output_dir() {
 
 prepare_local_output_dir "$OUTPUT_DIR"
 
+# Connectivity sanity check so we fail early if the NAS is unreachable before any
+# heavy compute starts.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   NAS_TEST_DIR="${OFFLOAD_NAS_DIR}/__connectivity_check__"
   if mkdir -p "${NAS_TEST_DIR}" \
@@ -220,6 +243,8 @@ if [ "$RESERVE_VRAM_GB" -gt 0 ]; then
   reserve_vram "$RESERVE_VRAM_GB"
 fi
 
+# Assignment planning is deterministic: in resume mode we skip generation and
+# reuse the previous manifest so scene/actor pairings stay stable.
 if $RESUME_MODE; then
   echo "[RESUME] Skipping assignment generation and reusing ${ASSIGNMENTS_OUT}"
 else
@@ -237,6 +262,8 @@ fi
 render_extra_snippets=(
   "--overwrite --stabilize --gpu-only --show-BEV --no-rgb-frames --navdp-ply-per-scene"
 )
+# Rendering CLI snippets are composed here so storage flags can extend/override
+# behavior (NAS uploads, BEV toggles, etc.) without duplicating the Python call.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   render_extra_snippets+=("--offload-nas-dir ${OFFLOAD_NAS_DIR} --offload-min-free-gb ${OFFLOAD_MIN_FREE_GB}")
 fi
@@ -250,6 +277,8 @@ parallel_cmd=(
   --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
 )
+# Thread the resume log into the renderer so it can skip completed scene/actor
+# pairs. Remaining CLI snippets (overwrite/offload/etc.) are appended below.
 if [ -n "$RESUME_LOG_ABS" ]; then
   parallel_cmd+=(--skip-completed-log "$RESUME_LOG_ABS")
 fi
@@ -267,10 +296,13 @@ if [ $render_status -ne 0 ]; then
 fi
 
 if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
+  # Offload finished results to the remote training PC via rsync/SSH when
+  # enabled. Keeps the local disk tidy while ensuring central storage has copies.
   storage_sync_remote "$OUTPUT_DIR" "$REMOTE_TARGET_DIR"
 fi
 
 if ! storage_bool_true "$ENABLE_LOCAL_STORAGE"; then
+  # When purely offloading to NAS/remote, purge local outputs to conserve disk.
   if [ -d "$OUTPUT_DIR" ]; then
     echo "[STORAGE] Removing local outputs at ${OUTPUT_DIR}"
     rm -rf "$OUTPUT_DIR"
