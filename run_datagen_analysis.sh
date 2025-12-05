@@ -4,8 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pushd "$SCRIPT_DIR" > /dev/null
 
-TASKS_DIR=${TASKS_DIR:-./data/selected_65k}
-OUTPUT_DIR=${OUTPUT_DIR:-./data/datagen_analysis_65k}
+TASKS_DIR=${TASKS_DIR:-./data/selected_33w}
+OUTPUT_DIR=${OUTPUT_DIR:-./data/datagen_analysis_33w}
 TOP_SCENES=${TOP_SCENES:-20}
 HIST_BINS=${HIST_BINS:-60}
 

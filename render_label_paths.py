@@ -27,7 +27,7 @@ from typing import Sequence, TextIO
 import contextlib
 import re
 import traceback
-from datetime import datetime
+from datetime import datetime, timezone
 import time
 
 import imageio.v2 as imageio
@@ -307,6 +307,91 @@ def _log_vram_usage(message: str, device: torch.device, before_bytes: int | None
         delta_str = f" (delta={_format_bytes(delta)})"
     print(f"[VERBOSE][VRAM] {message}: total={_format_bytes(current)}{delta_str}", flush=True)
     return current
+
+
+class PathMetricRecorder:
+    """Track per-path runtime metrics for downstream progress reporting."""
+
+    VIDEO_STAGE = "mp4_write_sec"
+    PNG_STAGE = "perframe_png_sec"
+    DEPTH_STAGE = "perframe_depth_sec"
+    PLY_STAGE = "ply_write_sec"
+
+    def __init__(self, device: torch.device | None):
+        self.device = device
+        self.stage_seconds: defaultdict[str, float] = defaultdict(float)
+        self.vram_samples: list[int] = []
+        self._have_cuda = device is not None and torch.cuda.is_available()
+        if self._have_cuda:
+            torch.cuda.reset_peak_memory_stats(device)  # fresh peak per path
+
+    @contextlib.contextmanager
+    def measure(self, stage: str):
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.stage_seconds[stage] += time.perf_counter() - start
+
+    def sample_vram(self) -> None:
+        if not self._have_cuda:
+            return
+        try:
+            self.vram_samples.append(int(torch.cuda.memory_allocated(self.device)))
+        except Exception:
+            pass
+
+    def finalize(
+        self,
+        *,
+        scene_id: str,
+        label_id: str,
+        frames_rendered: int,
+        total_duration: float,
+        video_enabled: bool,
+        job_slot: int | None,
+        job_actor_id: str | None,
+        job_name: str | None,
+    ) -> dict:
+        fps = (frames_rendered / total_duration) if frames_rendered > 0 and total_duration > 0 else None
+        peak_bytes = int(torch.cuda.max_memory_allocated(self.device)) if self._have_cuda else None
+        avg_bytes = None
+        if self.vram_samples:
+            avg_bytes = sum(self.vram_samples) / len(self.vram_samples)
+        elif self._have_cuda:
+            try:
+                avg_bytes = float(torch.cuda.memory_allocated(self.device))
+            except Exception:
+                avg_bytes = None
+        total_measured = sum(
+            self.stage_seconds.get(stage, 0.0)
+            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE)
+        )
+        stage_ratios = {}
+        if total_measured > 0.0:
+            for stage, seconds in self.stage_seconds.items():
+                if stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+                    stage_ratios[stage] = seconds / total_measured
+        else:
+            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+                stage_ratios[stage] = 0.0
+
+        return {
+            "scene_id": scene_id,
+            "label_id": label_id,
+            "frames": frames_rendered,
+            "duration_sec": total_duration,
+            "frames_per_sec": fps,
+            "video_enabled": video_enabled,
+            "job_slot": job_slot,
+            "job_name": job_name,
+            "actor_id": job_actor_id,
+            "vram_peak_bytes": peak_bytes,
+            "vram_avg_bytes": avg_bytes,
+            "stage_seconds": dict(self.stage_seconds),
+            "stage_ratios": stage_ratios,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        }
 
 
 @contextlib.contextmanager
@@ -882,6 +967,7 @@ def _save_depth_and_camera(
     img_pkg: dict,
     camera: MiniCam | OrthoMiniCam,
     orthographic: bool,
+    metrics: PathMetricRecorder | None = None,
 ) -> None:
     """
     Persist depth (npy + 16-bit PNG) and camera metadata for one frame.
@@ -889,27 +975,24 @@ def _save_depth_and_camera(
     depth_tensor = img_pkg.get("depth")
     if depth_tensor is None:
         return
-    depth = depth_tensor.detach().cpu().numpy()
-    if depth.ndim > 2:
-        depth = np.squeeze(depth)
-    # Rasterizer returns inverse depth (1 / meters); convert back so saved PNG stores meters.
-    with np.errstate(divide="ignore"):
-        depth = np.where(depth > 0.0, 1.0 / depth, 0.0)
-    rotate_k = 1 if orthographic else 2
-    depth_rot = np.rot90(depth, k=rotate_k)
+    timing_ctx = metrics.measure(PathMetricRecorder.DEPTH_STAGE) if metrics else contextlib.nullcontext()
+    with timing_ctx:
+        depth = depth_tensor.detach().cpu().numpy()
+        if depth.ndim > 2:
+            depth = np.squeeze(depth)
+        # Rasterizer returns inverse depth (1 / meters); convert back so saved PNG stores meters.
+        with np.errstate(divide="ignore"):
+            depth = np.where(depth > 0.0, 1.0 / depth, 0.0)
+        rotate_k = 1 if orthographic else 2
+        depth_rot = np.rot90(depth, k=rotate_k)
 
-    # Save raw float depth (meters from camera)
-    # depth_npy_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.npy"
-    # np.save(depth_npy_path, depth_rot.astype(np.float32))
+        depth_mm = np.clip(depth_rot * 1000.0, 0.0, 65535.0).astype(np.uint16)
+        depth_png_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.png"
+        imageio.imwrite(depth_png_path, depth_mm)
 
-    # Save 16-bit PNG (millimeters, clipped)
-    depth_mm = np.clip(depth_rot * 1000.0, 0.0, 65535.0).astype(np.uint16)
-    depth_png_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.png"
-    imageio.imwrite(depth_png_path, depth_mm)
-
-    cam_json = _serialize_camera(camera, orthographic=orthographic)
-    cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
-    cam_json_path.write_text(json.dumps(cam_json, indent=2))
+        cam_json = _serialize_camera(camera, orthographic=orthographic)
+        cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
+        cam_json_path.write_text(json.dumps(cam_json, indent=2))
 
 def _rotate_180_xy(xy: np.ndarray) -> np.ndarray:
     """Rotate 2D points by 180 degrees around origin."""
@@ -1581,6 +1664,7 @@ def render_actor_camera_only_sequence(
     stabilize: bool,
     verbose: bool,
     dump: ActorDumpOptions | None = None,
+    metrics: PathMetricRecorder | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Per-point camera walkthrough (base scene only) with actor pose preview."""
 
@@ -1639,6 +1723,9 @@ def render_actor_camera_only_sequence(
     prev_forward: np.ndarray | None = None
     frame_counter = 0
 
+    if metrics:
+        metrics.sample_vram()
+
     for idx, plan in enumerate(frame_plans):
         camera_position = camera_positions[idx]
 
@@ -1693,7 +1780,13 @@ def render_actor_camera_only_sequence(
         if save_rgb_frames:
             try:
                 frame_path = frames_dir / f"{frame_prefix}_{frame_counter:04d}.png"
-                imageio.imwrite(frame_path, render_uint8)
+                timing_ctx = (
+                    metrics.measure(PathMetricRecorder.PNG_STAGE)
+                    if metrics is not None
+                    else contextlib.nullcontext()
+                )
+                with timing_ctx:
+                    imageio.imwrite(frame_path, render_uint8)
             except Exception as e:
                 print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
         try:
@@ -1704,19 +1797,28 @@ def render_actor_camera_only_sequence(
                 img_pkg=img_pkg,
                 camera=camera,
                 orthographic=False,
+                metrics=metrics,
             )
         except Exception as e:
             print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
-        
+
         # Also write to video if requested
         if video:
             try:
-                writer.append_data(render_uint8)
+                timing_ctx = (
+                    metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                    if metrics is not None
+                    else contextlib.nullcontext()
+                )
+                with timing_ctx:
+                    writer.append_data(render_uint8)
             except Exception as e:
                 print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                 raise
-            
+
         frame_counter += 1
+        if metrics:
+            metrics.sample_vram()
 
         del combined_model
         del actor_render
@@ -1764,6 +1866,7 @@ def render_actor_follow_sequence(
     combined_tmp_dir: Path | None,
     sh_degree: int,
     gpu_only: bool,
+    metrics: PathMetricRecorder | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Render combined scene+actor frames using either CPU or GPU composition."""
 
@@ -1869,6 +1972,9 @@ def render_actor_follow_sequence(
     prev_forward: np.ndarray | None = None
     direction_window = STABILIZE_WINDOW if stabilize else 1
 
+    if metrics:
+        metrics.sample_vram()
+
     if gpu_only:
         # Prepare debug dumps with full-scene coverage
         scene_debug_vertices = None
@@ -1970,7 +2076,13 @@ def render_actor_follow_sequence(
             if save_rgb_frames:
                 try:
                     frame_path = frames_dir / f"{frame_prefix}_{frame_counter:04d}.png"
-                    imageio.imwrite(frame_path, render_uint8)
+                    timing_ctx = (
+                        metrics.measure(PathMetricRecorder.PNG_STAGE)
+                        if metrics is not None
+                        else contextlib.nullcontext()
+                    )
+                    with timing_ctx:
+                        imageio.imwrite(frame_path, render_uint8)
                 except Exception as e:
                     print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
             try:
@@ -1981,6 +2093,7 @@ def render_actor_follow_sequence(
                     img_pkg=img_pkg,
                     camera=camera,
                     orthographic=False,
+                    metrics=metrics,
                 )
             except Exception as e:
                 print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
@@ -1988,12 +2101,20 @@ def render_actor_follow_sequence(
             # Also write to video if requested (do this AFTER frame saving to avoid corruption)
             if video:
                 try:
-                    writer.append_data(render_uint8)
+                    timing_ctx = (
+                        metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                        if metrics is not None
+                        else contextlib.nullcontext()
+                    )
+                    with timing_ctx:
+                        writer.append_data(render_uint8)
                 except Exception as e:
                     print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                     raise  # Re-raise video errors as they're critical
-                
+
             frame_counter += 1
+            if metrics:
+                metrics.sample_vram()
 
             del actor_render
             torch.cuda.empty_cache()
@@ -2086,10 +2207,20 @@ def render_actor_follow_sequence(
         render_uint8 = np.rot90(render_uint8, k=2)
 
         if video:
-            writer.append_data(render_uint8)
+            with (
+                metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                if metrics is not None
+                else contextlib.nullcontext()
+            ):
+                writer.append_data(render_uint8)
         elif save_rgb_frames:
             frame_path = frames_dir / f"{frame_prefix}_{frame_counter:04d}.png"
-            imageio.imwrite(frame_path, render_uint8)
+            with (
+                metrics.measure(PathMetricRecorder.PNG_STAGE)
+                if metrics is not None
+                else contextlib.nullcontext()
+            ):
+                imageio.imwrite(frame_path, render_uint8)
         try:
             _save_depth_and_camera(
                 frames_dir=frames_dir,
@@ -2098,10 +2229,13 @@ def render_actor_follow_sequence(
                 img_pkg=img_pkg,
                 camera=camera,
                 orthographic=False,
+                metrics=metrics,
             )
         except Exception as e:
             print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
         frame_counter += 1
+        if metrics:
+            metrics.sample_vram()
 
         if verbose and (idx % 10 == 0 or idx == total_steps - 1):
             print(
@@ -2710,11 +2844,18 @@ def render_path_frames(
     gpu_only: bool = False,
     prepared_path: PreparedPath | None = None,
     navdp_manager: NavdpPlyCoordinator | None = None,
-) -> None:
+    metrics_enabled: bool = False,
+    job_slot: int | None = None,
+    job_actor_id: str | None = None,
+    job_name: str | None = None,
+) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
     start_time = time.perf_counter()
     frames_rendered = 0
+    metrics_recorder = PathMetricRecorder(device=device) if metrics_enabled else None
+    if metrics_recorder:
+        metrics_recorder.sample_vram()
 
     path_data = prepared_path or prepare_path_data(
         json_path=json_path,
@@ -2883,6 +3024,7 @@ def render_path_frames(
                         stabilize=stabilize,
                         verbose=verbose,
                         dump=dump_options,
+                        metrics=metrics_recorder,
                     )
                     frames_rendered = len(cam_seq)
                 else:
@@ -2919,6 +3061,7 @@ def render_path_frames(
                         combined_tmp_dir=combined_tmp_dir,
                         sh_degree=gaussians.max_sh_degree,
                         gpu_only=gpu_only,
+                        metrics=metrics_recorder,
                     )
                     frames_rendered = len(cam_seq)
                 if render_bev:
@@ -3030,7 +3173,13 @@ def render_path_frames(
                     if save_rgb_frames:
                         try:
                             frame_path = frames_dir / f"frame_{idx:04d}.png"
-                            imageio.imwrite(frame_path, render_uint8)
+                            timing_ctx = (
+                                metrics_recorder.measure(PathMetricRecorder.PNG_STAGE)
+                                if metrics_recorder is not None
+                                else contextlib.nullcontext()
+                            )
+                            with timing_ctx:
+                                imageio.imwrite(frame_path, render_uint8)
                         except Exception as e:
                             print(f"[WARN] Failed to save RGB frame {idx}: {e}", flush=True)
                     try:
@@ -3041,6 +3190,7 @@ def render_path_frames(
                             img_pkg=img_pkg,
                             camera=camera,
                             orthographic=orthographic,
+                            metrics=metrics_recorder,
                         )
                     except Exception as e:
                         print(f"[WARN] Failed to save depth/camera for frame {idx}: {e}", flush=True)
@@ -3048,10 +3198,19 @@ def render_path_frames(
                     # Also write to video if requested
                     if video:
                         try:
-                            writer.append_data(render_uint8)
+                            timing_ctx = (
+                                metrics_recorder.measure(PathMetricRecorder.VIDEO_STAGE)
+                                if metrics_recorder is not None
+                                else contextlib.nullcontext()
+                            )
+                            with timing_ctx:
+                                writer.append_data(render_uint8)
                         except Exception as e:
                             print(f"[ERROR] Failed to append frame {idx} to video: {e}", flush=True)
                             raise
+
+                    if metrics_recorder is not None:
+                        metrics_recorder.sample_vram()
 
                     if verbose and (idx % 10 == 0 or idx == total_positions - 1):
                         print(
@@ -3094,19 +3253,39 @@ def render_path_frames(
 
     if navdp_manager is not None:
         try:
-            navdp_manager.add_path(
-                scene_id=scene_id,
-                label_id=json_path.stem,
-                path_xy=path_xy,
-                meta=meta,
-                gaussians=gaussians,
-                output_dir=output_dir,
+            timing_ctx = (
+                metrics_recorder.measure(PathMetricRecorder.PLY_STAGE)
+                if metrics_recorder is not None
+                else contextlib.nullcontext()
             )
+            with timing_ctx:
+                navdp_manager.add_path(
+                    scene_id=scene_id,
+                    label_id=json_path.stem,
+                    path_xy=path_xy,
+                    meta=meta,
+                    gaussians=gaussians,
+                    output_dir=output_dir,
+                )
         except Exception as exc:  # pylint: disable=broad-except
             print(
                 f"      WARNING: Failed to build NavDP mask PLY: {exc}",
                 flush=True,
             )
+
+    summary = None
+    if metrics_recorder is not None:
+        summary = metrics_recorder.finalize(
+            scene_id=scene_id,
+            label_id=json_path.stem,
+            frames_rendered=frames_rendered,
+            total_duration=duration,
+            video_enabled=bool(effective_video),
+            job_slot=job_slot,
+            job_actor_id=job_actor_id,
+            job_name=job_name,
+        )
+    return summary
 
 
 def parse_args() -> ArgumentParser:
@@ -3266,6 +3445,30 @@ def parse_args() -> ArgumentParser:
         type=Path,
         default=DEFAULT_ERROR_LOG,
         help=f"Append rendering failures to this log file (default: {DEFAULT_ERROR_LOG}).",
+    )
+    parser.add_argument(
+        "--metrics-json",
+        type=Path,
+        default=None,
+        help="If set, write per-path runtime metrics to this JSON file for external progress tracking.",
+    )
+    parser.add_argument(
+        "--job-slot",
+        type=int,
+        default=None,
+        help="Optional worker slot identifier used when aggregating metrics across threads.",
+    )
+    parser.add_argument(
+        "--job-name",
+        type=str,
+        default=None,
+        help="Friendly job name for metrics reporting (defaults to scene/actor pairing).",
+    )
+    parser.add_argument(
+        "--job-actor-id",
+        type=str,
+        default=None,
+        help="Actor identifier for metrics reporting when invoked via the parallel runner.",
     )
     parser.add_argument(
         "--verbose",
@@ -3475,6 +3678,8 @@ def main() -> None:
         else None
     )
     navdp_manager = NavdpPlyCoordinator(per_scene=bool(args.navdp_ply_per_scene))
+    metrics_enabled = bool(args.metrics_json)
+    collected_metrics: list[dict] = []
 
     if args.actor_seq_dir is not None:
         actor_options = ActorOptions(
@@ -3679,7 +3884,7 @@ def main() -> None:
                     flush=True,
                 )
                 try:
-                    render_path_frames(
+                    summary = render_path_frames(
                         scene_id=scene_id,
                         json_path=json_path,
                         gaussians=gaussians,
@@ -3720,7 +3925,13 @@ def main() -> None:
                         gpu_only=gpu_only_enabled,
                         prepared_path=prepared,
                         navdp_manager=navdp_manager,
+                        metrics_enabled=metrics_enabled,
+                        job_slot=args.job_slot,
+                        job_actor_id=args.job_actor_id,
+                        job_name=args.job_name,
                     )
+                    if summary is not None:
+                        collected_metrics.append(summary)
                     if nas_offload_dir is not None:
                         # Use the script's local output root as the place to check/move from.
                         maybe_offload_if_low_space(
@@ -3773,6 +3984,19 @@ def main() -> None:
     finally:
         if error_log_file is not None:
             error_log_file.close()
+
+    if args.metrics_json is not None:
+        metrics_payload = {
+            "job_name": args.job_name,
+            "job_slot": args.job_slot,
+            "actor_id": args.job_actor_id,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "paths": collected_metrics,
+        }
+        metrics_path = args.metrics_json.resolve()
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_path.write_text(json.dumps(metrics_payload, indent=2))
+        print(f"[METRICS] Wrote per-path runtime metrics to {metrics_path}", flush=True)
 
     if error_count > 0:
         print(f"{error_count} error(s) logged to {error_log_path}", flush=True)

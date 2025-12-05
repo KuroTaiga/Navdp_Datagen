@@ -26,7 +26,7 @@ show_usage_and_exit() {
 # consumes the following logfile argument so the remainder of the script can lean
 # on env vars only.
 RESUME_MODE=true
-RESUME_LOG_PATH="./65k.log"
+RESUME_LOG_PATH="./33w.log"
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
@@ -56,7 +56,7 @@ abspath() {
 # data to different targets (local/NAS/remote SSH).
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
-ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-true}
+ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
 CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
 
 if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" \
@@ -72,18 +72,18 @@ SEED=${SEED:-12345}
 CONDA_ENV=${CONDA_ENV:-cuda121}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
-ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_65k.json}
+ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_33w.json}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
-TASKS_DIR=${TASKS_DIR:-./data/selected_65k}
-OUTPUT_DIR=${OUTPUT_DIR:-./data/path_video_frames_random_humans_65k}
-OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_65k}
+TASKS_DIR=${TASKS_DIR:-./data/selected_33w}
+OUTPUT_DIR=${OUTPUT_DIR:-./data/path_video_frames_random_humans_33w}
+OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-3}
+WORKERS=${WORKERS:-12}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}

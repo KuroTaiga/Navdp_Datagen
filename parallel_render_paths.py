@@ -22,6 +22,7 @@ import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -74,6 +75,127 @@ class JobPlan:
     actor_id: str
     labels: list[str]
     assignment: AssignmentEntry
+
+
+class ProgressTracker:
+    """Maintain aggregated runtime stats and write progress JSON after each job."""
+
+    STAGE_KEYS = (
+        "mp4_write_sec",
+        "perframe_png_sec",
+        "perframe_depth_sec",
+        "ply_write_sec",
+    )
+
+    def __init__(self, *, total_jobs: int, total_paths: int, output_path: Path | None):
+        self.total_jobs = total_jobs
+        self.total_paths = total_paths
+        self.completed_jobs = 0
+        self.completed_paths = 0
+        self.total_render_time = 0.0
+        self.stage_totals: defaultdict[str, float] = defaultdict(float)
+        self.slot_vram: defaultdict[str, list[float]] = defaultdict(list)
+        self.paths: list[dict] = []
+        self.output_path = output_path.resolve() if output_path is not None else None
+        if self.output_path is not None:
+            self.output_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_summary(None)
+
+    def record_job(self, job_result: dict, job_metrics: dict | None) -> None:
+        self.completed_jobs += 1
+        if job_metrics:
+            for entry in job_metrics.get("paths", []) or []:
+                self.paths.append(entry)
+                self.completed_paths += 1
+                try:
+                    duration = float(entry.get("duration_sec") or 0.0)
+                except (TypeError, ValueError):
+                    duration = 0.0
+                self.total_render_time += duration
+                stage_seconds = entry.get("stage_seconds") or {}
+                for stage, seconds in stage_seconds.items():
+                    try:
+                        self.stage_totals[stage] += float(seconds)
+                    except (TypeError, ValueError):
+                        continue
+                slot = entry.get("job_slot")
+                avg_vram = entry.get("vram_avg_bytes")
+                if slot is not None and isinstance(avg_vram, (int, float)):
+                    self.slot_vram[str(slot)].append(float(avg_vram))
+        self._write_summary(job_result)
+
+    def _write_summary(self, last_job: dict | None) -> None:
+        if self.output_path is None:
+            return
+        if self.total_paths <= 0:
+            progress_pct = 1.0
+            remaining_paths = 0
+        else:
+            progress_pct = self.completed_paths / self.total_paths
+            remaining_paths = max(self.total_paths - self.completed_paths, 0)
+        avg_path_time = (
+            self.total_render_time / self.completed_paths
+            if self.completed_paths > 0
+            else None
+        )
+        eta_seconds = None
+        if avg_path_time is not None and remaining_paths > 0:
+            eta_seconds = avg_path_time * remaining_paths
+
+        stage_total = sum(self.stage_totals.get(stage, 0.0) for stage in self.STAGE_KEYS)
+        stage_ratios = {}
+        for stage in self.STAGE_KEYS:
+            value = self.stage_totals.get(stage, 0.0)
+            stage_ratios[stage] = (value / stage_total) if stage_total > 0 else 0.0
+
+        avg_vram_per_thread = {
+            slot: (sum(values) / len(values))
+            for slot, values in self.slot_vram.items()
+            if values
+        }
+
+        summary = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "total_jobs": self.total_jobs,
+            "completed_jobs": self.completed_jobs,
+            "total_paths": self.total_paths,
+            "completed_paths": self.completed_paths,
+            "progress_pct": progress_pct,
+            "avg_path_time_sec": avg_path_time,
+            "eta_seconds": eta_seconds,
+            "avg_vram_per_thread": avg_vram_per_thread,
+            "stage_ratio": stage_ratios,
+        }
+        if last_job is not None:
+            summary["last_job"] = {
+                "scene": last_job.get("scene"),
+                "actor_id": last_job.get("actor_id"),
+                "status": last_job.get("status"),
+                "duration_sec": last_job.get("duration_sec"),
+            }
+
+        payload = {
+            "summary": summary,
+            "paths": self.paths,
+        }
+        self.output_path.write_text(json.dumps(payload, indent=2))
+
+
+def _load_metrics_json(path: Path) -> dict | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        print(f"[METRICS] WARN: Metrics file missing at {path}; job may have failed early.", flush=True)
+        return None
+    stripped = text.strip()
+    if not stripped:
+        print(f"[METRICS] WARN: Metrics file {path} is empty; skipping entry.", flush=True)
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError as exc:
+        print(f"[METRICS] WARN: Could not parse metrics {path}: {exc}", flush=True)
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -163,6 +285,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("parallel_render_report.json"),
         help="Destination JSON report detailing all jobs and path assignments.",
+    )
+    parser.add_argument(
+        "--per-job-metrics-dir",
+        type=Path,
+        default=Path("parallel_metrics"),
+        help="Directory where per-job metrics JSON files will be written (default: parallel_metrics).",
+    )
+    parser.add_argument(
+        "--progress-json",
+        type=Path,
+        default=Path("datagen_progress.json"),
+        help="Aggregated progress JSON path updated after each job (default: datagen_progress.json).",
     )
     parser.add_argument(
         "--scene-shard-index",
@@ -465,9 +599,11 @@ def run_job(
     *,
     log_dir: Path,
     dry_run: bool,
+    job_name: str | None = None,
+    metrics_path: Path | None = None,
 ) -> dict:
     log_dir.mkdir(parents=True, exist_ok=True)
-    base_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
+    base_name = job_name or f"{idx:04d}_{plan.scene}_{plan.actor_id}"
     temp_log_path = log_dir / f"{base_name}.log"
     final_log_path = temp_log_path
     pid: int | None = None
@@ -484,6 +620,8 @@ def run_job(
             "returncode": None,
             "pid": None,
             "duration_sec": duration,
+            "job_name": base_name,
+            "metrics_path": str(metrics_path) if metrics_path else None,
         }
 
     with temp_log_path.open("w", encoding="utf-8") as log_file:
@@ -516,6 +654,8 @@ def run_job(
         "returncode": returncode,
         "pid": pid,
         "duration_sec": duration,
+        "job_name": base_name,
+        "metrics_path": str(metrics_path) if metrics_path else None,
     }
 
 
@@ -566,6 +706,13 @@ def main() -> None:
             )
     print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
 
+    progress_tracker = ProgressTracker(
+        total_jobs=len(plans),
+        total_paths=len(tasks),
+        output_path=args.progress_json,
+    )
+    max_workers = max(1, args.workers)
+
     results: list[dict] = []
     if args.dry_run or not plans:
         for idx, plan in enumerate(plans, start=1):
@@ -582,11 +729,23 @@ def main() -> None:
                 error_log=args.error_log,
                 extra_args=extra_args,
             )
-            results.append(
-                run_job(idx, plan, cmd, log_dir=args.log_dir, dry_run=True),
+            job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
+            job_slot = ((idx - 1) % max_workers) + 1
+            cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+            result = run_job(
+                idx,
+                plan,
+                cmd,
+                log_dir=args.log_dir,
+                dry_run=True,
+                job_name=job_name,
             )
+            results.append(result)
+            progress_tracker.record_job(result, None)
     else:
-        with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        metrics_dir = args.per_job_metrics_dir.resolve()
+        metrics_dir.mkdir(parents=True, exist_ok=True)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
             future_to_idx: dict[Any, int] = {}
             for idx, plan in enumerate(plans, start=1):
                 cmd = make_command(
@@ -602,7 +761,21 @@ def main() -> None:
                     error_log=args.error_log,
                     extra_args=extra_args,
                 )
-                future = pool.submit(run_job, idx, plan, cmd, log_dir=args.log_dir, dry_run=False)
+                job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
+                job_slot = ((idx - 1) % max_workers) + 1
+                cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+                metrics_path = metrics_dir / f"{job_name}.json"
+                cmd.extend(["--metrics-json", str(metrics_path)])
+                future = pool.submit(
+                    run_job,
+                    idx,
+                    plan,
+                    cmd,
+                    log_dir=args.log_dir,
+                    dry_run=False,
+                    job_name=job_name,
+                    metrics_path=metrics_path,
+                )
                 future_to_idx[future] = idx
             for future in as_completed(future_to_idx):
                 result = future.result()
@@ -615,6 +788,11 @@ def main() -> None:
                 )
                 if result["status"] == "failed":
                     _print_failure_log(Path(result["log"]))
+                metrics_payload = None
+                metrics_file = result.get("metrics_path")
+                if metrics_file:
+                    metrics_payload = _load_metrics_json(Path(metrics_file))
+                progress_tracker.record_job(result, metrics_payload)
 
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
