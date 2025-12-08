@@ -12,3 +12,4 @@ screenshots
 *.log
 *.svg
 storage_remote_config.sh
+*.json

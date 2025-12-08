@@ -4,7 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 pushd "$SCRIPT_DIR" > /dev/null
 
-RENDERS_DIR=${RENDERS_DIR-/mnt/nas/jiankundong/random_human_dataset_w_ban_65k}
+# RENDERS_DIR=${RENDERS_DIR-/mnt/nas/jiankundong/random_human_dataset_w_ban_65k}
+RENDERS_DIR=${RENDERS_DIR-./data/path_video_frames_random_humans_65k}
 REPORT_DIR=${REPORT_DIR:-./data/post_datagen_analysis_65k}
 TASKS_DIR=${TASKS_DIR-./data/selected_65k}
 ASSIGNMENTS_JSON=${ASSIGNMENTS_JSON:-./data/actor_assignments_w_ban_65k.json}

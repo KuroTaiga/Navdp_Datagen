@@ -1,8 +1,8 @@
 #!/bin/bash
 
 INPUT_DIR="./data/scenes"
-OUTPUT_DIR="/mnt/nas/jiankundong/scenes_projection_fixed"
-MAX_SCENES=200
+OUTPUT_DIR="/mnt/nas/zhangxiaotao/scenes_projection_fixed"
+MAX_SCENES= ""
 
 if [ ! -d "$INPUT_DIR" ]; then
     echo "Error: Input directory $INPUT_DIR does not exist"

@@ -68,7 +68,7 @@ fi
 
 # Core configuration for assignment planning + rendering. Most callers just tweak
 # DATA roots or seeds via environment variables.
-SEED=${SEED:-12345}
+SEED=${SEED:-33}
 CONDA_ENV=${CONDA_ENV:-cuda121}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
@@ -78,12 +78,14 @@ TASKS_DIR=${TASKS_DIR:-./data/selected_33w}
 OUTPUT_DIR=${OUTPUT_DIR:-./data/path_video_frames_random_humans_33w}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
+PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/random_human_metrics}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-12}
+WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
@@ -400,6 +402,8 @@ parallel_cmd=(
   --workers "${WORKERS}"
   --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
+  --progress-json "${PROGRESS_JSON}"
+  --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
 )
 # Thread the resume log into the renderer so it can skip completed scene/actor
 # pairs. Remaining CLI snippets (overwrite/offload/etc.) are appended below.
