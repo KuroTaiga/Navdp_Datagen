@@ -52,8 +52,11 @@ abspath() {
   "$PYTHON_BIN" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
-# Storage toggles (set env vars to true/false/yes/no) so the same runner can ship
-# data to different targets (local/NAS/remote SSH).
+# -----------------------------------------------------------------------------
+# User-configurable defaults (override via env vars before invoking the script).
+# Collect everything editable here so deployments only need to tweak this block.
+# -----------------------------------------------------------------------------
+# Storage toggles so the same runner can ship data to different targets.
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-false}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
 ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-true}
@@ -96,6 +99,11 @@ WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
+
+# Default render_label_paths.py snippets appended to every worker invocation.
+render_extra_snippets=(
+  "--overwrite --stabilize --gpu-only --show-BEV --no-rgb-frames --navdp-ply-per-scene"
+)
 if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
   echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
   exit 1
@@ -430,9 +438,6 @@ else
   generate_assignment_manifest
 fi
 
-render_extra_snippets=(
-  "--overwrite --stabilize --gpu-only --show-BEV --no-rgb-frames --navdp-ply-per-scene"
-)
 # Rendering CLI snippets are composed here so storage flags can extend/override
 # behavior (NAS uploads, BEV toggles, etc.) without duplicating the Python call.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
