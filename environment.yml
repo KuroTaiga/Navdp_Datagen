@@ -1,23 +1,21 @@
-name: base
+name: cuda121
 channels:
+  - defaults
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/pytorch
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/r
   - https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free
 dependencies:
-  - python=3.13
-  - conda=25.11.0
-  - setuptools
-  - pip
-  - wheel
-  - conda-anaconda-telemetry[version='>=0.3.0']
-  - conda-anaconda-tos[version='>=0.2.2']
-  - conda-content-trust
-  - conda-libmamba-solver
-  - menuinst
-  - anaconda-anon-usage
-  - anaconda-auth
-  - mamba
-  - pytorch3d
-prefix: /home/lenovo/miniconda3
+  - python=3.10
+  - cuda-cupti=12.1.105
+  - cuda-version=12.1
+  - cuda-nvcc=12.1.105
+  - cuda-cudart=12.1.105
+  - cuda-toolkit=12.1.1
+  - make
+  - ninja
+  - gcc_linux-64=12
+  - cmake
+  - gxx_linux-64=12
+prefix: /home/dongjk/.conda/envs/cuda121
