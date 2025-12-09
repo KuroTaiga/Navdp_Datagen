@@ -66,6 +66,13 @@ if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" \
   exit 1
 fi
 
+REMOTE_ONLY_STORAGE=false
+if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" \
+  && ! storage_bool_true "$ENABLE_NAS_STORAGE" \
+  && storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
+  REMOTE_ONLY_STORAGE=true
+fi
+
 # Core configuration for assignment planning + rendering. Most callers just tweak
 # DATA roots or seeds via environment variables.
 SEED=${SEED:-33}
@@ -209,12 +216,27 @@ release_vram() {
 
 REMOTE_SYNC_WORKER_PID=""
 REMOTE_SYNC_DONE_FILE=""
+REMOTE_STORAGE_UNAVAILABLE=false
+PARALLEL_PID=""
+
+handle_remote_storage_unavailable() {
+  if [ "$REMOTE_STORAGE_UNAVAILABLE" = true ]; then
+    return
+  fi
+  REMOTE_STORAGE_UNAVAILABLE=true
+  echo "[STORAGE] Remote destination unavailable; pausing generation to avoid data loss." >&2
+  if [ -n "$PARALLEL_PID" ]; then
+    kill "$PARALLEL_PID" >/dev/null 2>&1 || true
+  fi
+}
 
 remote_sync_worker_loop() {
   local source_dir="$1"
   local remote_dir="$2"
   local done_flag="$3"
   local interval_secs="$4"
+  local abort_on_failure="${5:-false}"
+  local parent_pid="${6:-}"
   if [ -z "$interval_secs" ] || [ "$interval_secs" -le 0 ]; then
     interval_secs=60
   fi
@@ -226,6 +248,13 @@ remote_sync_worker_loop() {
     local sync_status=$?
     if [ $sync_status -ne 0 ]; then
       echo "[STORAGE] WARN: Remote sync worker pass ${iteration} failed with status ${sync_status}." >&2
+      if [ "$abort_on_failure" = true ]; then
+        echo "[STORAGE] Remote sync worker detected unreachable destination; notifying renderer to pause." >&2
+        if [ -n "$parent_pid" ]; then
+          kill -s USR1 "$parent_pid" >/dev/null 2>&1 || true
+        fi
+        break
+      fi
     fi
     if [ -f "$done_flag" ] && [ $sync_status -eq 0 ]; then
       echo "[STORAGE] Remote sync worker confirmed final sync after ${iteration} pass(es)."
@@ -240,9 +269,11 @@ start_remote_sync_worker() {
   local source_dir="$1"
   local remote_dir="$2"
   local interval_secs="$3"
+  local abort_on_failure="${4:-false}"
+  local parent_pid="${5:-}"
   REMOTE_SYNC_DONE_FILE=$(mktemp "${TMPDIR:-/tmp}/remote_sync_done.XXXXXX") || return 1
   rm -f "$REMOTE_SYNC_DONE_FILE"
-  remote_sync_worker_loop "$source_dir" "$remote_dir" "$REMOTE_SYNC_DONE_FILE" "$interval_secs" &
+  remote_sync_worker_loop "$source_dir" "$remote_dir" "$REMOTE_SYNC_DONE_FILE" "$interval_secs" "$abort_on_failure" "$parent_pid" &
   REMOTE_SYNC_WORKER_PID=$!
 }
 
@@ -270,6 +301,7 @@ cleanup_run() {
 
 # Always tear down helpers even on errors.
 trap cleanup_run EXIT
+trap handle_remote_storage_unavailable USR1
 
 RESUME_LOG_ABS=""
 # Assignment manifest generation helper.
@@ -369,6 +401,19 @@ if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   fi
 fi
 
+if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
+  if ! storage_test_remote_connection "$REMOTE_TARGET_DIR"; then
+    if [ "$REMOTE_ONLY_STORAGE" = true ]; then
+      echo "[CHECK] ERROR: remote destination ${REMOTE_SSH_TARGET:-?}:${REMOTE_TARGET_DIR} is unreachable and no alternate storage is configured." >&2
+      exit 1
+    else
+      echo "[CHECK] WARN: remote destination ${REMOTE_SSH_TARGET:-?}:${REMOTE_TARGET_DIR} is unreachable; continuing with other storage backends." >&2
+    fi
+  else
+    echo "[CHECK] Remote destination reachable at ${REMOTE_SSH_TARGET:-?}:${REMOTE_TARGET_DIR}"
+  fi
+fi
+
 echo "[CONFIG] ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE}"
 echo "[CONFIG] ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE}"
 echo "[CONFIG] ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE}"
@@ -415,24 +460,36 @@ for snippet in "${render_extra_snippets[@]}"; do
 done
 
 if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
-  start_remote_sync_worker "$OUTPUT_DIR" "$REMOTE_TARGET_DIR" "$REMOTE_SYNC_INTERVAL_SECS"
+  remote_abort_flag="false"
+  if [ "$REMOTE_ONLY_STORAGE" = true ]; then
+    remote_abort_flag="true"
+  fi
+  start_remote_sync_worker "$OUTPUT_DIR" "$REMOTE_TARGET_DIR" "$REMOTE_SYNC_INTERVAL_SECS" "$remote_abort_flag" "$$"
 fi
 
 render_status=0
 set +e
-"${parallel_cmd[@]}"
+"${parallel_cmd[@]}" &
+PARALLEL_PID=$!
+wait "$PARALLEL_PID"
 render_status=$?
+PARALLEL_PID=""
 set -e
-if [ $render_status -ne 0 ]; then
+if [ "$REMOTE_STORAGE_UNAVAILABLE" = true ]; then
+  render_status=99
+  echo "[STORAGE] Remote destination unavailable; generation paused. Resume once storage is back online." >&2
+elif [ $render_status -ne 0 ]; then
   echo "[WARN] parallel_render_paths.py exited with status ${render_status}, continuing per request."
 fi
 
 if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
-  signal_remote_sync_completion
+  if [ "$REMOTE_STORAGE_UNAVAILABLE" = false ]; then
+    signal_remote_sync_completion
+  fi
   wait_remote_sync_worker
 fi
 
-if ! storage_bool_true "$ENABLE_LOCAL_STORAGE"; then
+if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" && [ "$REMOTE_STORAGE_UNAVAILABLE" = false ]; then
   # When purely offloading to NAS/remote, purge local outputs to conserve disk.
   if [ -d "$OUTPUT_DIR" ]; then
     echo "[STORAGE] Removing local outputs at ${OUTPUT_DIR}"
