@@ -25,7 +25,7 @@ show_usage_and_exit() {
 # CLI parsing: optional leading "RESUME <log>" pair switches to resume mode and
 # consumes the following logfile argument so the remainder of the script can lean
 # on env vars only.
-RESUME_MODE=true
+RESUME_MODE=false
 RESUME_LOG_PATH="./33w.log"
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
@@ -54,10 +54,10 @@ abspath() {
 
 # Storage toggles (set env vars to true/false/yes/no) so the same runner can ship
 # data to different targets (local/NAS/remote SSH).
-ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
+ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-false}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
-ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
-CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
+ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-true}
+CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-true}
 
 if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" \
   && ! storage_bool_true "$ENABLE_NAS_STORAGE" \
@@ -80,8 +80,8 @@ OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_b
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/random_human_metrics}
-REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
-REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
+REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_33w}}
+REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
