@@ -99,11 +99,41 @@ WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
+# set files types we want as output
+ENABLE_BEV_IMAGES=${ENABLE_BEV_IMAGES:-true}
+ENABLE_VIDEO_OUTPUT=${ENABLE_VIDEO_OUTPUT:-true}
+ENABLE_RGB_FRAMES=${ENABLE_RGB_FRAMES:-false}
+ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-true}
+ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 
 # Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_snippets=(
-  "--overwrite --stabilize --gpu-only --show-BEV --no-rgb-frames --navdp-ply-per-scene"
-)
+render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene"
+if storage_bool_true "$ENABLE_BEV_IMAGES"; then
+  render_extra_args+=' --show-BEV'
+else
+  render_extra_args+=' --no-show-BEV'
+fi
+if storage_bool_true "$ENABLE_VIDEO_OUTPUT"; then
+  render_extra_args+=' --video'
+else
+  render_extra_args+=' --no-video'
+fi
+if storage_bool_true "$ENABLE_RGB_FRAMES"; then
+  render_extra_args+=' --rgb-frames'
+else
+  render_extra_args+=' --no-rgb-frames'
+fi
+if storage_bool_true "$ENABLE_DEPTH_OUTPUT"; then
+  render_extra_args+=' --save-depth-maps'
+else
+  render_extra_args+=' --no-save-depth-maps'
+fi
+if storage_bool_true "$ENABLE_FOLLOW_METADATA"; then
+  render_extra_args+=' --save-follow-metadata'
+else
+  render_extra_args+=' --no-save-follow-metadata'
+fi
+render_extra_snippets=("$render_extra_args")
 if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
   echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
   exit 1
@@ -226,6 +256,7 @@ REMOTE_SYNC_WORKER_PID=""
 REMOTE_SYNC_DONE_FILE=""
 REMOTE_STORAGE_UNAVAILABLE=false
 PARALLEL_PID=""
+STOP_REQUESTED=false
 
 handle_remote_storage_unavailable() {
   if [ "$REMOTE_STORAGE_UNAVAILABLE" = true ]; then
@@ -311,7 +342,26 @@ cleanup_run() {
 trap cleanup_run EXIT
 trap handle_remote_storage_unavailable USR1
 
-RESUME_LOG_ABS=""
+handle_interrupt() {
+  if [ "$STOP_REQUESTED" = true ]; then
+    return
+  fi
+  STOP_REQUESTED=true
+  echo "[RUN] Interrupt received; stopping workers..." >&2
+  trap - EXIT
+  if [ -n "$PARALLEL_PID" ]; then
+    kill -SIGINT "$PARALLEL_PID" >/dev/null 2>&1 || true
+    wait "$PARALLEL_PID" >/dev/null 2>&1 || true
+    PARALLEL_PID=""
+  fi
+  if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
+    signal_remote_sync_completion
+  fi
+  cleanup_run
+  exit 130
+}
+trap handle_interrupt INT TERM
+
 # Assignment manifest generation helper.
 generate_assignment_manifest() {
   local manifest_dir
