@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import math
 import torch
 import numpy as np
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func, build_rotation
@@ -273,43 +274,191 @@ class GaussianModel:
                 print(f"No exposure to be loaded at {exposure_file}")
                 self.pretrained_exposures = None
 
-        xyz = np.stack((np.asarray(plydata.elements[0]["x"]),
-                        np.asarray(plydata.elements[0]["y"]),
-                        np.asarray(plydata.elements[0]["z"])),  axis=1)
-        opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
+        try:
+            vertex_element = plydata["vertex"]
+        except KeyError as exc:
+            raise ValueError("PLY file does not contain a 'vertex' element") from exc
 
-        features_dc = np.zeros((xyz.shape[0], 3, 1))
-        features_dc[:, 0, 0] = np.asarray(plydata.elements[0]["f_dc_0"])
-        features_dc[:, 1, 0] = np.asarray(plydata.elements[0]["f_dc_1"])
-        features_dc[:, 2, 0] = np.asarray(plydata.elements[0]["f_dc_2"])
+        vertex_data = vertex_element.data
+        vertex_props = vertex_data.dtype.names if vertex_data.dtype.names is not None else ()
 
-        extra_f_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("f_rest_")]
-        extra_f_names = sorted(extra_f_names, key = lambda x: int(x.split('_')[-1]))
-        assert len(extra_f_names)==3*(self.max_sh_degree + 1) ** 2 - 3
-        features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
-        for idx, attr_name in enumerate(extra_f_names):
-            features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
-        features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
+        if "packed_position" in vertex_props:
+            try:
+                chunk_element = plydata["chunk"]
+            except KeyError as exc:
+                raise ValueError("Compressed PLY is missing required 'chunk' element") from exc
 
-        scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
-        scale_names = sorted(scale_names, key = lambda x: int(x.split('_')[-1]))
-        scales = np.zeros((xyz.shape[0], len(scale_names)))
-        for idx, attr_name in enumerate(scale_names):
-            scales[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            chunk_data = chunk_element.data
+            vert_count = vertex_data.shape[0]
+            chunk_size = 256
+            indices = np.arange(vert_count, dtype=np.int64)
+            chunk_indices = np.minimum(indices // chunk_size, len(chunk_data) - 1)
 
-        rot_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("rot")]
-        rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
-        rots = np.zeros((xyz.shape[0], len(rot_names)))
-        for idx, attr_name in enumerate(rot_names):
-            rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
+            def gather_chunk_fields(field_names):
+                stacked = np.stack([chunk_data[name] for name in field_names], axis=1)
+                return stacked[chunk_indices].astype(np.float32)
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+            pos_min = gather_chunk_fields(["min_x", "min_y", "min_z"])
+            pos_max = gather_chunk_fields(["max_x", "max_y", "max_z"])
+            scale_min = gather_chunk_fields(["min_scale_x", "min_scale_y", "min_scale_z"])
+            scale_max = gather_chunk_fields(["max_scale_x", "max_scale_y", "max_scale_z"])
+            color_min = gather_chunk_fields(["min_r", "min_g", "min_b"])
+            color_max = gather_chunk_fields(["max_r", "max_g", "max_b"])
+
+            mask_11 = np.uint32((1 << 11) - 1)
+            mask_10 = np.uint32((1 << 10) - 1)
+            inv_11 = 1.0 / float((1 << 11) - 1)
+            inv_10 = 1.0 / float((1 << 10) - 1)
+
+            packed_pos = vertex_data['packed_position'].astype(np.uint32)
+            pos_norm = np.stack([
+                ((packed_pos >> 21) & mask_11).astype(np.float32) * inv_11,
+                ((packed_pos >> 11) & mask_10).astype(np.float32) * inv_10,
+                (packed_pos & mask_11).astype(np.float32) * inv_11
+            ], axis=1)
+            xyz = pos_min + (pos_max - pos_min) * pos_norm
+
+            packed_scale = vertex_data['packed_scale'].astype(np.uint32)
+            scale_norm = np.stack([
+                ((packed_scale >> 21) & mask_11).astype(np.float32) * inv_11,
+                ((packed_scale >> 11) & mask_10).astype(np.float32) * inv_10,
+                (packed_scale & mask_11).astype(np.float32) * inv_11
+            ], axis=1)
+            log_scales = scale_min + (scale_max - scale_min) * scale_norm
+
+            packed_color = vertex_data['packed_color'].astype(np.uint32)
+            r = ((packed_color >> 24) & 0xFF).astype(np.float32)
+            g = ((packed_color >> 16) & 0xFF).astype(np.float32)
+            b = ((packed_color >> 8) & 0xFF).astype(np.float32)
+            a = (packed_color & 0xFF).astype(np.float32)
+            color_norm = np.stack((r, g, b), axis=1) / 255.0
+            colors = color_min + (color_max - color_min) * color_norm
+            alpha = np.clip(a / 255.0, 1e-6, 1.0 - 1e-6)
+
+            packed_rot = vertex_data['packed_rotation'].astype(np.uint32)
+            sqrt2 = math.sqrt(2.0)
+            r_comp = (((packed_rot >> 20) & mask_10).astype(np.float32) * inv_10 - 0.5) * sqrt2
+            i_comp = (((packed_rot >> 10) & mask_10).astype(np.float32) * inv_10 - 0.5) * sqrt2
+            o_comp = ((packed_rot & mask_10).astype(np.float32) * inv_10 - 0.5) * sqrt2
+            sum_sq = r_comp * r_comp + i_comp * i_comp + o_comp * o_comp
+            sum_sq = np.clip(sum_sq, 0.0, 1.0 - 1e-8)
+            n_comp = np.sqrt(1.0 - sum_sq)
+            variant = (packed_rot >> 30).astype(np.int32)
+
+            x = np.empty(vert_count, dtype=np.float32)
+            y = np.empty(vert_count, dtype=np.float32)
+            z = np.empty(vert_count, dtype=np.float32)
+            w = np.empty(vert_count, dtype=np.float32)
+
+            mask0 = variant == 0
+            x[mask0] = n_comp[mask0]
+            y[mask0] = r_comp[mask0]
+            z[mask0] = i_comp[mask0]
+            w[mask0] = o_comp[mask0]
+
+            mask1 = variant == 1
+            x[mask1] = r_comp[mask1]
+            y[mask1] = n_comp[mask1]
+            z[mask1] = i_comp[mask1]
+            w[mask1] = o_comp[mask1]
+
+            mask2 = variant == 2
+            x[mask2] = r_comp[mask2]
+            y[mask2] = i_comp[mask2]
+            z[mask2] = n_comp[mask2]
+            w[mask2] = o_comp[mask2]
+
+            mask3 = variant == 3
+            x[mask3] = r_comp[mask3]
+            y[mask3] = i_comp[mask3]
+            z[mask3] = o_comp[mask3]
+            w[mask3] = n_comp[mask3]
+
+            x_new = z.copy()
+            y_new = y.copy()
+            z_new = x.copy()
+            w_new = w.copy()
+            norm = np.sqrt(x_new * x_new + y_new * y_new + z_new * z_new + w_new * w_new)
+            norm[norm == 0.0] = 1.0
+            x_new /= norm
+            y_new /= norm
+            z_new /= norm
+            w_new /= norm
+            rotations = np.stack((w_new, x_new, y_new, z_new), axis=1)
+
+            rest_dim = (self.max_sh_degree + 1) ** 2 - 1
+            if rest_dim > 0:
+                try:
+                    sh_element = plydata['sh']
+                    sh_names = sh_element.data.dtype.names
+                    sh_array = np.column_stack([sh_element.data[name] for name in sh_names]).astype(np.float32)
+                    expected = rest_dim * 3
+                    if sh_array.shape[1] != expected:
+                        raise ValueError(f"Unexpected SH coefficient count: {sh_array.shape[1]} vs {expected}")
+                    features_extra = sh_array / 255.0 * 2.0 - 1.0
+                    features_extra = features_extra.reshape(vert_count, 3, rest_dim)
+                except KeyError:
+                    features_extra = np.zeros((vert_count, 3, rest_dim), dtype=np.float32)
+            else:
+                features_extra = np.zeros((vert_count, 3, 0), dtype=np.float32)
+
+            xyz_tensor = torch.tensor(xyz, dtype=torch.float, device="cuda")
+            log_scale_tensor = torch.tensor(log_scales, dtype=torch.float, device="cuda")
+            rotation_tensor = torch.tensor(rotations, dtype=torch.float, device="cuda")
+            alpha_tensor = torch.tensor(alpha.reshape(-1, 1), dtype=torch.float, device="cuda")
+            alpha_tensor = torch.clamp(alpha_tensor, 1e-6, 1.0 - 1e-6)
+            opacity_tensor = self.inverse_opacity_activation(alpha_tensor)
+
+            colors_tensor = torch.tensor(colors, dtype=torch.float, device="cuda")
+            # colors_tensor = torch.clamp(colors_tensor, 0.0, 1.0)
+            features_dc = RGB2SH(colors_tensor).unsqueeze(-1)
+
+            if features_extra.shape[2] > 0:
+                features_rest_tensor = torch.tensor(features_extra, dtype=torch.float, device="cuda")
+            else:
+                features_rest_tensor = torch.zeros((vert_count, 3, features_extra.shape[2]), dtype=torch.float, device="cuda")
+
+            self._xyz = nn.Parameter(xyz_tensor.requires_grad_(True))
+            self._features_dc = nn.Parameter(features_dc.transpose(1, 2).contiguous().requires_grad_(True))
+            self._features_rest = nn.Parameter(features_rest_tensor.transpose(1, 2).contiguous().requires_grad_(True))
+            self._opacity = nn.Parameter(opacity_tensor.requires_grad_(True))
+            self._scaling = nn.Parameter(log_scale_tensor.requires_grad_(True))
+            self._rotation = nn.Parameter(rotation_tensor.requires_grad_(True))
+
+        elif {"x", "y", "z"}.issubset(vertex_props):
+            xyz = np.stack((vertex_data['x'], vertex_data['y'], vertex_data['z']), axis=1).astype(np.float32)
+            opacities = vertex_data['opacity'].astype(np.float32)[..., np.newaxis]
+
+            features_dc = np.stack([
+                vertex_data['f_dc_0'],
+                vertex_data['f_dc_1'],
+                vertex_data['f_dc_2']
+            ], axis=1).astype(np.float32)[..., np.newaxis]
+
+            rest_dim = (self.max_sh_degree + 1) ** 2 - 1
+            extra_f_names = [p.name for p in vertex_element.properties if p.name.startswith("f_rest_")]
+            extra_f_names = sorted(extra_f_names, key=lambda name: int(name.split('_')[-1]))
+            if extra_f_names:
+                features_extra = np.stack([vertex_data[name] for name in extra_f_names], axis=1).astype(np.float32)
+                features_extra = features_extra.reshape(features_extra.shape[0], 3, rest_dim)
+            else:
+                features_extra = np.zeros((xyz.shape[0], 3, rest_dim), dtype=np.float32)
+
+            scale_names = sorted([p.name for p in vertex_element.properties if p.name.startswith("scale_")], key=lambda name: int(name.split('_')[-1]))
+            scales = np.stack([vertex_data[name] for name in scale_names], axis=1).astype(np.float32)
+
+            rot_names = sorted([p.name for p in vertex_element.properties if p.name.startswith("rot_")], key=lambda name: int(name.split('_')[-1]))
+            rots = np.stack([vertex_data[name] for name in rot_names], axis=1).astype(np.float32)
+
+            self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._features_dc = nn.Parameter(torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+            self._features_rest = nn.Parameter(torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True))
+            self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
+            self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+
+        else:
+            raise ValueError("Unsupported PLY vertex format")
 
         self.active_sh_degree = self.max_sh_degree
 
