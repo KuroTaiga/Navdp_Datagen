@@ -14,3 +14,4 @@ screenshots
 storage_remote_config.sh
 *.json
 data
+.env
