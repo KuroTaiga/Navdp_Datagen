@@ -20,5 +20,6 @@ dependencies:
   - gxx_linux-64=12
   - pip:
       - dotenv
-      - openai
+      - opena
+      - matplotlib
 prefix: /home/dongjk/.conda/envs/cuda121

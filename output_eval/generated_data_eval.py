@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from openai import OpenAI
+from openai import OpenAI, AzureOpenAI
 from dotenv import load_dotenv
 
 # ---------------------------
@@ -22,16 +22,31 @@ APP_VERSION = os.getenv("DATAEVAL_APP_VERSION", "1.0")
 if not API_KEY:
     raise RuntimeError("Missing DATAEVAL_API_KEY in .env file")
 
-client = OpenAI(
-    api_key=API_KEY,
-    base_url=API_ENDPOINT
-)
+
+def create_client():
+    endpoint = (API_ENDPOINT or "").rstrip("/")
+    if endpoint and ("azure.com" in endpoint or "cognitiveservices" in endpoint):
+        if not APP_VERSION:
+            raise RuntimeError("DATAEVAL_APP_VERSION must be set for Azure OpenAI usage")
+        return AzureOpenAI(
+            api_key=API_KEY,
+            azure_endpoint=endpoint,
+            api_version=APP_VERSION
+        )
+    # Default to the public OpenAI API
+    return OpenAI(
+        api_key=API_KEY,
+        base_url=endpoint or None
+    )
+
+
+client = create_client()
 
 # ---------------------------
 # CONFIGURABLE PARAMETERS
 # ---------------------------
 
-DATA_ROOT = "../data/path_video_frames_random_humans_33w"
+DATA_ROOT = "../data/path_video_frames_random_humans_65k"
 
 MAX_FRAMES_PER_VIDEO = 12
 OVERALL_CUTOFF = 0
