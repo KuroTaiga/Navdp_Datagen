@@ -1,13 +1,21 @@
+from __future__ import annotations
+
 import os
 import json
 import statistics
 import base64
+from typing import Any, List, TYPE_CHECKING
 import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
-from openai import OpenAI, AzureOpenAI
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from openai.types.chat import (
+        ChatCompletionContentPartParam,
+        ChatCompletionMessageParam,
+    )
 
 # ---------------------------
 # LOAD ENVIRONMENT VARIABLES
@@ -19,11 +27,22 @@ API_ENDPOINT = os.getenv("DATAEVAL_ENDPOINT", "https://api.openai.com/v1")
 API_MODEL = os.getenv("DATAEVAL_MODEL", "chat4o")
 APP_VERSION = os.getenv("DATAEVAL_APP_VERSION", "1.0")
 
-if not API_KEY:
+QWEN_MODEL_ID = os.getenv("QWEN_MODEL_ID", "Qwen/Qwen2-VL-7B-Instruct")
+QWEN_MAX_NEW_TOKENS = int(os.getenv("QWEN_MAX_NEW_TOKENS", "256"))
+QWEN_DEVICE = os.getenv("QWEN_DEVICE", "auto")
+PROVIDER = os.getenv("DATAEVAL_PROVIDER", "openai").strip().lower()
+
+VALID_PROVIDERS = {"openai", "qwen_local"}
+if PROVIDER not in VALID_PROVIDERS:
+    raise RuntimeError(f"Unsupported DATAEVAL_PROVIDER '{PROVIDER}'. Valid options: {sorted(VALID_PROVIDERS)}")
+
+if PROVIDER == "openai" and not API_KEY:
     raise RuntimeError("Missing DATAEVAL_API_KEY in .env file")
 
 
-def create_client():
+def create_openai_client():
+    from openai import OpenAI, AzureOpenAI  # Local import to keep dependency optional for Qwen
+
     endpoint = (API_ENDPOINT or "").rstrip("/")
     if endpoint and ("azure.com" in endpoint or "cognitiveservices" in endpoint):
         if not APP_VERSION:
@@ -40,7 +59,11 @@ def create_client():
     )
 
 
-client = create_client()
+client = create_openai_client() if PROVIDER == "openai" else None
+
+_QWEN_MODEL = None
+_QWEN_PROCESSOR = None
+_QWEN_DEVICE_CACHE = None
 
 # ---------------------------
 # CONFIGURABLE PARAMETERS
@@ -51,17 +74,57 @@ DATA_ROOT = "../data/path_video_frames_random_humans_65k"
 MAX_FRAMES_PER_VIDEO = 12
 OVERALL_CUTOFF = 0
 
-PROMPT_PATH = "eval_prompt.txt"
+PROMPT_PATH = Path(__file__).with_name("eval_prompt.txt")
 
 
 def load_eval_prompt():
-    if not os.path.exists(PROMPT_PATH):
+    if not PROMPT_PATH.exists():
         raise FileNotFoundError(f"Evaluation prompt file not found: {PROMPT_PATH}")
-    with open(PROMPT_PATH, "r", encoding="utf-8") as f:
-        return f.read()
+    return PROMPT_PATH.read_text(encoding="utf-8")
 
 
 EVAL_PROMPT = load_eval_prompt()
+
+
+def load_qwen_model():
+    """Lazy-load the local Qwen-VL model and processor."""
+    global _QWEN_MODEL, _QWEN_PROCESSOR, _QWEN_DEVICE_CACHE
+
+    if PROVIDER != "qwen_local":
+        raise RuntimeError("Qwen model requested but DATAEVAL_PROVIDER is not 'qwen_local'")
+
+    if _QWEN_MODEL is not None and _QWEN_PROCESSOR is not None:
+        return _QWEN_MODEL, _QWEN_PROCESSOR, _QWEN_DEVICE_CACHE
+
+    try:
+        from transformers import AutoModelForVision2Seq, AutoProcessor
+        import torch
+    except ImportError as exc:
+        raise RuntimeError(
+            "transformers and torch are required for DATAEVAL_PROVIDER=qwen_local"
+        ) from exc
+
+    processor = AutoProcessor.from_pretrained(QWEN_MODEL_ID, trust_remote_code=True)
+
+    dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = AutoModelForVision2Seq.from_pretrained(
+        QWEN_MODEL_ID,
+        trust_remote_code=True,
+        torch_dtype=dtype,
+        device_map="auto" if QWEN_DEVICE == "auto" else None,
+    )
+
+    target_device: Any
+    if QWEN_DEVICE == "auto":
+        target_device = getattr(model, "device", torch.device("cpu"))
+    else:
+        target_device = torch.device(QWEN_DEVICE)
+        model.to(target_device)
+
+    _QWEN_MODEL = model
+    _QWEN_PROCESSOR = processor
+    _QWEN_DEVICE_CACHE = target_device
+    return _QWEN_MODEL, _QWEN_PROCESSOR, _QWEN_DEVICE_CACHE
 
 
 # ---------------------------
@@ -103,26 +166,113 @@ def sample_video_frames(video_path, max_frames=MAX_FRAMES_PER_VIDEO):
 
 def evaluate_video(video_path):
     frames_b64 = sample_video_frames(video_path)
+    if not frames_b64:
+        raise ValueError(f"Could not extract frames from video: {video_path}")
 
-    content_blocks = []
+    if PROVIDER == "openai":
+        return evaluate_with_openai(video_path, frames_b64)
+    if PROVIDER == "qwen_local":
+        return evaluate_with_qwen(video_path, frames_b64)
+    raise RuntimeError(f"Unsupported provider: {PROVIDER}")
+
+
+def build_user_instructions(video_name: str) -> str:
+    return (
+        f"Video file: {video_name}. Review the evenly sampled frames provided below. "
+        "Assign 0-10 scores for Quality, Realism, and Overall fidelity, then explain your judgment. "
+        "Respond in four lines starting with 'Quality:', 'Realism:', 'Overall:', and 'Reason:'."
+    )
+
+
+def evaluate_with_openai(video_path: str, frames_b64: List[str]):
+    if client is None:
+        raise RuntimeError("OpenAI client is not initialized")
+
+    video_name = Path(video_path).name
+    user_instructions = build_user_instructions(video_name)
+
+    content_blocks: List["ChatCompletionContentPartParam"] = [
+        {"type": "text", "text": user_instructions}
+    ]
     for b64 in frames_b64:
         content_blocks.append({
-            "type": "input_image",
-            "image_base64": b64,
-            "image_type": "jpg"
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{b64}",
+            }
         })
+
+    messages: List["ChatCompletionMessageParam"] = [
+        {
+            "role": "system",
+            "content": [{"type": "text", "text": EVAL_PROMPT}],
+        },
+        {
+            "role": "user",
+            "content": content_blocks,
+        },
+    ]
 
     response = client.chat.completions.create(
         model=API_MODEL,
-        messages=[
-            {"role": "system", "content": EVAL_PROMPT},
-            {"role": "user", "content": content_blocks},
-        ],
+        messages=messages,
     )
 
-    text = response.choices[0].message["content"]
+    message = response.choices[0].message
+    text = _coerce_message_text(message)
+    if not text:
+        raise ValueError(f"LLM returned empty content for {video_path}")
+    return _parse_score_block(text, video_path)
+
+
+def evaluate_with_qwen(video_path: str, frames_b64: List[str]):
+    model, processor, target_device = load_qwen_model()
+    video_name = Path(video_path).name
+
+    from io import BytesIO
+    from PIL import Image
+
+    images = []
+    for b64 in frames_b64:
+        img = Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
+        images.append(img)
+
+    text_prompt = f"{EVAL_PROMPT.strip()}\n\n{build_user_instructions(video_name)}"
+    user_content = [{"type": "text", "text": text_prompt}]
+    user_content.extend({"type": "image"} for _ in images)
+
+    messages = [{"role": "user", "content": user_content}]
+    inputs = processor(messages=messages, images=images, return_tensors="pt")
+    if hasattr(inputs, "to") and target_device is not None:
+        inputs = inputs.to(target_device)
+
+    generated_ids = model.generate(**inputs, max_new_tokens=QWEN_MAX_NEW_TOKENS)
+    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    if not text:
+        raise ValueError(f"Qwen returned empty content for {video_path}")
+    return _parse_score_block(text, video_path)
+
+
+def _coerce_message_text(message: Any) -> str:
+    content = getattr(message, "content", "")
+
+    def _extract_text(part: Any) -> str:
+        if isinstance(part, dict):
+            if part.get("type") == "text":
+                return part.get("text", "")
+            return ""
+        if getattr(part, "type", None) == "text":
+            return getattr(part, "text", "")
+        return ""
+
+    if isinstance(content, list):
+        return "\n".join(filter(None, (_extract_text(p) for p in content))).strip()
+    return (content or "").strip()
+
+
+def _parse_score_block(text: str, video_path: str):
     lines = [x.strip() for x in text.split("\n") if x.strip()]
-    out = {}
+    out: dict[str, Any] = {}
 
     for line in lines:
         if line.startswith("Quality:"):
