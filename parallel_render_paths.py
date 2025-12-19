@@ -158,7 +158,9 @@ class ProgressTracker:
         if avg_path_time is not None and remaining_paths > 0:
             eta_seconds = avg_path_time * remaining_paths
 
-        stage_total = sum(self.stage_totals.get(stage, 0.0) for stage in self.STAGE_KEYS)
+        stage_total = sum(
+            self.stage_totals.get(stage, 0.0) for stage in self.STAGE_KEYS
+        )
         stage_ratios = {}
         for stage in self.STAGE_KEYS:
             value = self.stage_totals.get(stage, 0.0)
@@ -203,11 +205,16 @@ def _load_metrics_json(path: Path) -> dict | None:
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        print(f"[METRICS] WARN: Metrics file missing at {path}; job may have failed early.", flush=True)
+        print(
+            f"[METRICS] WARN: Metrics file missing at {path}; job may have failed early.",
+            flush=True,
+        )
         return None
     stripped = text.strip()
     if not stripped:
-        print(f"[METRICS] WARN: Metrics file {path} is empty; skipping entry.", flush=True)
+        print(
+            f"[METRICS] WARN: Metrics file {path} is empty; skipping entry.", flush=True
+        )
         return None
     try:
         return json.loads(stripped)
@@ -278,7 +285,7 @@ def parse_args() -> argparse.Namespace:
         action="append",
         default=[],
         help="Additional CLI snippet appended to every render_label_paths.py command "
-        "(example: --render-extra-args \"--overwrite --gpu-only\").",
+        '(example: --render-extra-args "--overwrite --gpu-only").',
     )
     parser.add_argument(
         "--output-dir",
@@ -342,7 +349,9 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_manifest(path: Path) -> tuple[dict[str, dict], list[AssignmentEntry], dict[str, Any]]:
+def load_manifest(
+    path: Path,
+) -> tuple[dict[str, dict], list[AssignmentEntry], dict[str, Any]]:
     manifest = json.loads(path.read_text())
     actor_map: dict[str, dict] = {}
     for entry in manifest.get("actors", []):
@@ -352,7 +361,9 @@ def load_manifest(path: Path) -> tuple[dict[str, dict], list[AssignmentEntry], d
         actor_id = row["actor_id"]
         actor_info = actor_map.get(actor_id)
         if not actor_info:
-            raise KeyError(f"Actor {actor_id} referenced by assignment but missing from manifest.")
+            raise KeyError(
+                f"Actor {actor_id} referenced by assignment but missing from manifest."
+            )
         assignments.append(
             AssignmentEntry(
                 scene=row["scene"],
@@ -365,7 +376,9 @@ def load_manifest(path: Path) -> tuple[dict[str, dict], list[AssignmentEntry], d
                 actor_fps=float(actor_info.get("fps", DEFAULT_VIDEO_FPS)),
                 follow_distance=float(actor_info.get("follow_distance", 1.5)),
                 follow_buffer=float(actor_info.get("follow_buffer", 0.5)),
-                actor_foot_offset=float(row.get("actor_foot_offset", actor_info.get("foot_offset", 0.0))),
+                actor_foot_offset=float(
+                    row.get("actor_foot_offset", actor_info.get("foot_offset", 0.0))
+                ),
                 animation_cycle_mod=int(actor_info.get("animation_cycle_mod", 3)),
                 actor_loop=bool(actor_info.get("loop", True)),
             )
@@ -420,7 +433,9 @@ def gather_label_tasks(
             continue
         json_path = label_dir / f"{entry.label}.json"
         if not json_path.is_file():
-            skipped.append({"scene": entry.scene, "label": entry.label, "reason": "label_missing"})
+            skipped.append(
+                {"scene": entry.scene, "label": entry.label, "reason": "label_missing"}
+            )
             continue
         try:
             prepared = prepare_path_data(
@@ -430,13 +445,23 @@ def gather_label_tasks(
                 mirror_translation=mirror_translation,
                 swap_xy=swap_xy,
             )
-            path_length = float(PathSampler(prepared.path_xy).total_length) if len(prepared.path_xy) >= 2 else 0.0
+            path_length = (
+                float(PathSampler(prepared.path_xy).total_length)
+                if len(prepared.path_xy) >= 2
+                else 0.0
+            )
             estimated_frames = estimate_actor_frame_count(
                 prepared.path_xy,
                 follow_distance=entry.follow_distance,
             )
         except Exception as exc:  # pylint: disable=broad-except
-            skipped.append({"scene": entry.scene, "label": entry.label, "reason": f"prepare_failed: {exc}"})
+            skipped.append(
+                {
+                    "scene": entry.scene,
+                    "label": entry.label,
+                    "reason": f"prepare_failed: {exc}",
+                }
+            )
             continue
 
         if minimal_frames is not None and estimated_frames < minimal_frames:
@@ -487,7 +512,9 @@ RESUME_STATUS_RE = re.compile(
 )
 
 
-def load_resume_statuses_from_log(log_path: Path) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+def load_resume_statuses_from_log(
+    log_path: Path,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
     if not log_path.is_file():
         raise FileNotFoundError(f"Resume log not found: {log_path}")
     completed: set[tuple[str, str]] = set()
@@ -516,15 +543,21 @@ def filter_tasks_by_scene_shard(
     if shard_index is None and shard_count is None:
         return list(tasks)
     if shard_index is None or shard_count is None:
-        raise ValueError("Both --scene-shard-index and --scene-shard-count must be specified together.")
+        raise ValueError(
+            "Both --scene-shard-index and --scene-shard-count must be specified together."
+        )
     if shard_count <= 0:
         raise ValueError("--scene-shard-count must be positive.")
     zero_based = shard_index - 1
     if zero_based < 0 or zero_based >= shard_count:
-        raise ValueError("--scene-shard-index must be between 1 and --scene-shard-count inclusive.")
+        raise ValueError(
+            "--scene-shard-index must be between 1 and --scene-shard-count inclusive."
+        )
     scene_ids = sorted({task.assignment.scene for task in tasks})
     selected_scenes = {
-        scene for idx, scene in enumerate(scene_ids) if (idx % shard_count) == zero_based
+        scene
+        for idx, scene in enumerate(scene_ids)
+        if (idx % shard_count) == zero_based
     }
     return [task for task in tasks if task.assignment.scene in selected_scenes]
 
@@ -681,7 +714,9 @@ def main() -> None:
     args = parse_args()
     actor_map, assignments, manifest = load_manifest(args.assignment_manifest)
     if not assignments:
-        raise SystemExit("Assignment manifest does not contain any label-path pairings.")
+        raise SystemExit(
+            "Assignment manifest does not contain any label-path pairings."
+        )
 
     extra_args: list[str] = []
     for snippet in args.render_extra_args:
@@ -696,7 +731,9 @@ def main() -> None:
         mirror_translation=args.mirror_translation,
         minimal_frames=args.minimal_frames,
     )
-    tasks = filter_tasks_by_scene_shard(tasks, args.scene_shard_index, args.scene_shard_count)
+    tasks = filter_tasks_by_scene_shard(
+        tasks, args.scene_shard_index, args.scene_shard_count
+    )
     if not tasks:
         print("[WARN] No label paths satisfied the current filters.", flush=True)
 
@@ -704,25 +741,40 @@ def main() -> None:
     plans.sort(key=lambda p: (p.scene, p.actor_id))
     skipped_jobs_from_log = 0
     if args.skip_completed_log is not None:
-        completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
+        completed_pairs, failed_pairs = load_resume_statuses_from_log(
+            args.skip_completed_log
+        )
         if completed_pairs:
             before = len(plans)
-            plans = [plan for plan in plans if (plan.scene, plan.actor_id) not in completed_pairs]
+            plans = [
+                plan
+                for plan in plans
+                if (plan.scene, plan.actor_id) not in completed_pairs
+            ]
             skipped_jobs_from_log = before - len(plans)
             print(
                 f"[RESUME] Loaded {len(completed_pairs)} completed jobs from {args.skip_completed_log}.",
                 flush=True,
             )
             if skipped_jobs_from_log:
-                print(f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.", flush=True)
+                print(
+                    f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.",
+                    flush=True,
+                )
         else:
-            print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
+            print(
+                f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.",
+                flush=True,
+            )
         if failed_pairs:
             print(
                 f"[RESUME] {len(failed_pairs)} jobs recorded as FAILED in the log will be retried.",
                 flush=True,
             )
-    print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
+    print(
+        f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).",
+        flush=True,
+    )
 
     progress_tracker = ProgressTracker(
         total_jobs=len(plans),
@@ -749,7 +801,16 @@ def main() -> None:
             )
             job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
             job_slot = ((idx - 1) % max_workers) + 1
-            cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+            cmd.extend(
+                [
+                    "--job-slot",
+                    str(job_slot),
+                    "--job-name",
+                    job_name,
+                    "--job-actor-id",
+                    plan.actor_id,
+                ]
+            )
             result = run_job(
                 idx,
                 plan,
@@ -781,7 +842,16 @@ def main() -> None:
                 )
                 job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
                 job_slot = ((idx - 1) % max_workers) + 1
-                cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+                cmd.extend(
+                    [
+                        "--job-slot",
+                        str(job_slot),
+                        "--job-name",
+                        job_name,
+                        "--job-actor-id",
+                        plan.actor_id,
+                    ]
+                )
                 metrics_path = metrics_dir / f"{job_name}.json"
                 cmd.extend(["--metrics-json", str(metrics_path)])
                 future = pool.submit(
@@ -822,7 +892,9 @@ def main() -> None:
         "executed_jobs": sum(1 for r in results if r["status"] not in ("dry-run",)),
         "successful_jobs": sum(1 for r in results if r["status"] == "success"),
         "failed_jobs": sum(1 for r in results if r["status"] == "failed"),
-        "skip_completed_log": str(args.skip_completed_log) if args.skip_completed_log else None,
+        "skip_completed_log": str(args.skip_completed_log)
+        if args.skip_completed_log
+        else None,
         "jobs_skipped_via_log": skipped_jobs_from_log,
         "path_assignments": [
             {

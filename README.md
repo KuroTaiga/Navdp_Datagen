@@ -100,9 +100,10 @@ The optimizer uses PyTorch and CUDA extensions in a Python environment to produc
 
 Our default, provided install method is based on Conda package and environment management:
 ```shell
-SET DISTUTILS_USE_SDK=1 # Windows only
-conda env create --file environment.yml
-conda activate gaussian_splatting
+conda create -n navdp_datagen python=3.10 -y
+conda activate navdp_datagen
+pip install torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu121
+pip install -r requirements.txt
 ```
 Please note that this process assumes that you have CUDA SDK **11** installed, not **12**. For modifications, see below.
 

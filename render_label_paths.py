@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#search for "test" for comments to be remvoed after testing of the implementation is done
+# search for "test" for comments to be remvoed after testing of the implementation is done
 
 """Render walkthrough frames for raster_world trajectories.
 
@@ -10,7 +10,7 @@ that path, orients it along the motion direction, and renders individual frames
 that can later be stitched into a video.
 """
 
-#use stabilize to stabilize forward direction
+# use stabilize to stabilize forward direction
 from __future__ import annotations
 import os
 import shutil
@@ -86,7 +86,9 @@ def ensure_output_dir_writable(path: Path) -> None:
     try:
         sentinel.write_text("navdp_datagen_probe", encoding="utf-8")
     except Exception as exc:  # pylint: disable=broad-except
-        raise PermissionError(f"Cannot write to output directory {path}: {exc}") from exc
+        raise PermissionError(
+            f"Cannot write to output directory {path}: {exc}"
+        ) from exc
     finally:
         with contextlib.suppress(Exception):
             sentinel.unlink()
@@ -97,6 +99,7 @@ def _disk_free_bytes(path: Path) -> int:
     """Return free bytes on the filesystem hosting 'path'."""
     usage = shutil.disk_usage(str(path))
     return int(usage.free)
+
 
 def _safe_move(src: Path, dst: Path) -> None:
     """
@@ -111,10 +114,14 @@ def _safe_move(src: Path, dst: Path) -> None:
             dst.unlink()
     shutil.move(str(src), str(dst))
 
+
 class _OffloadWorker:
     """Async mover to NAS so rendering never blocks."""
+
     def __init__(self, maxsize: int = 256, verbose: bool = False):
-        self.q: "queue.Queue[tuple[callable, tuple, dict]]" = queue.Queue(maxsize=maxsize)
+        self.q: "queue.Queue[tuple[callable, tuple, dict]]" = queue.Queue(
+            maxsize=maxsize
+        )
         self._ok = True
         self._t = threading.Thread(target=self._loop, daemon=True)
         self._verbose = verbose
@@ -158,8 +165,14 @@ class _OffloadWorker:
         except Exception:
             pass
 
+
 def offload_label_outputs(
-    *, local_out_root: Path, nas_out_root: Path, scene_id: str, label_stem: str, verbose: bool = False
+    *,
+    local_out_root: Path,
+    nas_out_root: Path,
+    scene_id: str,
+    label_stem: str,
+    verbose: bool = False,
 ) -> list[tuple[Path, Path]]:
     """
     Move the just-produced outputs for one label path to the NAS mirror:
@@ -173,14 +186,18 @@ def offload_label_outputs(
     """
     moved: list[tuple[Path, Path]] = []
     local_scene_dir = local_out_root / scene_id
-    nas_scene_dir   = nas_out_root   / scene_id
+    nas_scene_dir = nas_out_root / scene_id
 
     # 1) frames directory (contains all frame PNGs, depth NPYs, camera JSONs)
     frames_dir = local_scene_dir / label_stem
     if frames_dir.exists() and frames_dir.is_dir():
         _safe_move(frames_dir, nas_scene_dir / label_stem)
         moved.append((frames_dir, nas_scene_dir / label_stem))
-        if verbose: print(f"[OFFLOAD] moved frames dir -> {nas_scene_dir/label_stem}", flush=True)
+        if verbose:
+            print(
+                f"[OFFLOAD] moved frames dir -> {nas_scene_dir / label_stem}",
+                flush=True,
+            )
 
     # 2) ALL files matching label_stem pattern
     if local_scene_dir.exists():
@@ -190,17 +207,28 @@ def offload_label_outputs(
                 try:
                     _safe_move(entry, dst)
                     moved.append((entry, dst))
-                    if verbose: 
+                    if verbose:
                         print(f"[OFFLOAD] moved {entry.name} -> {dst}", flush=True)
                 except Exception as e:
                     if verbose:
-                        print(f"[OFFLOAD] WARN: failed to move {entry} -> {dst}: {e}", flush=True)
+                        print(
+                            f"[OFFLOAD] WARN: failed to move {entry} -> {dst}: {e}",
+                            flush=True,
+                        )
 
     return moved
 
+
 def maybe_offload_if_low_space(
-    *, check_path: Path, min_free_bytes: int, local_out_root: Path, nas_out_root: Path,
-    scene_id: str, label_stem: str, verbose: bool = False, offloader: _OffloadWorker | None=None
+    *,
+    check_path: Path,
+    min_free_bytes: int,
+    local_out_root: Path,
+    nas_out_root: Path,
+    scene_id: str,
+    label_stem: str,
+    verbose: bool = False,
+    offloader: _OffloadWorker | None = None,
 ) -> None:
     """
     If free space on the filesystem hosting 'check_path' is below 'min_free_bytes',
@@ -216,12 +244,14 @@ def maybe_offload_if_low_space(
                 flush=True,
             )
         if offloader is not None:
-            offloader.enqueue(offload_label_outputs,
-                              local_out_root=local_out_root,
-                              nas_out_root=nas_out_root,
-                              scene_id=scene_id,
-                              label_stem=label_stem,
-                              verbose=verbose)
+            offloader.enqueue(
+                offload_label_outputs,
+                local_out_root=local_out_root,
+                nas_out_root=nas_out_root,
+                scene_id=scene_id,
+                label_stem=label_stem,
+                verbose=verbose,
+            )
         else:
             offload_label_outputs(
                 local_out_root=local_out_root,
@@ -230,6 +260,7 @@ def maybe_offload_if_low_space(
                 label_stem=label_stem,
                 verbose=verbose,
             )
+
 
 def consolidate_outputs_to_nas(
     *, local_out_root: Path, nas_out_root: Path, verbose: bool = False
@@ -257,15 +288,24 @@ def consolidate_outputs_to_nas(
             if entry.is_dir():
                 if entry.name.startswith("__tmp"):
                     if verbose:
-                        print(f"[CONSOLIDATE] skipping temp dir {scene_id}/{entry.name}", flush=True)
+                        print(
+                            f"[CONSOLIDATE] skipping temp dir {scene_id}/{entry.name}",
+                            flush=True,
+                        )
                     continue
                 dst = nas_scene_dir / entry.name
                 try:
                     _safe_move(entry, dst)
                     if verbose:
-                        print(f"[CONSOLIDATE] moved dir {scene_id}/{entry.name} -> {dst}", flush=True)
+                        print(
+                            f"[CONSOLIDATE] moved dir {scene_id}/{entry.name} -> {dst}",
+                            flush=True,
+                        )
                 except Exception as e:
-                    print(f"[CONSOLIDATE] WARN: failed to move {entry} -> {dst}: {e}", flush=True)
+                    print(
+                        f"[CONSOLIDATE] WARN: failed to move {entry} -> {dst}: {e}",
+                        flush=True,
+                    )
 
         # 2) Move ALL remaining files (no filtering by extension)
         for entry in sorted(scene_dir.iterdir()):
@@ -274,19 +314,31 @@ def consolidate_outputs_to_nas(
                 try:
                     _safe_move(entry, dst)
                     if verbose:
-                        print(f"[CONSOLIDATE] moved file {scene_id}/{entry.name} -> {dst}", flush=True)
+                        print(
+                            f"[CONSOLIDATE] moved file {scene_id}/{entry.name} -> {dst}",
+                            flush=True,
+                        )
                 except Exception as e:
-                    print(f"[CONSOLIDATE] WARN: failed to move {entry} -> {dst}: {e}", flush=True)
+                    print(
+                        f"[CONSOLIDATE] WARN: failed to move {entry} -> {dst}: {e}",
+                        flush=True,
+                    )
 
         # 3) Clean empty scene dir
         try:
             if not any(scene_dir.iterdir()):
                 scene_dir.rmdir()
                 if verbose:
-                    print(f"[CONSOLIDATE] removed empty scene dir {scene_id}", flush=True)
+                    print(
+                        f"[CONSOLIDATE] removed empty scene dir {scene_id}", flush=True
+                    )
         except Exception as e:
             if verbose:
-                print(f"[CONSOLIDATE] could not remove scene dir {scene_id}: {e}", flush=True)
+                print(
+                    f"[CONSOLIDATE] could not remove scene dir {scene_id}: {e}",
+                    flush=True,
+                )
+
 
 ### helpers
 def _format_bytes(num_bytes: int) -> str:
@@ -311,7 +363,9 @@ def _scene_prefix(scene_id: str) -> str:
     return scene_id.split("_", 1)[0]
 
 
-def _log_vram_usage(message: str, device: torch.device, before_bytes: int | None = None) -> int:
+def _log_vram_usage(
+    message: str, device: torch.device, before_bytes: int | None = None
+) -> int:
     """
     Print current and delta GPU memory usage when verbose mode is active.
     Returns the current allocation so callers can reuse it as the next 'before'.
@@ -322,7 +376,10 @@ def _log_vram_usage(message: str, device: torch.device, before_bytes: int | None
     else:
         delta = current - before_bytes
         delta_str = f" (delta={_format_bytes(delta)})"
-    print(f"[VERBOSE][VRAM] {message}: total={_format_bytes(current)}{delta_str}", flush=True)
+    print(
+        f"[VERBOSE][VRAM] {message}: total={_format_bytes(current)}{delta_str}",
+        flush=True,
+    )
     return current
 
 
@@ -370,8 +427,16 @@ class PathMetricRecorder:
         job_actor_id: str | None,
         job_name: str | None,
     ) -> dict:
-        fps = (frames_rendered / total_duration) if frames_rendered > 0 and total_duration > 0 else None
-        peak_bytes = int(torch.cuda.max_memory_allocated(self.device)) if self._have_cuda else None
+        fps = (
+            (frames_rendered / total_duration)
+            if frames_rendered > 0 and total_duration > 0
+            else None
+        )
+        peak_bytes = (
+            int(torch.cuda.max_memory_allocated(self.device))
+            if self._have_cuda
+            else None
+        )
         avg_bytes = None
         if self.vram_samples:
             avg_bytes = sum(self.vram_samples) / len(self.vram_samples)
@@ -382,15 +447,30 @@ class PathMetricRecorder:
                 avg_bytes = None
         total_measured = sum(
             self.stage_seconds.get(stage, 0.0)
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE)
+            for stage in (
+                self.VIDEO_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.PLY_STAGE,
+            )
         )
         stage_ratios = {}
         if total_measured > 0.0:
             for stage, seconds in self.stage_seconds.items():
-                if stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+                if stage in (
+                    self.VIDEO_STAGE,
+                    self.PNG_STAGE,
+                    self.DEPTH_STAGE,
+                    self.PLY_STAGE,
+                ):
                     stage_ratios[stage] = seconds / total_measured
         else:
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+            for stage in (
+                self.VIDEO_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.PLY_STAGE,
+            ):
                 stage_ratios[stage] = 0.0
 
         return {
@@ -431,7 +511,7 @@ def _cuda_oom_trace(label: str, device: torch.device, verbose: bool = False):
         import traceback
 
         stack_lines = traceback.format_exception(type(exc), exc, exc.__traceback__)
-        stack_text = ''.join(stack_lines).rstrip()
+        stack_text = "".join(stack_lines).rstrip()
 
         diagnostics = (
             f"{message}\n"
@@ -502,11 +582,17 @@ class RegionGaussianModel:
         self.max_sh_degree = base.max_sh_degree
 
         self._xyz = base.get_xyz.index_select(0, indices).detach().contiguous()
-        self._features_dc = base.get_features_dc.index_select(0, indices).detach().contiguous()
-        self._features_rest = base.get_features_rest.index_select(0, indices).detach().contiguous()
+        self._features_dc = (
+            base.get_features_dc.index_select(0, indices).detach().contiguous()
+        )
+        self._features_rest = (
+            base.get_features_rest.index_select(0, indices).detach().contiguous()
+        )
         self._opacity = base.get_opacity.index_select(0, indices).detach().contiguous()
         self._scaling = base.get_scaling.index_select(0, indices).detach().contiguous()
-        self._rotation = base.get_rotation.index_select(0, indices).detach().contiguous()
+        self._rotation = (
+            base.get_rotation.index_select(0, indices).detach().contiguous()
+        )
 
     @property
     def get_xyz(self) -> torch.Tensor:
@@ -552,7 +638,11 @@ def _extract_scaling_components_struct(
         if uniform_scale and len(scale_names) >= 1:
             values = np.asarray(data[scale_names[0]], dtype=np.float32).reshape(-1, 1)
             return np.repeat(values, 3, axis=1)
-        cols = [np.asarray(data[name], dtype=np.float32) for name in scale_names if name in names]
+        cols = [
+            np.asarray(data[name], dtype=np.float32)
+            for name in scale_names
+            if name in names
+        ]
         if cols:
             stacked = np.stack(cols, axis=1)
             if stacked.shape[1] >= 3:
@@ -561,16 +651,20 @@ def _extract_scaling_components_struct(
                 return np.repeat(stacked, 3, axis=1).astype(np.float32, copy=False)
     if {"scale_0", "scale_1", "scale_2"}.issubset(names):
         return np.stack(
-            [np.asarray(data["scale_0"], dtype=np.float32),
-             np.asarray(data["scale_1"], dtype=np.float32),
-             np.asarray(data["scale_2"], dtype=np.float32)],
+            [
+                np.asarray(data["scale_0"], dtype=np.float32),
+                np.asarray(data["scale_1"], dtype=np.float32),
+                np.asarray(data["scale_2"], dtype=np.float32),
+            ],
             axis=1,
         ).astype(np.float32, copy=False)
     if {"scales_0", "scales_1", "scales_2"}.issubset(names):
         return np.stack(
-            [np.asarray(data["scales_0"], dtype=np.float32),
-             np.asarray(data["scales_1"], dtype=np.float32),
-             np.asarray(data["scales_2"], dtype=np.float32)],
+            [
+                np.asarray(data["scales_0"], dtype=np.float32),
+                np.asarray(data["scales_1"], dtype=np.float32),
+                np.asarray(data["scales_2"], dtype=np.float32),
+            ],
             axis=1,
         ).astype(np.float32, copy=False)
     if "scale" in names:
@@ -585,9 +679,11 @@ def _build_scene_debug_vertices(data: np.ndarray) -> np.ndarray:
         return np.zeros((0,), dtype=DEBUG_PLY_DTYPE)
 
     xyz = np.stack(
-        (np.asarray(data["x"], dtype=np.float32),
-         np.asarray(data["y"], dtype=np.float32),
-         np.asarray(data["z"], dtype=np.float32)),
+        (
+            np.asarray(data["x"], dtype=np.float32),
+            np.asarray(data["y"], dtype=np.float32),
+            np.asarray(data["z"], dtype=np.float32),
+        ),
         axis=1,
     )
     scaling = _extract_scaling_components_struct(data)
@@ -612,9 +708,13 @@ def _build_scene_debug_vertices(data: np.ndarray) -> np.ndarray:
     return out
 
 
-def _build_actor_debug_vertices(actor_data: np.ndarray, sequence: ActorSequence) -> np.ndarray:
+def _build_actor_debug_vertices(
+    actor_data: np.ndarray, sequence: ActorSequence
+) -> np.ndarray:
     """Construct a structured array representing the transformed actor gaussians."""
-    xyz = np.stack((actor_data["x"], actor_data["y"], actor_data["z"]), axis=1).astype(np.float32)
+    xyz = np.stack((actor_data["x"], actor_data["y"], actor_data["z"]), axis=1).astype(
+        np.float32
+    )
     scaling = _extract_scaling_components_struct(
         actor_data,
         scale_names=sequence.scale_names,
@@ -642,8 +742,6 @@ def _write_debug_ply(path: Path, data: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     element = PlyElement.describe(data, "vertex")
     PlyData([element], text=False).write(str(path))
-
-
 
 
 @dataclass(frozen=True)
@@ -748,6 +846,7 @@ _DIGIT_PATTERN = re.compile(r"(\d+)")
 ### helper for BEV showing ###
 # ===== BEV helpers =====
 
+
 def _world_to_pixel(meta: dict, xy: np.ndarray) -> tuple[int, int]:
     """
     Convert world (x,y) to occupancy image pixel (u,v).
@@ -758,6 +857,7 @@ def _world_to_pixel(meta: dict, xy: np.ndarray) -> tuple[int, int]:
     v = int(round((float(meta["top"]) - y) / float(meta["scale"])))
     return u, v
 
+
 def _ensure_rgb(img: np.ndarray) -> np.ndarray:
     if img.ndim == 2:
         return np.stack([img, img, img], axis=-1)
@@ -766,7 +866,10 @@ def _ensure_rgb(img: np.ndarray) -> np.ndarray:
         return img[..., :3]
     return img
 
-def _draw_disk(img: np.ndarray, uv: tuple[int, int], r: int, color: tuple[int, int, int]) -> None:
+
+def _draw_disk(
+    img: np.ndarray, uv: tuple[int, int], r: int, color: tuple[int, int, int]
+) -> None:
     h, w = img.shape[:2]
     u0, v0 = uv
     umin = max(0, u0 - r)
@@ -781,7 +884,15 @@ def _draw_disk(img: np.ndarray, uv: tuple[int, int], r: int, color: tuple[int, i
             if du * du + dv * dv <= rr:
                 img[v, u, :] = color
 
-def _draw_polyline(img: np.ndarray, pts: list[tuple[int, int]], color: tuple[int, int, int], thickness: int = 1, dotted = False, dot_gap =6) -> None:
+
+def _draw_polyline(
+    img: np.ndarray,
+    pts: list[tuple[int, int]],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dotted=False,
+    dot_gap=6,
+) -> None:
     """
     Very lightweight line rasterization: sample along each segment with max(|dx|,|dy|)+1 points.
     """
@@ -814,12 +925,16 @@ def _draw_polyline(img: np.ndarray, pts: list[tuple[int, int]], color: tuple[int
             v = int(round(v0 + dv * (t / steps)))
             put(u, v)
 
-def _draw_text_lines(img: np.ndarray, lines: list[str], origin: tuple[int, int] = (8, 8)) -> None:
+
+def _draw_text_lines(
+    img: np.ndarray, lines: list[str], origin: tuple[int, int] = (8, 8)
+) -> None:
     """
     Overlay text if Pillow is available; otherwise draw small colored ticks as a fallback.
     """
     try:
         from PIL import Image, ImageDraw, ImageFont
+
         pil_img = Image.fromarray(img)
         draw = ImageDraw.Draw(pil_img)
         try:
@@ -828,7 +943,14 @@ def _draw_text_lines(img: np.ndarray, lines: list[str], origin: tuple[int, int] 
             font = None
         x, y = origin
         for line in lines:
-            draw.text((x, y), line, fill=(255, 255, 255), font=font, stroke_width=2, stroke_fill=(0, 0, 0))
+            draw.text(
+                (x, y),
+                line,
+                fill=(255, 255, 255),
+                font=font,
+                stroke_width=2,
+                stroke_fill=(0, 0, 0),
+            )
             y += 14
         img[:] = np.array(pil_img)
     except Exception:
@@ -840,6 +962,7 @@ def _draw_text_lines(img: np.ndarray, lines: list[str], origin: tuple[int, int] 
                     img[y, x + dx, :] = (200, 200, 200)
             y += 6
     # Mirror the PATHS (not the image) if requested
+
 
 def save_bev_debug_image(
     *,
@@ -857,22 +980,20 @@ def save_bev_debug_image(
     mirror_bev_x: bool = True,
     mirror_bev_y: bool = True,
 ) -> None:
-
     """
     Draw a BEV (bird's-eye view) image using occupancy.png as background.
     Camera path = magenta, Actor path = green. Mark start/end.
     """
+
     def _mirror_pts(pts: list[tuple[int, int]]) -> list[tuple[int, int]]:
         if not pts:
             return pts
         out = []
-        for (u, v) in pts:
+        for u, v in pts:
             uu = (w - 1 - u) if mirror_bev_x else u
             vv = (h - 1 - v) if mirror_bev_y else v
             out.append((uu, vv))
         return out
-
-
 
     occ_path = SCENES_DIR / scene_id / "occupancy.png"
     if not occ_path.is_file():
@@ -897,14 +1018,18 @@ def save_bev_debug_image(
     act_pts = _mirror_pts(act_pts)
     # Draw polylines
     if cam_pts:
-        _draw_polyline(base, cam_pts, (255, 0, 255), thickness=2, dotted = False)  # magenta
+        _draw_polyline(
+            base, cam_pts, (255, 0, 255), thickness=2, dotted=False
+        )  # magenta
         # start/end markers
-        _draw_disk(base, cam_pts[0], 4, (255, 255, 0))            # yellow start for camera
-        _draw_disk(base, cam_pts[-1], 4, (255, 0, 0))             # red end for camera
+        _draw_disk(base, cam_pts[0], 4, (255, 255, 0))  # yellow start for camera
+        _draw_disk(base, cam_pts[-1], 4, (255, 0, 0))  # red end for camera
     if act_pts:
-        _draw_polyline(base, act_pts, (0, 255, 0), thickness=2, dotted = actor_path_dotted)   # green
-        _draw_disk(base, act_pts[0], 4, (0, 255, 255))            # cyan start for actor
-        _draw_disk(base, act_pts[-1], 4, (0, 128, 0))             # dark green end for actor
+        _draw_polyline(
+            base, act_pts, (0, 255, 0), thickness=2, dotted=actor_path_dotted
+        )  # green
+        _draw_disk(base, act_pts[0], 4, (0, 255, 255))  # cyan start for actor
+        _draw_disk(base, act_pts[-1], 4, (0, 128, 0))  # dark green end for actor
 
     # Text overlay
     lines = [
@@ -925,7 +1050,10 @@ def save_bev_debug_image(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(out_path, base)
+
+
 ##############################################################################################
+
 
 def _serialize_camera(camera: MiniCam | OrthoMiniCam, *, orthographic: bool) -> dict:
     """
@@ -992,7 +1120,11 @@ def _save_depth_and_camera(
     depth_tensor = img_pkg.get("depth")
     if depth_tensor is None:
         return
-    timing_ctx = metrics.measure(PathMetricRecorder.DEPTH_STAGE) if metrics else contextlib.nullcontext()
+    timing_ctx = (
+        metrics.measure(PathMetricRecorder.DEPTH_STAGE)
+        if metrics
+        else contextlib.nullcontext()
+    )
     with timing_ctx:
         depth = depth_tensor.detach().cpu().numpy()
         if depth.ndim > 2:
@@ -1011,9 +1143,12 @@ def _save_depth_and_camera(
         cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
         cam_json_path.write_text(json.dumps(cam_json, indent=2))
 
+
 def _rotate_180_xy(xy: np.ndarray) -> np.ndarray:
     """Rotate 2D points by 180 degrees around origin."""
     return np.flipud(np.fliplr(xy))
+
+
 def build_navdp_mask_ply(
     *,
     scene_id: str,
@@ -1050,8 +1185,12 @@ def build_navdp_mask_ply(
         xyz = gaussians.get_xyz.detach().cpu().numpy()
         xy = xyz[:, :2]
         setattr(gaussians, "_navdp_xy_cache", xy)
-    u = np.round((xy[:, 0] - float(meta["left"])) / float(meta["scale"])).astype(np.int64)
-    v = np.round((float(meta["top"]) - xy[:, 1]) / float(meta["scale"])).astype(np.int64)
+    u = np.round((xy[:, 0] - float(meta["left"])) / float(meta["scale"])).astype(
+        np.int64
+    )
+    v = np.round((float(meta["top"]) - xy[:, 1]) / float(meta["scale"])).astype(
+        np.int64
+    )
     in_bounds = (u >= 0) & (u < w) & (v >= 0) & (v < h)
     u_valid = u[in_bounds]
     v_valid = v[in_bounds]
@@ -1062,8 +1201,12 @@ def build_navdp_mask_ply(
     xy_kept = _rotate_180_xy(xy_kept)
     # Path polyline projected to z=0 (respect mask to keep white areas blank)
     path_xy_arr = np.stack(path_xy, axis=0)
-    pu = np.round((path_xy_arr[:, 0] - float(meta["left"])) / float(meta["scale"])).astype(np.int64)
-    pv = np.round((float(meta["top"]) - path_xy_arr[:, 1]) / float(meta["scale"])).astype(np.int64)
+    pu = np.round(
+        (path_xy_arr[:, 0] - float(meta["left"])) / float(meta["scale"])
+    ).astype(np.int64)
+    pv = np.round(
+        (float(meta["top"]) - path_xy_arr[:, 1]) / float(meta["scale"])
+    ).astype(np.int64)
     p_in_bounds = (pu >= 0) & (pu < w) & (pv >= 0) & (pv < h)
     pu = pu[p_in_bounds]
     pv = pv[p_in_bounds]
@@ -1193,18 +1336,12 @@ def list_actor_frame_paths(options: ActorOptions) -> list[Path]:
         return []
 
     pattern = options.pattern or "*.ply"
-    initial = [
-        path
-        for path in options.sequence_dir.glob(pattern)
-        if path.is_file()
-    ]
+    initial = [path for path in options.sequence_dir.glob(pattern) if path.is_file()]
     initial = [path for path in initial if path.suffix.lower() == ".ply"]
 
     if not initial:
         initial = [
-            path
-            for path in options.sequence_dir.glob("*.ply")
-            if path.is_file()
+            path for path in options.sequence_dir.glob("*.ply") if path.is_file()
         ]
 
     return sorted(initial, key=natural_sort_key)
@@ -1262,7 +1399,9 @@ def load_actor_sequence(
     """Load and normalise an animated actor sequence comprised of per-frame PLYs."""
 
     if not options.sequence_dir.is_dir():
-        raise FileNotFoundError(f"Actor sequence directory not found: {options.sequence_dir}")
+        raise FileNotFoundError(
+            f"Actor sequence directory not found: {options.sequence_dir}"
+        )
 
     ply_files = list_actor_frame_paths(options)
     if not ply_files:
@@ -1344,17 +1483,22 @@ def load_actor_sequence(
     )
 
     if rest_dim * 3 != len(feature_rest_names):
-        raise ValueError("Unexpected spherical harmonic coefficient layout in actor PLY.")
+        raise ValueError(
+            "Unexpected spherical harmonic coefficient layout in actor PLY."
+        )
 
     if rot_names and len(rot_names) != 4:
         raise ValueError("Actor PLY must provide quaternion components rot_0..rot_3.")
     if scale_names and len(scale_names) not in (1, 3):
-        raise ValueError("Actor PLY scales must appear as scale_0/1/2 or a single scale column.")
+        raise ValueError(
+            "Actor PLY scales must appear as scale_0/1/2 or a single scale column."
+        )
 
     max_sh_degree = int(round(math.sqrt(rest_dim + 1) - 1)) if rest_dim > 0 else 0
 
     frames = [
-        ActorSequenceFrame(base_data=np.array(ply.data, copy=True)) for ply in actor_plys
+        ActorSequenceFrame(base_data=np.array(ply.data, copy=True))
+        for ply in actor_plys
     ]
 
     return ActorSequence(
@@ -1416,11 +1560,20 @@ def actor_data_to_tensors(
     if not all(name in data.dtype.names for name in dc_names):
         missing = [name for name in dc_names if name not in data.dtype.names]
         raise KeyError(f"Actor PLY missing DC SH coefficients: {missing}")
-    features_dc_np = np.stack([data[name] for name in dc_names], axis=1).astype(np.float32)
-    features_dc = torch.from_numpy(features_dc_np[:, :, None]).to(device).transpose(1, 2).contiguous()
+    features_dc_np = np.stack([data[name] for name in dc_names], axis=1).astype(
+        np.float32
+    )
+    features_dc = (
+        torch.from_numpy(features_dc_np[:, :, None])
+        .to(device)
+        .transpose(1, 2)
+        .contiguous()
+    )
 
     source_rest_dim = sequence.rest_dim if sequence.rest_dim > 0 else 0
-    expected_rest_dim = int(target_rest_dim) if target_rest_dim is not None else source_rest_dim
+    expected_rest_dim = (
+        int(target_rest_dim) if target_rest_dim is not None else source_rest_dim
+    )
     if expected_rest_dim < 0:
         raise ValueError("target_rest_dim must be non-negative")
 
@@ -1455,7 +1608,9 @@ def actor_data_to_tensors(
 
     if sequence.scale_names:
         if sequence.uniform_scale:
-            scale_values = np.asarray(data[sequence.scale_names[0]], dtype=np.float32).reshape(-1, 1)
+            scale_values = np.asarray(
+                data[sequence.scale_names[0]], dtype=np.float32
+            ).reshape(-1, 1)
             scales_np = np.repeat(scale_values, 3, axis=1)
         else:
             scales_np = np.stack(
@@ -1503,14 +1658,22 @@ def build_marker_actor_render(
     """Create a single-gaussian actor frame to visualize the hidden avatar position."""
 
     center_z = floor_z + sequence.hip_height
-    xyz = torch.tensor([[float(position_xy[0]), float(position_xy[1]), float(center_z)]], device=device, dtype=torch.float32)
+    xyz = torch.tensor(
+        [[float(position_xy[0]), float(position_xy[1]), float(center_z)]],
+        device=device,
+        dtype=torch.float32,
+    )
 
     features_dc = torch.zeros((1, 1, 3), device=device, dtype=torch.float32)
     features_dc[0, 0, 0] = 1.0
 
     base_rest = gaussians.get_features_rest
     if base_rest.shape[1] > 0:
-        features_rest = torch.zeros((1, base_rest.shape[1], base_rest.shape[2]), device=device, dtype=torch.float32)
+        features_rest = torch.zeros(
+            (1, base_rest.shape[1], base_rest.shape[2]),
+            device=device,
+            dtype=torch.float32,
+        )
     else:
         features_rest = torch.zeros((1, 0, 0), device=device, dtype=torch.float32)
 
@@ -1518,12 +1681,16 @@ def build_marker_actor_render(
 
     base_scaling = gaussians.get_scaling
     if base_scaling.shape[1] > 0:
-        scaling = torch.full((1, base_scaling.shape[1]), radius, device=device, dtype=torch.float32)
+        scaling = torch.full(
+            (1, base_scaling.shape[1]), radius, device=device, dtype=torch.float32
+        )
     else:
         scaling = torch.zeros((1, 0), device=device, dtype=torch.float32)
 
     base_rotation = gaussians.get_rotation
-    rotation = torch.zeros((1, base_rotation.shape[1]), device=device, dtype=torch.float32)
+    rotation = torch.zeros(
+        (1, base_rotation.shape[1]), device=device, dtype=torch.float32
+    )
     if base_rotation.shape[1] > 0:
         rotation[0, 0] = 1.0
 
@@ -1549,7 +1716,9 @@ class CombinedGaussianModel:
         self.active_sh_degree = base.active_sh_degree
         self.max_sh_degree = base.max_sh_degree
 
-        self._xyz = torch.empty((self.base_size + actor_size, 3), device=device, dtype=dtype)
+        self._xyz = torch.empty(
+            (self.base_size + actor_size, 3), device=device, dtype=dtype
+        )
         self._xyz[: self.base_size] = base._xyz.detach()
         self._xyz[self.base_size :] = actor_frame.xyz
 
@@ -1579,20 +1748,32 @@ class CombinedGaussianModel:
             )
 
         opacity_base = base._opacity.detach()
-        self._opacity = torch.empty((self.base_size + actor_size, 1), device=device, dtype=opacity_base.dtype)
+        self._opacity = torch.empty(
+            (self.base_size + actor_size, 1), device=device, dtype=opacity_base.dtype
+        )
         self._opacity[: self.base_size] = opacity_base
         self._opacity[self.base_size :] = actor_frame.opacity
 
         scaling_base = base._scaling.detach()
-        self._scaling = torch.empty((self.base_size + actor_size, scaling_base.shape[1]), device=device, dtype=scaling_base.dtype)
+        self._scaling = torch.empty(
+            (self.base_size + actor_size, scaling_base.shape[1]),
+            device=device,
+            dtype=scaling_base.dtype,
+        )
         self._scaling[: self.base_size] = scaling_base
         if actor_frame.scaling.shape[1] == 0:
             self._scaling[self.base_size :] = 0.0
         else:
             self._scaling[self.base_size :] = actor_frame.scaling
 
-        rotation_base = base._rotation.detach()  # <- CHANGED: use _rotation not get_rotation
-        self._rotation = torch.empty((self.base_size + actor_size, rotation_base.shape[1]), device=device, dtype=rotation_base.dtype)
+        rotation_base = (
+            base._rotation.detach()
+        )  # <- CHANGED: use _rotation not get_rotation
+        self._rotation = torch.empty(
+            (self.base_size + actor_size, rotation_base.shape[1]),
+            device=device,
+            dtype=rotation_base.dtype,
+        )
         self._rotation[: self.base_size] = rotation_base
         self._rotation[self.base_size :] = actor_frame.rotation
 
@@ -1647,10 +1828,6 @@ class CombinedGaussianModel:
     @property
     def get_rotation(self) -> torch.Tensor:
         return self.rotation_activation(self._rotation)
-
-
-
-
 
 
 def render_actor_camera_only_sequence(
@@ -1728,7 +1905,9 @@ def render_actor_camera_only_sequence(
                 camera_offset=0.0,
             )
         )
-        camera_positions.append(np.array([camera_xy[0], camera_xy[1], camera_z], dtype=np.float32))
+        camera_positions.append(
+            np.array([camera_xy[0], camera_xy[1], camera_z], dtype=np.float32)
+        )
 
         if camera_distance >= max_camera_distance - 1e-6:
             break
@@ -1762,7 +1941,10 @@ def render_actor_camera_only_sequence(
         if np.linalg.norm(forward[:2]) < EPS:
             forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         if stabilize and prev_forward is not None:
-            blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + forward * FORWARD_SMOOTH_BLEND
+            blended = (
+                prev_forward * (1.0 - FORWARD_SMOOTH_BLEND)
+                + forward * FORWARD_SMOOTH_BLEND
+            )
             blended_norm = float(np.linalg.norm(blended))
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
@@ -1789,9 +1971,13 @@ def render_actor_camera_only_sequence(
             device,
             verbose,
         ):
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = render_or(
+                camera, combined_model, pipeline, bg_color=bg_color, orthographic=False
+            )
         render = img_pkg["render"].detach().cpu().numpy()
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        render_uint8 = (
+            (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        )
         render_uint8 = np.rot90(render_uint8, k=2)
 
         # Save requested artifacts.
@@ -1806,7 +1992,9 @@ def render_actor_camera_only_sequence(
                 with timing_ctx:
                     imageio.imwrite(frame_path, render_uint8)
             except Exception as e:
-                print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
+                print(
+                    f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True
+                )
         if save_depth_maps:
             try:
                 _save_depth_and_camera(
@@ -1819,7 +2007,10 @@ def render_actor_camera_only_sequence(
                     metrics=metrics,
                 )
             except Exception as e:
-                print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
+                print(
+                    f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}",
+                    flush=True,
+                )
 
         # Also write to video if requested
         if video:
@@ -1832,7 +2023,10 @@ def render_actor_camera_only_sequence(
                 with timing_ctx:
                     writer.append_data(render_uint8)
             except Exception as e:
-                print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
+                print(
+                    f"[ERROR] Failed to append frame {frame_counter} to video: {e}",
+                    flush=True,
+                )
                 raise
 
         frame_counter += 1
@@ -1850,6 +2044,7 @@ def render_actor_camera_only_sequence(
 
     camera_xy_seq = [pos[:2].copy() for pos in camera_positions]
     return camera_xy_seq, actor_xy_seq_would_be
+
 
 def render_actor_follow_sequence(
     *,
@@ -1895,7 +2090,7 @@ def render_actor_follow_sequence(
     if not sequence.frames:
         raise ValueError("Actor sequence is empty; cannot render.")
 
-    sampler = PathSampler(path_xy)  
+    sampler = PathSampler(path_xy)
     distances = list(sampler.cumulative)
     total_length = sampler.total_length
     scene_rest_dim = int(gaussians.get_features_rest.shape[1])
@@ -1916,7 +2111,9 @@ def render_actor_follow_sequence(
 
     dump_enabled = dump is not None and dump.directory is not None
     if dump and dump.dump_only and not dump_enabled:
-        raise ValueError("actor_dump_only requires --actor-dump-ply-dir to be specified.")
+        raise ValueError(
+            "actor_dump_only requires --actor-dump-ply-dir to be specified."
+        )
     dump_stride = max(dump.stride, 1) if dump_enabled else 1
     dump_max = dump.max_frames if dump_enabled else None
     dump_count = 0
@@ -1936,7 +2133,10 @@ def render_actor_follow_sequence(
             direction_xy = cached_direction
         actor_dir = direction_xy.copy()
         if stabilize and prev_actor_dir is not None:
-            blended_actor = prev_actor_dir * (1.0 - FORWARD_SMOOTH_BLEND) + actor_dir * FORWARD_SMOOTH_BLEND
+            blended_actor = (
+                prev_actor_dir * (1.0 - FORWARD_SMOOTH_BLEND)
+                + actor_dir * FORWARD_SMOOTH_BLEND
+            )
             norm_actor = np.linalg.norm(blended_actor)
             if norm_actor > EPS:
                 actor_dir = blended_actor / norm_actor
@@ -1948,7 +2148,9 @@ def render_actor_follow_sequence(
         rotation_np = rotation_matrix_z_np(theta)
 
         actor_pos_xy = sampler.position_at(actor_distance)
-        translation_vec = np.array([actor_pos_xy[0], actor_pos_xy[1], actor_ground_z], dtype=np.float64)
+        translation_vec = np.array(
+            [actor_pos_xy[0], actor_pos_xy[1], actor_ground_z], dtype=np.float64
+        )
         transform = build_transform_matrix(rotation_np, translation_vec)
 
         if options.loop:
@@ -1967,7 +2169,9 @@ def render_actor_follow_sequence(
             )
         )
         camera_xy = sampler.position_at(camera_distance)
-        camera_positions.append(np.array([camera_xy[0], camera_xy[1], camera_z], dtype=np.float32))
+        camera_positions.append(
+            np.array([camera_xy[0], camera_xy[1], camera_z], dtype=np.float32)
+        )
 
         if camera_distance >= max_camera_distance - 1e-6:
             break
@@ -2011,13 +2215,19 @@ def render_actor_follow_sequence(
             actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
 
             # Dump debug PLY if requested
-            if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+            if (
+                dump_enabled
+                and (dump_max is None or dump_count < dump_max)
+                and (idx % dump_stride == 0)
+            ):
                 actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
                 entries = []
                 if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
                     entries.append(scene_debug_vertices)
                 entries.append(actor_vertices)
-                debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+                debug_vertices = (
+                    entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+                )
                 dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
                 _write_debug_ply(dump_path, debug_vertices)
                 dump_count += 1
@@ -2048,7 +2258,10 @@ def render_actor_follow_sequence(
             if np.linalg.norm(forward[:2]) < EPS:
                 forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
             if stabilize and prev_forward is not None:
-                blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + forward * FORWARD_SMOOTH_BLEND
+                blended = (
+                    prev_forward * (1.0 - FORWARD_SMOOTH_BLEND)
+                    + forward * FORWARD_SMOOTH_BLEND
+                )
                 blended_norm = float(np.linalg.norm(blended))
                 if blended_norm > EPS:
                     forward = (blended / blended_norm).astype(np.float32)
@@ -2072,24 +2285,44 @@ def render_actor_follow_sequence(
             )
 
             # Render
-            #debug
+            # debug
             if idx == 0 and verbose:  # Only print for first frame
                 print(f"[DEBUG] Scene gaussians: {gaussians.get_xyz.shape[0]}")
-                print(f"[DEBUG] Scene max_sh_degree: {gaussians.max_sh_degree}, active: {gaussians.active_sh_degree}")
-                print(f"[DEBUG] Scene features_dc shape: {gaussians.get_features_dc.shape}")
-                print(f"[DEBUG] Scene features_rest shape: {gaussians.get_features_rest.shape}")
-                
+                print(
+                    f"[DEBUG] Scene max_sh_degree: {gaussians.max_sh_degree}, active: {gaussians.active_sh_degree}"
+                )
+                print(
+                    f"[DEBUG] Scene features_dc shape: {gaussians.get_features_dc.shape}"
+                )
+                print(
+                    f"[DEBUG] Scene features_rest shape: {gaussians.get_features_rest.shape}"
+                )
+
                 print(f"[DEBUG] Actor gaussians: {actor_render.xyz.shape[0]}")
-                print(f"[DEBUG] Actor features_dc shape: {actor_render.features_dc.shape}")
-                print(f"[DEBUG] Actor features_rest shape: {actor_render.features_rest.shape}")
-                
-                print(f"[DEBUG] Combined model max_sh_degree: {combined_model.max_sh_degree}, active: {combined_model.active_sh_degree}")
-                print(f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}")
-                print(f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}")
+                print(
+                    f"[DEBUG] Actor features_dc shape: {actor_render.features_dc.shape}"
+                )
+                print(
+                    f"[DEBUG] Actor features_rest shape: {actor_render.features_rest.shape}"
+                )
+
+                print(
+                    f"[DEBUG] Combined model max_sh_degree: {combined_model.max_sh_degree}, active: {combined_model.active_sh_degree}"
+                )
+                print(
+                    f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}"
+                )
+                print(
+                    f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}"
+                )
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
-            render = img_pkg['render'].detach().cpu().numpy()
-            render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+            img_pkg = render_or(
+                camera, combined_model, pipeline, bg_color=bg_color, orthographic=False
+            )
+            render = img_pkg["render"].detach().cpu().numpy()
+            render_uint8 = (
+                (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+            )
             render_uint8 = np.rot90(render_uint8, k=2)
 
             # Save requested artifacts without blocking rendering.
@@ -2104,7 +2337,10 @@ def render_actor_follow_sequence(
                     with timing_ctx:
                         imageio.imwrite(frame_path, render_uint8)
                 except Exception as e:
-                    print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
+                    print(
+                        f"[WARN] Failed to save RGB frame {frame_counter}: {e}",
+                        flush=True,
+                    )
             if save_depth_maps:
                 try:
                     _save_depth_and_camera(
@@ -2117,8 +2353,11 @@ def render_actor_follow_sequence(
                         metrics=metrics,
                     )
                 except Exception as e:
-                    print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
-            
+                    print(
+                        f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}",
+                        flush=True,
+                    )
+
             # Also write to video if requested (do this AFTER frame saving to avoid corruption)
             if video:
                 try:
@@ -2130,7 +2369,10 @@ def render_actor_follow_sequence(
                     with timing_ctx:
                         writer.append_data(render_uint8)
                 except Exception as e:
-                    print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
+                    print(
+                        f"[ERROR] Failed to append frame {frame_counter} to video: {e}",
+                        flush=True,
+                    )
                     raise  # Re-raise video errors as they're critical
 
             frame_counter += 1
@@ -2155,7 +2397,9 @@ def render_actor_follow_sequence(
         return camera_xy_seq, actor_xy_seq
 
     if scene_vertices is None or scene_dtype is None or combined_tmp_dir is None:
-        raise ValueError("CPU compositor requires scene vertex data; rerun without --gpu-only.")
+        raise ValueError(
+            "CPU compositor requires scene vertex data; rerun without --gpu-only."
+        )
 
     scene_subset = scene_vertices.copy()
 
@@ -2173,13 +2417,19 @@ def render_actor_follow_sequence(
         base_frame = sequence.frames[plan.base_frame_index]
         actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
 
-        if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+        if (
+            dump_enabled
+            and (dump_max is None or dump_count < dump_max)
+            and (idx % dump_stride == 0)
+        ):
             actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
             entries: list[np.ndarray] = []
             if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
                 entries.append(scene_debug_vertices)
             entries.append(actor_vertices)
-            debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+            debug_vertices = (
+                entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+            )
             dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
             _write_debug_ply(dump_path, debug_vertices)
             dump_count += 1
@@ -2199,7 +2449,10 @@ def render_actor_follow_sequence(
         if np.linalg.norm(forward[:2]) < EPS:
             forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         if stabilize and prev_forward is not None:
-            blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + forward * FORWARD_SMOOTH_BLEND
+            blended = (
+                prev_forward * (1.0 - FORWARD_SMOOTH_BLEND)
+                + forward * FORWARD_SMOOTH_BLEND
+            )
             blended_norm = float(np.linalg.norm(blended))
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
@@ -2222,9 +2475,13 @@ def render_actor_follow_sequence(
             device=device,
         )
 
-        img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
-        render = img_pkg['render'].detach().cpu().numpy()
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        img_pkg = render_or(
+            camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False
+        )
+        render = img_pkg["render"].detach().cpu().numpy()
+        render_uint8 = (
+            (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        )
         render_uint8 = np.rot90(render_uint8, k=2)
 
         if video:
@@ -2254,7 +2511,10 @@ def render_actor_follow_sequence(
                     metrics=metrics,
                 )
             except Exception as e:
-                print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
+                print(
+                    f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}",
+                    flush=True,
+                )
         frame_counter += 1
         if metrics:
             metrics.sample_vram()
@@ -2272,7 +2532,6 @@ def render_actor_follow_sequence(
         )
 
     return camera_xy_seq, actor_xy_seq
-
 
 
 def resolve_label_directory(scene_task_dir: Path) -> Path | None:
@@ -2414,7 +2673,9 @@ def load_raster_world_points(
     if not raster_world or not raster_pixel:
         raise ValueError(f"Missing raster_world or raster_pixel in {json_path}")
     if len(raster_world) != len(raster_pixel):
-        raise ValueError(f"Length mismatch between raster_world and raster_pixel in {json_path}")
+        raise ValueError(
+            f"Length mismatch between raster_world and raster_pixel in {json_path}"
+        )
 
     points: list[np.ndarray] = []
     pixels: list[tuple[int, int]] = []
@@ -2423,7 +2684,9 @@ def load_raster_world_points(
             x = float(entry["x"])
             y = float(entry["y"])
         except (TypeError, KeyError) as exc:
-            raise ValueError(f"Invalid raster_world entry #{idx} in {json_path}") from exc
+            raise ValueError(
+                f"Invalid raster_world entry #{idx} in {json_path}"
+            ) from exc
         if swap_xy:
             points.append(np.array([y, x], dtype=np.float32))
         else:
@@ -2432,7 +2695,9 @@ def load_raster_world_points(
     return points, pixels
 
 
-def deduplicate_points(points: Sequence[np.ndarray], eps: float = 1e-4) -> list[np.ndarray]:
+def deduplicate_points(
+    points: Sequence[np.ndarray], eps: float = 1e-4
+) -> list[np.ndarray]:
     """Remove consecutive duplicates within a tolerance."""
 
     if not points:
@@ -2444,7 +2709,9 @@ def deduplicate_points(points: Sequence[np.ndarray], eps: float = 1e-4) -> list[
     return deduped
 
 
-def sample_points(points: Sequence[np.ndarray], stride: int, eps: float = 1e-4) -> list[np.ndarray]:
+def sample_points(
+    points: Sequence[np.ndarray], stride: int, eps: float = 1e-4
+) -> list[np.ndarray]:
     """Subsample points while guaranteeing the final point is kept."""
 
     if stride <= 1 or len(points) <= 2:
@@ -2540,7 +2807,9 @@ def prepare_path_data(
     )
 
 
-def estimate_actor_frame_count(path_xy: Sequence[np.ndarray], follow_distance: float) -> int:
+def estimate_actor_frame_count(
+    path_xy: Sequence[np.ndarray], follow_distance: float
+) -> int:
     if not path_xy:
         return 0
     if len(path_xy) == 1:
@@ -2586,7 +2855,11 @@ def build_path_metadata(
     for dist in cumulative:
         if len(distances) >= len(camera_xy_seq):
             break
-        camera_distance = min(dist, max_camera_distance) if limit_to_follow else min(dist, total_length)
+        camera_distance = (
+            min(dist, max_camera_distance)
+            if limit_to_follow
+            else min(dist, total_length)
+        )
         distances.append(camera_distance)
         if limit_to_follow and camera_distance >= max_camera_distance - 1e-6:
             # Camera stops once we can no longer keep the desired follow distance.
@@ -2627,10 +2900,18 @@ def build_path_metadata(
         "frames": frames,
     }
 
-def get_forward_fn(args):
-    return forward_direction_beta if getattr(args, "use_forward_beta", False) else forward_direction
 
-def forward_direction(points: Sequence[np.ndarray], idx: int, window: int = 1) -> np.ndarray:
+def get_forward_fn(args):
+    return (
+        forward_direction_beta
+        if getattr(args, "use_forward_beta", False)
+        else forward_direction
+    )
+
+
+def forward_direction(
+    points: Sequence[np.ndarray], idx: int, window: int = 1
+) -> np.ndarray:
     """Estimate the forward direction (in XY) around the given index."""
 
     if len(points) == 1:
@@ -2661,9 +2942,14 @@ def forward_direction(points: Sequence[np.ndarray], idx: int, window: int = 1) -
     norm = np.linalg.norm(direction_xy)
     if norm < 1e-4:
         return np.array([0.0, 1.0, 0.0], dtype=np.float32)
-    return np.array([direction_xy[0] / norm, direction_xy[1] / norm, 0.0], dtype=np.float32)
+    return np.array(
+        [direction_xy[0] / norm, direction_xy[1] / norm, 0.0], dtype=np.float32
+    )
 
-def forward_direction_beta(points: Sequence[np.ndarray], idx: int, window: int = 1) -> np.ndarray:
+
+def forward_direction_beta(
+    points: Sequence[np.ndarray], idx: int, window: int = 1
+) -> np.ndarray:
     """
     Robust local forward (XY). Symmetric, distance-weighted; friendlier at ends.
     Returns a unit 3D vector [dx, dy, 0].
@@ -2712,7 +2998,9 @@ def build_look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.nda
     forward = eye - target
     forward_norm = np.linalg.norm(forward)
     if forward_norm < EPS:
-        raise ValueError("Camera target too close to position; cannot build view matrix.")
+        raise ValueError(
+            "Camera target too close to position; cannot build view matrix."
+        )
     forward /= forward_norm
 
     right = np.cross(up, forward)
@@ -2756,7 +3044,11 @@ def build_perspective_camera(
 
     view = build_look_at(position, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
     world_view = torch.from_numpy(view).to(device).transpose(0, 1)
-    projection = getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy).to(device).transpose(0, 1)
+    projection = (
+        getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy)
+        .to(device)
+        .transpose(0, 1)
+    )
     full_proj = (world_view.unsqueeze(0) @ projection.unsqueeze(0)).squeeze(0)
 
     return MiniCam(
@@ -2800,8 +3092,18 @@ def build_orthographic_camera(
 
     projection_np = np.array(
         [
-            [2.0 / (right_cam - left_cam), 0.0, 0.0, -(right_cam + left_cam) / (right_cam - left_cam)],
-            [0.0, 2.0 / (top_cam - bottom_cam), 0.0, -(top_cam + bottom_cam) / (top_cam - bottom_cam)],
+            [
+                2.0 / (right_cam - left_cam),
+                0.0,
+                0.0,
+                -(right_cam + left_cam) / (right_cam - left_cam),
+            ],
+            [
+                0.0,
+                2.0 / (top_cam - bottom_cam),
+                0.0,
+                -(top_cam + bottom_cam) / (top_cam - bottom_cam),
+            ],
             [0.0, 0.0, -2.0 / (zfar - znear), -(zfar + znear) / (zfar - znear)],
             [0.0, 0.0, 0.0, 1.0],
         ],
@@ -2810,7 +3112,9 @@ def build_orthographic_camera(
 
     world_view_transform = torch.tensor(world_view_np, device=device).transpose(0, 1)
     projection_matrix = torch.tensor(projection_np, device=device).transpose(0, 1)
-    full_proj_transform = (world_view_transform.unsqueeze(0) @ projection_matrix.unsqueeze(0)).squeeze(0)
+    full_proj_transform = (
+        world_view_transform.unsqueeze(0) @ projection_matrix.unsqueeze(0)
+    ).squeeze(0)
 
     return OrthoMiniCam(
         width=width,
@@ -2855,8 +3159,8 @@ def render_path_frames(
     default_follow_distance: float,
     verbose: bool,
     hide_actor_enabled: bool = False,
-    mirror_bev_x = False,
-    mirror_bev_y = False,
+    mirror_bev_x=False,
+    mirror_bev_y=False,
     save_rgb_frames: bool = False,
     save_depth_maps: bool = True,
     save_follow_metadata: bool = True,
@@ -2903,9 +3207,7 @@ def render_path_frames(
         else float(default_follow_distance)
     )
 
-    positions = [
-        np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
-    ]
+    positions = [np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy]
 
     scene_vertices: np.ndarray | None = None
     scene_dtype: np.dtype | None = None
@@ -2970,23 +3272,25 @@ def render_path_frames(
     frames_dir = output_dir / scene_id / json_path.stem
     video_dir = output_dir / scene_id
     video_path = video_dir / f"{json_path.stem}.mp4"
-    
+
     # Always create frames_dir since we save depth/camera metadata there
     frames_dir.mkdir(parents=True, exist_ok=True)
-    
+
     if effective_video:
         video_dir.mkdir(parents=True, exist_ok=True)
         if not overwrite and video_path.exists():
             print(f"  Skipping {json_path.stem}: video already exists.")
             return
-    
+
     # Check for existing frames if not in video mode
     if not effective_video:
         skip_frame_check = dump_options is not None and dump_options.dump_only
         if not overwrite and not skip_frame_check:
             existing = list(frames_dir.glob("frame_*.png"))
             if existing:
-                print(f"  Skipping {json_path.stem}: frames already exist ({len(existing)} files).")
+                print(
+                    f"  Skipping {json_path.stem}: frames already exist ({len(existing)} files)."
+                )
                 return
 
     with torch.no_grad():
@@ -3014,7 +3318,9 @@ def render_path_frames(
                 )
             if actor_runtime is not None:
                 if view_mode != "forward":
-                    raise ValueError("Animated actor rendering currently supports --view-mode forward only.")
+                    raise ValueError(
+                        "Animated actor rendering currently supports --view-mode forward only."
+                    )
                 if hide_actor_enabled:
                     if verbose:
                         print(
@@ -3125,7 +3431,11 @@ def render_path_frames(
                         actor_xy_seq=act_seq,
                         out_path=bev_path,
                         look_ahead=look_ahead,
-                        follow_points=(actor_runtime.options.follow_distance if actor_runtime is not None else None),
+                        follow_points=(
+                            actor_runtime.options.follow_distance
+                            if actor_runtime is not None
+                            else None
+                        ),
                         total_length_m=total_len,
                         fps=DEFAULT_VIDEO_FPS,
                         actor_path_dotted=actor_path_dotted,
@@ -3144,12 +3454,17 @@ def render_path_frames(
 
                 for idx, position in enumerate(positions):
                     if view_mode == "forward":
-                        forward = forward_direction(positions, idx, window=direction_window)
+                        forward = forward_direction(
+                            positions, idx, window=direction_window
+                        )
                         if np.linalg.norm(forward[:2]) < EPS:
                             forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
                         if stabilize and prev_forward is not None:
-                            blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + forward * FORWARD_SMOOTH_BLEND
+                            blended = (
+                                prev_forward * (1.0 - FORWARD_SMOOTH_BLEND)
+                                + forward * FORWARD_SMOOTH_BLEND
+                            )
                             blended_norm = float(np.linalg.norm(blended))
                             if blended_norm > EPS:
                                 forward = (blended / blended_norm).astype(np.float32)
@@ -3159,7 +3474,9 @@ def render_path_frames(
                         target_xy = position[:2] - forward[:2] * look_ahead
                         target_z = position[2] - look_down
                         target_z = max(target_z, floor_z + 0.05)
-                        target = np.array([target_xy[0], target_xy[1], target_z], dtype=np.float32)
+                        target = np.array(
+                            [target_xy[0], target_xy[1], target_z], dtype=np.float32
+                        )
                         camera = build_perspective_camera(
                             position=position,
                             target=target,
@@ -3188,9 +3505,19 @@ def render_path_frames(
                         device,
                         verbose,
                     ):
-                        img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
+                        img_pkg = render_or(
+                            camera,
+                            gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=orthographic,
+                        )
                     render = img_pkg["render"].detach().cpu().numpy()
-                    render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+                    render_uint8 = (
+                        (np.clip(render, 0.0, 1.0) * 255.0)
+                        .astype(np.uint8)
+                        .transpose(1, 2, 0)
+                    )
                     if orthographic:
                         render_uint8 = np.rot90(render_uint8, k=1)
                     else:
@@ -3207,7 +3534,10 @@ def render_path_frames(
                             with timing_ctx:
                                 imageio.imwrite(frame_path, render_uint8)
                         except Exception as e:
-                            print(f"[WARN] Failed to save RGB frame {idx}: {e}", flush=True)
+                            print(
+                                f"[WARN] Failed to save RGB frame {idx}: {e}",
+                                flush=True,
+                            )
                     if save_depth_maps:
                         try:
                             _save_depth_and_camera(
@@ -3220,8 +3550,11 @@ def render_path_frames(
                                 metrics=metrics_recorder,
                             )
                         except Exception as e:
-                            print(f"[WARN] Failed to save depth/camera for frame {idx}: {e}", flush=True)
-                    
+                            print(
+                                f"[WARN] Failed to save depth/camera for frame {idx}: {e}",
+                                flush=True,
+                            )
+
                     # Also write to video if requested
                     if video:
                         try:
@@ -3233,7 +3566,10 @@ def render_path_frames(
                             with timing_ctx:
                                 writer.append_data(render_uint8)
                         except Exception as e:
-                            print(f"[ERROR] Failed to append frame {idx} to video: {e}", flush=True)
+                            print(
+                                f"[ERROR] Failed to append frame {idx} to video: {e}",
+                                flush=True,
+                            )
                             raise
 
                     if metrics_recorder is not None:
@@ -3317,18 +3653,20 @@ def render_path_frames(
 
 
 def parse_args() -> ArgumentParser:
-    parser = ArgumentParser(description="Render frames along raster_world navigation paths.")
+    parser = ArgumentParser(
+        description="Render frames along raster_world navigation paths."
+    )
     parser.add_argument(
         "--offload-nas-dir",
         type=Path,
         default=None,
-        help="If set, when local free space drops below threshold, move finished path outputs to this NAS mirror (e.g. /mnt/nas/jiankundong/path_video_frames_Jiankun_test)."
+        help="If set, when local free space drops below threshold, move finished path outputs to this NAS mirror (e.g. /mnt/nas/jiankundong/path_video_frames_Jiankun_test).",
     )
     parser.add_argument(
         "--offload-min-free-gb",
         type=float,
         default=0.5,
-        help="Minimum free space (in GB) to maintain locally before offloading (default: 0.5)."
+        help="Minimum free space (in GB) to maintain locally before offloading (default: 0.5).",
     )
     parser.add_argument(
         "--scenes-dir",
@@ -3365,7 +3703,7 @@ def parse_args() -> ArgumentParser:
     parser.add_argument(
         "--height-offset",
         type=float,
-        default=0, #-0.098 for LHM model following scene generations
+        default=0,  # -0.098 for LHM model following scene generations
         help="Add this many meters above occupancy upper_z when placing the camera (default: 1.0).",
     )
     parser.add_argument(
@@ -3520,12 +3858,12 @@ def parse_args() -> ArgumentParser:
         "--hide-actor",
         action="store_true",
         default=False,
-        help="Disable animated actor overlay rendering."
+        help="Disable animated actor overlay rendering.",
     )
     parser.add_argument(
         "--use-forward-beta",
         action="store_true",
-        help="Use the improved forward_direction_beta function for smoother turns."
+        help="Use the improved forward_direction_beta function for smoother turns.",
     )
 
     parser.add_argument(
@@ -3634,19 +3972,19 @@ def parse_args() -> ArgumentParser:
         "--show-BEV",
         action=BooleanOptionalAction,
         default=True,
-        help="Save a bird's-eye-view debug image of camera (magenta) and actor (green) paths next to the video."
+        help="Save a bird's-eye-view debug image of camera (magenta) and actor (green) paths next to the video.",
     )
     parser.add_argument(
         "--bev-mirror-x",
         action=BooleanOptionalAction,
         default=True,
-        help="Mirror BEV paths across the X axis (u -> W-1-u) before drawing (default: on)."
+        help="Mirror BEV paths across the X axis (u -> W-1-u) before drawing (default: on).",
     )
     parser.add_argument(
         "--bev-mirror-y",
         action=BooleanOptionalAction,
         default=True,
-        help="Mirror BEV paths across the Y axis (v -> H-1-v) before drawing (default: on)."
+        help="Mirror BEV paths across the Y axis (v -> H-1-v) before drawing (default: on).",
     )
     parser.add_argument(
         "--navdp-ply-per-scene",
@@ -3714,7 +4052,11 @@ def main() -> None:
     actor_dump_root = args.actor_dump_ply_dir
     actor_dump_stride = max(1, int(args.actor_dump_stride))
     actor_dump_include_scene = bool(args.actor_dump_include_scene)
-    actor_dump_max = None if args.actor_dump_max == 0 else (int(args.actor_dump_max) if args.actor_dump_max is not None else None)
+    actor_dump_max = (
+        None
+        if args.actor_dump_max == 0
+        else (int(args.actor_dump_max) if args.actor_dump_max is not None else None)
+    )
     actor_dump_only = bool(args.actor_dump_only)
     minimal_frames_required = (
         int(args.minimal_frames)
@@ -3743,7 +4085,9 @@ def main() -> None:
         if actor_options.speed <= 0.0:
             raise ValueError("Actor walking speed must be positive.")
         if actor_options.buffer_distance > actor_options.follow_distance:
-            raise ValueError("Follow buffer must be less than or equal to follow distance.")
+            raise ValueError(
+                "Follow buffer must be less than or equal to follow distance."
+            )
         actor_sequence = load_actor_sequence(
             actor_options,
             debug=debug_enabled,
@@ -3765,7 +4109,9 @@ def main() -> None:
         scene_ids = list(dict.fromkeys(args.scene))
     else:
         if not TASK_OUTPUT_DIR.is_dir():
-            raise FileNotFoundError(f"Task output directory not found: {TASK_OUTPUT_DIR}")
+            raise FileNotFoundError(
+                f"Task output directory not found: {TASK_OUTPUT_DIR}"
+            )
         scene_ids = sorted(
             entry.name
             for entry in TASK_OUTPUT_DIR.iterdir()
@@ -3826,7 +4172,9 @@ def main() -> None:
 
     try:
         for scene_idx, scene_id in enumerate(scene_ids, start=1):
-            print(f"[{scene_idx}/{total_scenes}] Processing scene {scene_id}", flush=True)
+            print(
+                f"[{scene_idx}/{total_scenes}] Processing scene {scene_id}", flush=True
+            )
             dataset_dir = SCENES_DIR / scene_id
             scene_task_root = TASK_OUTPUT_DIR / scene_id
             label_dir = resolve_label_directory(scene_task_root)
@@ -3835,7 +4183,9 @@ def main() -> None:
                 print(f"WARNING: Scene directory missing: {dataset_dir}; skipping.")
                 continue
             if label_dir is None:
-                print(f"WARNING: No label JSON found under {scene_task_root}; skipping.")
+                print(
+                    f"WARNING: No label JSON found under {scene_task_root}; skipping."
+                )
                 continue
 
             try:
@@ -3871,7 +4221,9 @@ def main() -> None:
             if label_filter:
                 json_files = [path for path in json_files if path.stem in label_filter]
             if not json_files:
-                print("  No label JSON files found for this scene; skipping.", flush=True)
+                print(
+                    "  No label JSON files found for this scene; skipping.", flush=True
+                )
                 continue
 
             if args.max_labels is not None:
@@ -3960,7 +4312,7 @@ def main() -> None:
                         actor_runtime=actor_runtime,
                         default_follow_distance=float(args.follow_distance),
                         verbose=verbose_enabled,
-                        hide_actor_enabled = hide_actor_enabled,
+                        hide_actor_enabled=hide_actor_enabled,
                         render_bev=args.show_BEV,
                         mirror_bev_x=args.bev_mirror_x,
                         mirror_bev_y=args.bev_mirror_y,
@@ -3992,7 +4344,10 @@ def main() -> None:
                             offloader=offloader,
                         )
                 except Exception as exc:  # pylint: disable=broad-except
-                    print(f"      WARNING: Rendering {json_path.name} failed: {exc}", flush=True)
+                    print(
+                        f"      WARNING: Rendering {json_path.name} failed: {exc}",
+                        flush=True,
+                    )
                     log_file = ensure_log_file()
                     error_count += 1
                     timestamp = datetime.now().isoformat(timespec="seconds")
@@ -4023,10 +4378,12 @@ def main() -> None:
                         "[CONSOLIDATE] Final pass: moving any remaining outputs to NAS ...",
                         flush=True,
                     )
-                offloader.enqueue(consolidate_outputs_to_nas,
-                                  local_out_root=args.output_dir,
-                                  nas_out_root=nas_offload_dir,
-                                  verbose=verbose_enabled)
+                offloader.enqueue(
+                    consolidate_outputs_to_nas,
+                    local_out_root=args.output_dir,
+                    nas_out_root=nas_offload_dir,
+                    verbose=verbose_enabled,
+                )
         offloader.flush_and_stop()
     finally:
         if error_log_file is not None:
