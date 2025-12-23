@@ -25,8 +25,12 @@ from scene.cameras import MiniCam
 from utils.graphics_utils import getProjectionMatrix
 
 
-JSON_DIR = Path("/home/tianhang/habitatbuild/habitat-sim/navdata_multi_terrain_pixelspace_with_gs")
-PLY_PATH = Path("/home/tianhang/NavDP/navdp_api/gaussian_splatting/data/floor30geo_noncut_v1.ply")
+JSON_DIR = Path(
+    "/home/tianhang/habitatbuild/habitat-sim/navdata_multi_terrain_pixelspace_with_gs"
+)
+PLY_PATH = Path(
+    "/home/tianhang/NavDP/navdp_api/gaussian_splatting/data/floor30geo_noncut_v1.ply"
+)
 DEFAULT_ERROR_LOG = JSON_DIR.parent / "errors.log"
 EPS = 1e-6
 CAMERA_HEIGHT_OFFSET = 1.3
@@ -54,7 +58,9 @@ def build_look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.nda
     forward = target - eye
     forward_norm = np.linalg.norm(forward)
     if forward_norm < EPS:
-        raise ValueError("Camera target too close to position; cannot build view matrix.")
+        raise ValueError(
+            "Camera target too close to position; cannot build view matrix."
+        )
     forward /= forward_norm
 
     right = np.cross(up, forward)
@@ -98,7 +104,11 @@ def build_perspective_camera(
 
     view = build_look_at(position, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
     world_view = torch.from_numpy(view).to(device).transpose(0, 1)
-    projection = getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy).to(device).transpose(0, 1)
+    projection = (
+        getProjectionMatrix(znear=znear, zfar=zfar, fovX=fovx, fovY=fovy)
+        .to(device)
+        .transpose(0, 1)
+    )
     full_proj = (world_view.unsqueeze(0) @ projection.unsqueeze(0)).squeeze(0)
 
     return MiniCam(
@@ -137,9 +147,13 @@ def render_path_first_frame(
     first = raster_world[0]
     second = raster_world[1]
 
-    position = np.array([first["x"], first["y"], first["z"] + CAMERA_HEIGHT_OFFSET], dtype=np.float32)
+    position = np.array(
+        [first["x"], first["y"], first["z"] + CAMERA_HEIGHT_OFFSET], dtype=np.float32
+    )
 
-    target = np.array([second["x"], second["y"], second["z"] + CAMERA_HEIGHT_OFFSET], dtype=np.float32)
+    target = np.array(
+        [second["x"], second["y"], second["z"] + CAMERA_HEIGHT_OFFSET], dtype=np.float32
+    )
 
     top_down_map_dir = JSON_DIR / "gs_obs"
     top_down_map_dir.mkdir(parents=True, exist_ok=True)
@@ -165,7 +179,9 @@ def render_path_first_frame(
     with torch.no_grad():
         img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color)
         render = img_pkg["render"].detach().cpu().numpy()
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        render_uint8 = (
+            (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+        )
         render_uint8 = np.rot90(render_uint8, k=2)
 
         imageio.imwrite(output_path, render_uint8)
@@ -175,7 +191,9 @@ def render_path_first_frame(
 
 
 def parse_args() -> ArgumentParser:
-    parser = ArgumentParser(description="Render first frame along raster_world navigation paths.")
+    parser = ArgumentParser(
+        description="Render first frame along raster_world navigation paths."
+    )
     parser.add_argument(
         "--look-down",
         type=float,
@@ -289,9 +307,7 @@ def main() -> None:
                 log_file = ensure_log_file()
                 error_count += 1
                 timestamp = datetime.now().isoformat(timespec="seconds")
-                log_file.write(
-                    f"[{timestamp}] Label={json_path.name} Error={exc}\n"
-                )
+                log_file.write(f"[{timestamp}] Label={json_path.name} Error={exc}\n")
                 log_file.write(traceback.format_exc())
                 log_file.write("\n")
                 log_file.flush()
@@ -300,7 +316,10 @@ def main() -> None:
             error_log_file.close()
 
     if error_count > 0:
-        print(f"Processing complete, but {error_count} tasks failed; see {error_log_path} for details.", flush=True)
+        print(
+            f"Processing complete, but {error_count} tasks failed; see {error_log_path} for details.",
+            flush=True,
+        )
     else:
         print("All tasks complete, no errors detected.", flush=True)
 

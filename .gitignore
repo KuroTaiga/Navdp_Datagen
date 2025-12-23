@@ -21,3 +21,5 @@ data
 parallel_render_report.json
 ./data1
 data1
+submodules/*
+*.so
