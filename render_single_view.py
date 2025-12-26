@@ -172,7 +172,7 @@ def derive_affine_transform(points, pixels, meta):
     return a_x, b_x, a_y, b_y
 
 
-def transform_point_3d(
+def transform_from_BEV_to_GS(
     pt_xyz: np.ndarray, affine: tuple, meta: dict, mirror_translation: bool
 ) -> np.ndarray:
     """
@@ -198,6 +198,37 @@ def transform_point_3d(
         y_final = y_aff
 
     return np.array([x_final, y_final, pt_xyz[2]], dtype=np.float32)
+
+
+def transform_from_GS_to_BEV(
+    pt_gs: np.ndarray, affine: tuple, meta: dict, mirror_translation: bool
+) -> np.ndarray:
+    a_x, b_x, a_y, b_y = affine
+    x_gs = pt_gs[0]
+    y_gs = pt_gs[1]
+
+    if mirror_translation:
+        center_x = 0.5 * (meta["left"] + meta["right"])
+        center_y = 0.5 * (meta["top"] + meta["bottom"])
+        x_aff = center_x * 2.0 - x_gs
+        y_aff = center_y * 2.0 - y_gs
+    else:
+        x_aff = x_gs
+        y_aff = y_gs
+
+    if abs(a_x) < 1e-8:
+        x_nav = x_aff
+    else:
+        x_nav = (x_aff - b_x) / a_x
+
+    if abs(a_y) < 1e-8:
+        y_nav = y_aff
+    else:
+        y_nav = (y_aff - b_y) / a_y
+
+    z_nav = pt_gs[2] if pt_gs.shape[0] > 2 else 0.0
+
+    return np.array([x_nav, y_nav, z_nav], dtype=np.float32)
 
 
 # ==========================================
@@ -312,8 +343,19 @@ def main():
     parser.add_argument("--fov", type=float, default=70.0)
     parser.add_argument("--sh-degree", type=int, default=3)
     parser.add_argument("--bg-color", type=float, nargs=3, default=[1.0, 1.0, 1.0])
+    parser.add_argument(
+        "--debug", action="store_true", help="Enable debugpy waiting for client attach"
+    )
 
     args = parser.parse_args()
+
+    if args.debug:
+        import debugpy
+
+        debugpy.listen(5678)
+        print("Waiting for debugger attach")
+        debugpy.wait_for_client()
+        print("Attached, continue...")
 
     # Logical validation
     if args.pos and args.target is None:
@@ -346,6 +388,15 @@ def main():
         print("[Mode 2] Using Pose input (Position + Quaternion).")
         raw_x, raw_y, raw_z_input, qw, qx, qy, qz = args.pose
 
+        # gs_coord = transform_from_GS_to_BEV(
+        #     np.array([raw_x, raw_y, fixed_z], dtype=np.float32),
+        #     affine,
+        #     meta,
+        #     mirror_translation,
+        # )
+
+        # nav_pos = transform_from_BEV_to_GS(gs_coord, affine, meta, mirror_translation)
+
         # Camera Position in Nav coords (forcing fixed Z)
         nav_pos = np.array([raw_x, raw_y, fixed_z], dtype=np.float32)
 
@@ -353,8 +404,8 @@ def main():
         rot_mat = qvec2rotmat([qw, qx, qy, qz])
 
         # Define local forward vector.
-        # Assuming typical conventions where view direction is +Z.
-        local_forward = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        # Assuming typical conventions where view direction is +X.
+        local_forward = np.array([1.0, 0.0, 0.0], dtype=np.float32)
 
         # Forward vector in World coords
         world_forward = rot_mat @ local_forward
@@ -375,8 +426,8 @@ def main():
         )
 
     # 3. Coordinate Transformation (Nav -> GS)
-    gs_pos = transform_point_3d(nav_pos, affine, meta, mirror_translation)
-    gs_target = transform_point_3d(nav_target, affine, meta, mirror_translation)
+    gs_pos = transform_from_BEV_to_GS(nav_pos, affine, meta, mirror_translation)
+    gs_target = transform_from_BEV_to_GS(nav_target, affine, meta, mirror_translation)
 
     print("-" * 40)
     print(f"GS Camera Pos:    {gs_pos}")
