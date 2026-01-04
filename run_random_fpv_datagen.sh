@@ -4,8 +4,6 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/storage_targets.sh"
 
-# Ensure we have a Python interpreter available (needed for path resolution helper below).
-
 PYTHON_BIN=${PYTHON_BIN:-python3}
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python >/dev/null 2>&1; then
@@ -16,17 +14,13 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-# Tiny helper for consistent usage errors so RESUME mode is easy to discover.
 show_usage_and_exit() {
   echo "Usage: $(basename "$0") [RESUME <log-file>]" >&2
   exit 1
 }
 
-# CLI parsing: optional leading "RESUME <log>" pair switches to resume mode and
-# consumes the following logfile argument so the remainder of the script can lean
-# on env vars only.
 RESUME_MODE=false
-RESUME_LOG_PATH="./33w_npc1.log"
+RESUME_LOG_PATH="./0500_fpv.log"
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
@@ -47,21 +41,15 @@ if [ $# -gt 0 ]; then
   show_usage_and_exit
 fi
 
-# Convenience wrapper so we can expand relative paths and keep the script POSIX-ish.
 abspath() {
   "$PYTHON_BIN" -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$1"
 }
 
 # -----------------------------------------------------------------------------
 # User-configurable defaults (override via env vars before invoking the script).
-# Collect everything editable here so deployments only need to tweak this block.
 # -----------------------------------------------------------------------------
-# Storage toggles so the same runner can ship data to different targets.
-ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
-ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
-CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
 ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
 CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
 
@@ -99,56 +87,55 @@ if [ "$REMOTE_STORAGE_GUARD_ENABLED" = true ] && [ -z "$SETSID_BIN" ]; then
   REMOTE_STORAGE_GUARD_ENABLED=false
 fi
 
-# Core configuration for assignment planning + rendering. Most callers just tweak
-# DATA roots or seeds via environment variables.
-SEED=${SEED:-1}
 CONDA_ENV=${CONDA_ENV:-cuda121}
-ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
-BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
-ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_33w_1_npc.json}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_33w_1_npc.json}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
-TASKS_DIR=${TASKS_DIR:-./data/selected_33w}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/33w_npc_key1}
-OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w_1}
+TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
+OUTPUT_DIR=${OUTPUT_DIR:-./data2/0500_fpv}
+OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/fpv_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
-PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/random_human_metrics}
-REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_33w_1}}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_progress.json}
+PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_metrics}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv.json}
+ERROR_LOG=${ERROR_LOG:-./0500_fpv.log}
+REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_fpv}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-# Optional NPC placement/debug (applies to FPV or following data). Leave values empty to skip.
-NPC_ENABLE=${NPC_ENABLE:-true}                            # true/false to append NPC args
-NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}          # e.g., 0.2 angular coverage
-NPC_COUNT=${NPC_COUNT:-8}                                  # desired NPC count per frame
-NPC_PRIORITY=${NPC_PRIORITY:-coverage}                     # coverage|count
-NPC_MAX_RANGE=${NPC_MAX_RANGE:-10}                         # meters, radial cap
-NPC_FREE_THRESHOLD=${NPC_FREE_THRESHOLD:-250}              # occupancy threshold
-NPC_FREE_WHITE=${NPC_FREE_WHITE:-true}                     # true => free is white >= threshold
-NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}              # angular|area
-NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio (applied when count>=12)
-NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
-WORKERS=${WORKERS:-36}
-MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
-# vram reserve function
+WORKERS=${WORKERS:-24}
+MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
+FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
+
+# Optional NPC placement/debug. Leave values empty to skip.
+NPC_ENABLE=${NPC_ENABLE:-false}
+NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}
+NPC_COUNT=${NPC_COUNT:-8}
+NPC_PRIORITY=${NPC_PRIORITY:-coverage}
+NPC_MAX_RANGE=${NPC_MAX_RANGE:-10}
+NPC_FREE_THRESHOLD=${NPC_FREE_THRESHOLD:-250}
+NPC_FREE_WHITE=${NPC_FREE_WHITE:-true}
+NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}
+NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}
+NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}
+NPC_AUTO_CLEARANCE=${NPC_AUTO_CLEARANCE:-true}
+ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
+
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
 RETRY_CUDA_OOM=${RETRY_CUDA_OOM:-true}
 CUDA_OOM_RETRY_DELAY=${CUDA_OOM_RETRY_DELAY:-10}
-CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:--1}
-# set files types we want as output
-# To enable per-path BEV debug images, run: ENABLE_BEV_IMAGES=true ./run_random_human_datagen.sh
+CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:-20}
+
+# To enable per-path BEV debug images, run: ENABLE_BEV_IMAGES=true ./run_random_fpv_datagen.sh
 ENABLE_BEV_IMAGES=${ENABLE_BEV_IMAGES:-false}
 ENABLE_VIDEO_OUTPUT=${ENABLE_VIDEO_OUTPUT:-true}
 ENABLE_RGB_FRAMES=${ENABLE_RGB_FRAMES:-false}
 ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
-ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
+ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
+VERBOSE=${VERBOSE:-true}
 
-# Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene"
+render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else
@@ -179,8 +166,11 @@ if storage_bool_true "$ENABLE_FOLLOW_METADATA"; then
 else
   render_extra_args+=' --no-save-follow-metadata'
 fi
+if storage_bool_true "$VERBOSE"; then
+  render_extra_args+=' --verbose'
+fi
 render_extra_snippets=("$render_extra_args")
-# Optional NPC placement / BEV debug flags
+
 if storage_bool_true "$NPC_ENABLE"; then
   npc_args=(
     "--npc-render"
@@ -203,13 +193,19 @@ if storage_bool_true "$NPC_ENABLE"; then
   if [ -n "${NPC_MAX_RANGE:-}" ]; then
     npc_args+=("--npc-max-range ${NPC_MAX_RANGE}")
   fi
-  # Auto-clearance from HumanGS sources; keep on by default when NPC_ENABLE is true.
-  npc_args+=("--npc-auto-clearance" "--npc-actor-root ${ACTOR_ROOT}")
+  if storage_bool_true "$NPC_AUTO_CLEARANCE"; then
+    if [ -d "$ACTOR_ROOT" ]; then
+      npc_args+=("--npc-auto-clearance" "--npc-actor-root ${ACTOR_ROOT}")
+    else
+      echo "[NPC] WARN: ACTOR_ROOT ${ACTOR_ROOT} not found; skipping auto-clearance." >&2
+    fi
+  fi
   if [ -n "${NPC_EXTRA_FLAGS:-}" ]; then
     npc_args+=(${NPC_EXTRA_FLAGS})
   fi
   render_extra_snippets+=("${npc_args[*]}")
 fi
+
 if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
   echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
   exit 1
@@ -235,9 +231,6 @@ if ! [[ "$REMOTE_STORAGE_GUARD_INTERVAL_SECS" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-# VRAM throttling: spawn a small Python helper that grabs a configurable chunk of
-# GPU memory so other users do not over-subscribe the card while this run is in
-# flight. The tensor holder stays alive until we exit (trap below).
 VRAM_RESERVATION_PID=""
 reserve_vram() {
   local reserve_gb="$1"
@@ -508,7 +501,6 @@ cleanup_run() {
   stop_storage_guard
 }
 
-# Always tear down helpers even on errors.
 trap cleanup_run EXIT
 trap handle_remote_storage_unavailable USR1
 
@@ -532,62 +524,17 @@ handle_interrupt() {
 }
 trap handle_interrupt INT TERM
 
-# Assignment manifest generation helper.
-generate_assignment_manifest() {
-  local manifest_dir
-  manifest_dir="$(dirname "$ASSIGNMENTS_OUT")"
-  mkdir -p "$manifest_dir"
-  echo "[RUN] Random human data generation, seed ${SEED}"
-  conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
-    --actor-root "${ACTOR_ROOT}" \
-    --ban-list "${BAN_LIST}" \
-    --assignments-out "${ASSIGNMENTS_OUT}" \
-    --scenes-dir "${SCENES_DIR}" \
-    --tasks-dir "${TASKS_DIR}" \
-    --seed "${SEED}"
-  echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
-}
-
 RESUME_LOG_ABS=""
-# Resume bookkeeping: we reuse the assignment manifest referenced inside the
-# provided log file and disable destructive cleanup so partially-generated data is
-# preserved.
 if $RESUME_MODE; then
   RESUME_LOG_ABS=$(abspath "$RESUME_LOG_PATH")
   if [ ! -f "$RESUME_LOG_ABS" ]; then
     echo "[RESUME] ERROR: Log file not found: $RESUME_LOG_PATH" >&2
     exit 1
   fi
-  manifest_line=$(grep -m1 "Assignment manifest generated at" "$RESUME_LOG_ABS" || true)
-  if [ -z "$manifest_line" ]; then
-    echo "[RESUME] ERROR: Could not locate assignment manifest line in $RESUME_LOG_PATH" >&2
-    exit 1
-  fi
-  resume_manifest_path="${manifest_line#*Assignment manifest generated at }"
-  resume_manifest_path="${resume_manifest_path%% *}"
-  if [ -z "$resume_manifest_path" ]; then
-    echo "[RESUME] ERROR: Failed to parse assignment manifest path from log." >&2
-    exit 1
-  fi
-  if [[ "$resume_manifest_path" != /* ]]; then
-    resume_manifest_path="${resume_manifest_path#./}"
-    resume_manifest_path="${SCRIPT_DIR}/${resume_manifest_path}"
-  fi
-  ASSIGNMENTS_OUT=$(abspath "$resume_manifest_path")
-  if [ ! -f "$ASSIGNMENTS_OUT" ]; then
-    echo "[RESUME] WARN: Assignment manifest missing at $ASSIGNMENTS_OUT; regenerating."
-    generate_assignment_manifest
-    if [ ! -f "$ASSIGNMENTS_OUT" ]; then
-      echo "[RESUME] ERROR: Failed to regenerate assignment manifest at $ASSIGNMENTS_OUT." >&2
-      exit 1
-    fi
-  fi
-  echo "[RESUME] Using manifest $ASSIGNMENTS_OUT (derived from $RESUME_LOG_PATH)"
+  echo "[RESUME] Using log $RESUME_LOG_ABS to skip completed scene jobs."
   CLEAR_LOCAL_OUTPUT_DIR=false
 fi
 
-# Utility: guarantee output dir exists + is writable before we drop a ton of
-# frames in there.
 ensure_writable_dir() {
   local target="$1"
   if [ ! -d "$target" ]; then
@@ -602,8 +549,6 @@ ensure_writable_dir() {
   fi
 }
 
-# Optionally wipe previous contents to keep runs deterministic unless resume
-# mode disabled the cleanup step earlier.
 prepare_local_output_dir() {
   local target="$1"
   ensure_writable_dir "$target"
@@ -615,8 +560,6 @@ prepare_local_output_dir() {
 
 prepare_local_output_dir "$OUTPUT_DIR"
 
-# Connectivity sanity check so we fail early if the NAS is unreachable before any
-# heavy compute starts.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   NAS_TEST_DIR="${OFFLOAD_NAS_DIR}/__connectivity_check__"
   if mkdir -p "${NAS_TEST_DIR}" \
@@ -650,28 +593,20 @@ if [ "$RESERVE_VRAM_GB" -gt 0 ]; then
   reserve_vram "$RESERVE_VRAM_GB"
 fi
 
-# Assignment planning is deterministic: in resume mode we skip generation and
-# reuse the previous manifest so scene/actor pairings stay stable.
-if $RESUME_MODE; then
-  echo "[RESUME] Skipping assignment generation and reusing ${ASSIGNMENTS_OUT}"
-else
-  generate_assignment_manifest
-fi
-
-# Rendering CLI snippets are composed here so storage flags can extend/override
-# behavior (NAS uploads, BEV toggles, etc.) without duplicating the Python call.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   render_extra_snippets+=("--offload-nas-dir ${OFFLOAD_NAS_DIR} --offload-min-free-gb ${OFFLOAD_MIN_FREE_GB}")
 fi
 
 parallel_cmd=(
   conda run --no-capture-output -n "$CONDA_ENV" python parallel_render_paths.py
-  --assignment-manifest "${ASSIGNMENTS_OUT}"
+  --fpv-only
+  --fpv-follow-distance "${FPV_FOLLOW_DISTANCE}"
   --scenes-dir "${SCENES_DIR}"
   --tasks-dir "${TASKS_DIR}"
   --workers "${WORKERS}"
   --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
+  --error-log "${ERROR_LOG}"
   --progress-json "${PROGRESS_JSON}"
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
@@ -683,8 +618,6 @@ if storage_bool_true "$RETRY_CUDA_OOM"; then
 else
   parallel_cmd+=(--no-retry-cuda-oom)
 fi
-# Thread the resume log into the renderer so it can skip completed scene/actor
-# pairs. Remaining CLI snippets (overwrite/offload/etc.) are appended below.
 if [ -n "$RESUME_LOG_ABS" ]; then
   parallel_cmd+=(--skip-completed-log "$RESUME_LOG_ABS")
 fi
@@ -736,7 +669,6 @@ if storage_bool_true "$ENABLE_REMOTE_STORAGE"; then
 fi
 
 if ! storage_bool_true "$ENABLE_LOCAL_STORAGE" && [ "$REMOTE_STORAGE_UNAVAILABLE" = false ]; then
-  # When purely offloading to NAS/remote, purge local outputs to conserve disk.
   if [ -d "$OUTPUT_DIR" ]; then
     echo "[STORAGE] Removing local outputs at ${OUTPUT_DIR}"
     rm -rf "$OUTPUT_DIR"

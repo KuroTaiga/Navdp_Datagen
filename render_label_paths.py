@@ -3,6 +3,19 @@
 
 """Render walkthrough frames for raster_world trajectories.
 
+Debug NPC BEV-only (unmirrored, strict free-space, auto clearance):
+$ python render_label_paths.py --npc-bev-debug-only \
+    --tasks-dir data/selected_65k --scene 0001_839920 \
+    --npc-density-coverage 0.2 --npc-count 8 --npc-priority coverage \
+    --npc-density-mode angular --npc-zone-ratio 1:2:1 \
+    --npc-max-range 10 --npc-free-threshold 250 --npc-free-white \
+    --npc-auto-clearance --npc-actor-root ./data/human_gs_source --npc-radius-samples 80 \
+    --no-mirror-translation --no-bev-mirror-x --no-bev-mirror-y \
+    --npc-seed 12345 --output-dir /tmp/npc_debug
+
+Formal render example (with NPC BEV overlays alongside full renders):
+  python render_label_paths.py --tasks-dir data/task_outputs_10w_4 --scene 0001_839920 --actor-seq-dir ./data/human_gs_source/<actor_id> --npc-bev-debug --npc-density-coverage 0.2 --npc-count 4 --npc-priority coverage --npc-density-mode angular --npc-zone-ratio 1:2:1 --npc-max-range 5 --npc-seed 12345 --output-dir ./data/path_video_frames_10w_4
+
 This utility pairs scene reconstructions under ``data/scenes`` with task
 descriptions in ``data/task_outputs_10w``. For each label-path JSON that
 contains a ``raster_world`` polyline, the script places a perspective camera on
@@ -15,6 +28,8 @@ from __future__ import annotations
 import os
 import shutil
 import threading, queue
+import hashlib
+import glob
 
 import json
 import math
@@ -51,6 +66,12 @@ from utils.render_utils import (
     load_raster_world_points,
     sample_points,
     world_to_pixel,
+)
+from utils.npc_density import (
+    CameraWedge,
+    NPCDensityConfig,
+    load_free_space_mask,
+    plan_npc_positions,
 )
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -765,7 +786,25 @@ def _ensure_rgb(img: np.ndarray) -> np.ndarray:
         return img[..., :3]
     return img
 
-def _draw_disk(img: np.ndarray, uv: tuple[int, int], r: int, color: tuple[int, int, int]) -> None:
+def _blend_pixel(img: np.ndarray, u: int, v: int, color: tuple[int, int, int], alpha: float | None) -> None:
+    """Blend a pixel with optional alpha; defaults to overwrite when alpha is None/1."""
+    if alpha is None or alpha >= 1.0:
+        img[v, u, :] = color
+        return
+    if alpha <= 0.0:
+        return
+    orig = img[v, u, :].astype(np.float32)
+    target = np.array(color, dtype=np.float32)
+    blended = orig * (1.0 - alpha) + target * alpha
+    img[v, u, :] = blended.astype(img.dtype)
+
+def _draw_disk(
+    img: np.ndarray,
+    uv: tuple[int, int],
+    r: int,
+    color: tuple[int, int, int],
+    alpha: float | None = None,
+) -> None:
     h, w = img.shape[:2]
     u0, v0 = uv
     umin = max(0, u0 - r)
@@ -778,9 +817,17 @@ def _draw_disk(img: np.ndarray, uv: tuple[int, int], r: int, color: tuple[int, i
         for u in range(umin, umax + 1):
             du = u - u0
             if du * du + dv * dv <= rr:
-                img[v, u, :] = color
+                _blend_pixel(img, u, v, color, alpha)
 
-def _draw_polyline(img: np.ndarray, pts: list[tuple[int, int]], color: tuple[int, int, int], thickness: int = 1, dotted = False, dot_gap =6) -> None:
+def _draw_polyline(
+    img: np.ndarray,
+    pts: list[tuple[int, int]],
+    color: tuple[int, int, int],
+    thickness: int = 1,
+    dotted: bool = False,
+    dot_gap: int = 6,
+    alpha: float | None = None,
+) -> None:
     """
     Very lightweight line rasterization: sample along each segment with max(|dx|,|dy|)+1 points.
     """
@@ -790,13 +837,13 @@ def _draw_polyline(img: np.ndarray, pts: list[tuple[int, int]], color: tuple[int
 
     def put(u, v):
         if 0 <= v < h and 0 <= u < w:
-            img[v, u, :] = color
+            _blend_pixel(img, u, v, color, alpha)
             if thickness > 1:
                 for dv in range(-thickness + 1, thickness):
                     for du in range(-thickness + 1, thickness):
                         vv, uu = v + dv, u + du
                         if 0 <= vv < h and 0 <= uu < w:
-                            img[vv, uu, :] = color
+                            _blend_pixel(img, uu, vv, color, alpha)
 
     for seg_idx, ((u0, v0), (u1, v1)) in enumerate(zip(pts[:-1], pts[1:])):
         du = u1 - u0
@@ -839,6 +886,80 @@ def _draw_text_lines(img: np.ndarray, lines: list[str], origin: tuple[int, int] 
                     img[y, x + dx, :] = (200, 200, 200)
             y += 6
     # Mirror the PATHS (not the image) if requested
+
+def _mirror_uv(uv: tuple[int, int], w: int, h: int, mirror_x: bool, mirror_y: bool) -> tuple[int, int]:
+    u, v = uv
+    uu = (w - 1 - u) if mirror_x else u
+    vv = (h - 1 - v) if mirror_y else v
+    return uu, vv
+
+def _meters_to_px(meta: dict, meters: float) -> int:
+    """Convert meters to occupancy pixel units (rounded)."""
+    if meters <= 0.0:
+        return 0
+    return int(round(meters / float(meta["scale"])))
+
+def _rotate_xy(vec: np.ndarray, angle_rad: float) -> np.ndarray:
+    c, s = math.cos(angle_rad), math.sin(angle_rad)
+    x, y = float(vec[0]), float(vec[1])
+    return np.array([c * x - s * y, s * x + c * y], dtype=np.float32)
+
+def _draw_circle_outline(
+    img: np.ndarray,
+    center: tuple[int, int],
+    radius: int,
+    color: tuple[int, int, int],
+    alpha: float | None = None,
+) -> None:
+    """Approximate a circle outline by drawing two filled discs."""
+    if radius <= 0:
+        return
+    h, w = img.shape[:2]
+    u, v = center
+    if not (0 <= u < w and 0 <= v < h):
+        return
+    base_color = tuple(int(c) for c in img[v, u, :])
+    _draw_disk(img, center, radius, color, alpha)
+    inner = max(0, radius - 1)
+    if inner > 0:
+        # Restore interior so the center marker remains visible
+        _draw_disk(img, center, inner, base_color, None)
+
+def _draw_wedge(
+    img: np.ndarray,
+    meta: dict,
+    origin_xy: np.ndarray,
+    forward_xy: np.ndarray,
+    fov_deg: float,
+    r_min: float,
+    r_max: float,
+    color: tuple[int, int, int] = (255, 165, 0),
+    mirror_x: bool = True,
+    mirror_y: bool = True,
+    alpha: float | None = None,
+) -> None:
+    """Draw wedge bounds (ground-plane FOV slice) and optional inner radius."""
+    if r_max <= 0.0:
+        return
+    fov_rad = math.radians(fov_deg)
+    left_dir = _rotate_xy(forward_xy, -0.5 * fov_rad)
+    right_dir = _rotate_xy(forward_xy, 0.5 * fov_rad)
+    left_pt = origin_xy + left_dir * r_max
+    right_pt = origin_xy + right_dir * r_max
+    origin_px = world_to_pixel(meta, origin_xy)
+    left_px = world_to_pixel(meta, left_pt)
+    right_px = world_to_pixel(meta, right_pt)
+    h = int((meta["top"] - meta["bottom"]) / meta["scale"])
+    w = int((meta["right"] - meta["left"]) / meta["scale"])
+    origin_px = _mirror_uv(origin_px, w, h, mirror_x, mirror_y)
+    left_px = _mirror_uv(left_px, w, h, mirror_x, mirror_y)
+    right_px = _mirror_uv(right_px, w, h, mirror_x, mirror_y)
+    _draw_polyline(img, [origin_px, left_px], color, thickness=1, dotted=False, alpha=alpha)
+    _draw_polyline(img, [origin_px, right_px], color, thickness=1, dotted=False, alpha=alpha)
+    _draw_polyline(img, [left_px, right_px], color, thickness=1, dotted=True, dot_gap=4, alpha=alpha)
+    if r_min > 0.0 and r_min < r_max:
+        radius_px = _meters_to_px(meta, r_min)
+        _draw_circle_outline(img, origin_px, radius_px, color, alpha)
 
 def save_bev_debug_image(
     *,
@@ -924,6 +1045,189 @@ def save_bev_debug_image(
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     imageio.imwrite(out_path, base)
+
+def save_npc_bev_debug_image(
+    *,
+    scene_id: str,
+    label_id: str,
+    frame_idx: int,
+    meta: dict,
+    occ_image: np.ndarray,
+    path_xy: list[np.ndarray],
+    camera_xy: np.ndarray,
+    forward_xy: np.ndarray,
+    npc_positions: list[np.ndarray],
+    config: NPCDensityConfig,
+    fov_deg: float,
+    wedge_max_range: float,
+    achieved_coverage: float,
+    requested_count: int,
+    shortfall: int,
+    target_coverage: float | None,
+    mirror_bev_x: bool,
+    mirror_bev_y: bool,
+    out_path: Path,
+) -> None:
+    """Draw an NPC placement debug frame (camera FOV wedge + NPC discs) on occupancy."""
+
+    occ_rgb = occ_image.copy()
+    h, w = occ_rgb.shape[:2]
+    pad_w = 240
+    base = np.zeros((h, w + pad_w, 3), dtype=np.uint8)
+    base[:, :w, :] = occ_rgb
+
+    path_px = [_mirror_uv(world_to_pixel(meta, xy), w, h, mirror_bev_x, mirror_bev_y) for xy in path_xy]
+    cam_px = _mirror_uv(world_to_pixel(meta, camera_xy), w, h, mirror_bev_x, mirror_bev_y)
+    npc_px = [_mirror_uv(world_to_pixel(meta, xy), w, h, mirror_bev_x, mirror_bev_y) for xy in npc_positions]
+
+    # Paths
+    if path_px:
+        _draw_polyline(base, path_px, (255, 0, 255), thickness=1, dotted=False)
+        _draw_disk(base, path_px[0], 4, (255, 255, 0))
+        _draw_disk(base, path_px[-1], 4, (255, 0, 0))
+
+    # Camera marker and wedge
+    _draw_disk(base, cam_px, 4, (0, 191, 255))  # camera center
+    _draw_wedge(
+        base,
+        meta=meta,
+        origin_xy=camera_xy,
+        forward_xy=forward_xy,
+        fov_deg=fov_deg,
+        r_min=config.min_distance_from_camera,
+        r_max=wedge_max_range,
+        color=(255, 165, 0),
+        mirror_x=mirror_bev_x,
+        mirror_y=mirror_bev_y,
+        alpha=0.5,
+    )
+
+    # NPC discs
+    npc_radius_px = max(1, _meters_to_px(meta, config.clearance_radius))
+    for xy_px in npc_px:
+        _draw_disk(base, xy_px, npc_radius_px, (0, 255, 0))
+        _draw_disk(base, xy_px, max(1, npc_radius_px // 3), (0, 128, 0))
+
+    lines = [
+        f"Scene: {scene_id}",
+        f"Label: {label_id}",
+        f"Frame: {frame_idx}",
+        f"Coverage: {achieved_coverage:.2f}"
+        + (f"/{target_coverage:.2f}" if target_coverage is not None else "")
+        + f" ({config.coverage_mode})",
+        f"NPCs: {len(npc_positions)}/{requested_count} (shortfall {shortfall})",
+        f"Priority: {config.priority} | desired={config.desired_count or '-'} | max={config.max_npcs or '-'}",
+        f"Zones (near:mid:far): {config.zone_weights[0]:.1f}:{config.zone_weights[1]:.1f}:{config.zone_weights[2]:.1f}",
+        f"Clearance: {config.clearance_radius:.2f} m",
+        f"Range: {config.min_distance_from_camera:.2f}-{wedge_max_range:.2f} m",
+        f"FOV: {fov_deg:.1f} deg",
+    ]
+
+    _draw_text_lines(base, lines, origin=(w + 12, 8))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(out_path, base)
+
+def generate_npc_bev_debug_for_path(
+    *,
+    scene_id: str,
+    label_id: str,
+    path_xy: list[np.ndarray],
+    meta: dict,
+    occ_image: np.ndarray,
+    free_mask: np.ndarray,
+    config: NPCDensityConfig,
+    fov_deg: float,
+    seed_base: int,
+    output_root: Path,
+    stabilize: bool,
+    forward_fn,
+    goal_xy: np.ndarray | None = None,
+    npc_max_range: float | None = None,
+    mirror_bev_x: bool = True,
+    mirror_bev_y: bool = True,
+    exclude_discs: list[tuple[np.ndarray, float]] | None = None,
+) -> dict:
+    """Generate per-frame NPC BEV debug images without rendering RGB/depth."""
+
+    direction_window = STABILIZE_WINDOW if stabilize else 1
+    positions = [np.array([xy[0], xy[1], 0.0], dtype=np.float32) for xy in path_xy]
+    goal_xy = goal_xy if goal_xy is not None else (path_xy[-1] if path_xy else None)
+    out_dir = output_root / scene_id / label_id / "__npc_bev_debug"
+
+    wedge_max_range = npc_max_range if npc_max_range is not None else config.max_distance_from_camera
+    if wedge_max_range is None:
+        wedge_max_range = 5.0
+
+    frames_done = 0
+    total_shortfall = 0
+    coverages: list[float] = []
+    for frame_idx, cam_pos in enumerate(positions):
+        forward = forward_fn(positions, frame_idx, window=direction_window)
+        forward_xy = forward[:2]
+        norm = float(np.linalg.norm(forward_xy))
+        if norm < EPS:
+            forward_xy = np.array([0.0, 1.0], dtype=np.float32)
+        else:
+            forward_xy = (forward_xy / norm).astype(np.float32)
+
+        wedge = CameraWedge(
+            origin_xy=cam_pos[:2],
+            forward_xy=forward_xy,
+            fov_deg=fov_deg,
+            max_range=wedge_max_range,
+            min_range=config.min_distance_from_camera,
+        )
+        seed = _npc_frame_seed(seed_base, scene_id, label_id, frame_idx)
+        rng = np.random.default_rng(seed)
+        placement = plan_npc_positions(
+            wedge=wedge,
+            free_mask=free_mask,
+            meta=meta,
+            rng=rng,
+            config=config,
+            goal_xy=goal_xy,
+            exclude_discs=exclude_discs,
+        )
+
+        out_path = out_dir / f"npc_bev_{frame_idx:04d}.png"
+        save_npc_bev_debug_image(
+            scene_id=scene_id,
+            label_id=label_id,
+            frame_idx=frame_idx,
+            meta=meta,
+            occ_image=occ_image,
+            path_xy=path_xy,
+            camera_xy=cam_pos[:2],
+            forward_xy=forward_xy,
+            npc_positions=placement.positions_xy,
+            config=config,
+            fov_deg=fov_deg,
+            wedge_max_range=wedge_max_range,
+            achieved_coverage=placement.achieved_coverage,
+            requested_count=placement.requested_count,
+            shortfall=placement.shortfall,
+            target_coverage=config.target_coverage,
+            mirror_bev_x=mirror_bev_x,
+            mirror_bev_y=mirror_bev_y,
+            out_path=out_path,
+        )
+        frames_done += 1
+        total_shortfall += placement.shortfall
+        coverages.append(float(placement.achieved_coverage))
+
+    coverage_min = min(coverages) if coverages else 0.0
+    coverage_max = max(coverages) if coverages else 0.0
+    coverage_mean = float(sum(coverages) / len(coverages)) if coverages else 0.0
+
+    return {
+        "frames": frames_done,
+        "shortfall": total_shortfall,
+        "output_dir": out_dir,
+        "coverage_min": coverage_min,
+        "coverage_max": coverage_max,
+        "coverage_mean": coverage_mean,
+    }
 ##############################################################################################
 
 def _serialize_camera(camera: MiniCam | OrthoMiniCam, *, orthographic: bool) -> dict:
@@ -975,19 +1279,38 @@ def _serialize_camera(camera: MiniCam | OrthoMiniCam, *, orthographic: bool) -> 
     }
 
 
-def _save_depth_and_camera(
+# Depth encoding options: bit depth -> (step meters, max distance meters).
+# 16-bit: 1 mm steps to 65.535 m; 12-bit: 1 mm steps to 4.095 m;
+# 10-bit: 2 mm steps to 2.046 m; 8-bit: 4 cm steps to 10.2 m.
+DEPTH_ENCODING_SPECS = {
+    16: {"step_m": 0.001, "max_m": 0.001 * ((1 << 16) - 1)},
+    12: {"step_m": 0.001, "max_m": 0.001 * ((1 << 12) - 1)},
+    10: {"step_m": 0.002, "max_m": 0.002 * ((1 << 10) - 1)},
+    8: {"step_m": 0.04, "max_m": 0.04 * ((1 << 8) - 1)},
+}
+
+
+def _quantize_depth(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
+    spec = DEPTH_ENCODING_SPECS[bit_depth]
+    step_m = spec["step_m"]
+    max_m = spec["max_m"]
+    depth_clipped = np.clip(depth_m, 0.0, max_m)
+    quantized = np.rint(depth_clipped / step_m)
+    dtype = np.uint8 if bit_depth <= 8 else np.uint16
+    return quantized.astype(dtype)
+
+
+def _save_depth_map(
     *,
     frames_dir: Path,
     frame_prefix: str,
     frame_idx: int,
     img_pkg: dict,
-    camera: MiniCam | OrthoMiniCam,
     orthographic: bool,
+    depth_bit_depth: int,
     metrics: PathMetricRecorder | None = None,
 ) -> None:
-    """
-    Persist depth (npy + 16-bit PNG) and camera metadata for one frame.
-    """
+    """Persist depth (PNG, quantized by bit depth) for one frame."""
     depth_tensor = img_pkg.get("depth")
     if depth_tensor is None:
         return
@@ -1002,17 +1325,83 @@ def _save_depth_and_camera(
         rotate_k = 1 if orthographic else 2
         depth_rot = np.rot90(depth, k=rotate_k)
 
-        depth_mm = np.clip(depth_rot * 1000.0, 0.0, 65535.0).astype(np.uint16)
+        depth_quant = _quantize_depth(depth_rot, bit_depth=depth_bit_depth)
         depth_png_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.png"
-        imageio.imwrite(depth_png_path, depth_mm)
+        imageio.imwrite(depth_png_path, depth_quant)
 
-        cam_json = _serialize_camera(camera, orthographic=orthographic)
-        cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
-        cam_json_path.write_text(json.dumps(cam_json, indent=2))
+
+def _save_camera_metadata(
+    *,
+    frames_dir: Path,
+    frame_prefix: str,
+    frame_idx: int,
+    camera: MiniCam | OrthoMiniCam,
+    orthographic: bool,
+) -> None:
+    """Persist camera metadata JSON for one frame."""
+    cam_json = _serialize_camera(camera, orthographic=orthographic)
+    cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
+    cam_json_path.write_text(json.dumps(cam_json, indent=2))
 
 def _rotate_180_xy(xy: np.ndarray) -> np.ndarray:
     """Rotate 2D points by 180 degrees around origin."""
     return np.flipud(np.fliplr(xy))
+
+def _npc_frame_seed(base_seed: int, scene_id: str, label_id: str, frame_idx: int) -> int:
+    payload = f"{base_seed}:{scene_id}:{label_id}:{frame_idx}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="little")
+
+def _compute_ply_radius(ply_path: Path) -> float:
+    """Estimate avatar radius from a PLY frame using 95th percentile of XY distances from median center."""
+    ply = ply_utils.GaussianPly.read(ply_path)
+    x = np.asarray(ply.data["x"], dtype=np.float64)
+    y = np.asarray(ply.data["y"], dtype=np.float64)
+    if x.size == 0 or y.size == 0:
+        return 0.0
+    xy = np.stack((x, y), axis=1)
+    center = np.median(xy, axis=0)
+    dists = np.linalg.norm(xy - center[None, :], axis=1)
+    return float(np.percentile(dists, 95))
+
+def _compute_default_npc_clearance(actor_root: Path, sample_limit: int = 80) -> float:
+    """Derive a default NPC clearance radius from HumanGS sources (trimmed mean of radii)."""
+    if not actor_root.is_dir():
+        raise FileNotFoundError(f"Actor source root not found: {actor_root}")
+    radii: list[float] = []
+    actor_dirs = sorted(p for p in actor_root.iterdir() if p.is_dir())
+    for idx, actor_dir in enumerate(actor_dirs):
+        if idx >= sample_limit:
+            break
+        ply_files = sorted(glob.glob(str(actor_dir / "*.ply")))
+        if not ply_files:
+            continue
+        try:
+            r = _compute_ply_radius(Path(ply_files[0]))
+            if r > 0.0 and math.isfinite(r):
+                radii.append(r)
+        except Exception:
+            continue
+    if not radii:
+        raise RuntimeError(f"No valid PLY frames found under {actor_root}")
+    radii_sorted = sorted(radii)
+    n = len(radii_sorted)
+    drop = max(0, int(n * 0.125))
+    trimmed = radii_sorted[drop : n - drop] if n - 2 * drop > 0 else radii_sorted
+    return float(sum(trimmed) / len(trimmed))
+
+def _parse_zone_ratio(text: str) -> tuple[float, float, float]:
+    parts = text.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"Expected near:mid:far ratio like 1:2:1, got '{text}'")
+    vals = []
+    for part in parts:
+        try:
+            vals.append(float(part))
+        except Exception as exc:  # pylint: disable=broad-except
+            raise ValueError(f"Invalid zone ratio component '{part}' in '{text}'") from exc
+    if all(v <= 0.0 for v in vals):
+        return (1.0, 1.0, 1.0)
+    return tuple(vals)  # type: ignore[return-value]
 def build_navdp_mask_ply(
     *,
     scene_id: str,
@@ -1204,9 +1593,22 @@ def list_actor_frame_paths(options: ActorOptions) -> list[Path]:
             path
             for path in options.sequence_dir.glob("*.ply")
             if path.is_file()
-        ]
+    ]
 
     return sorted(initial, key=natural_sort_key)
+
+
+def _first_actor_subdir(root: Path) -> Path | None:
+    """Pick the first child directory under root that contains at least one PLY."""
+
+    if root is None or not root.is_dir():
+        return None
+    for child in sorted(root.iterdir()):
+        if not child.is_dir():
+            continue
+        if any(child.glob("*.ply")):
+            return child
+    return None
 
 
 def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
@@ -1649,6 +2051,27 @@ class CombinedGaussianModel:
 
 
 
+def _concat_actor_frames(frames: Sequence[ActorRenderFrame]) -> ActorRenderFrame:
+    """Concatenate multiple ActorRenderFrame entries into a single batch."""
+
+    if not frames:
+        raise ValueError("No actor frames provided for concatenation.")
+    xyz = torch.cat([f.xyz for f in frames], dim=0)
+    features_dc = torch.cat([f.features_dc for f in frames], dim=0)
+    features_rest = torch.cat([f.features_rest for f in frames], dim=0)
+    opacity = torch.cat([f.opacity for f in frames], dim=0)
+    scaling = torch.cat([f.scaling for f in frames], dim=0)
+    rotation = torch.cat([f.rotation for f in frames], dim=0)
+    return ActorRenderFrame(
+        xyz=xyz,
+        features_dc=features_dc,
+        features_rest=features_rest,
+        opacity=opacity,
+        scaling=scaling,
+        rotation=rotation,
+    )
+
+
 
 
 
@@ -1675,6 +2098,8 @@ def render_actor_camera_only_sequence(
     video: bool,
     save_rgb_frames: bool,
     save_depth_maps: bool,
+    save_camera_metadata: bool,
+    depth_bit_depth: int,
     frames_dir: Path,
     frame_prefix: str,
     debug: bool,
@@ -1808,17 +2233,28 @@ def render_actor_camera_only_sequence(
                 print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
         if save_depth_maps:
             try:
-                _save_depth_and_camera(
+                _save_depth_map(
                     frames_dir=frames_dir,
                     frame_prefix=frame_prefix,
                     frame_idx=frame_counter,
                     img_pkg=img_pkg,
-                    camera=camera,
                     orthographic=False,
+                    depth_bit_depth=depth_bit_depth,
                     metrics=metrics,
                 )
             except Exception as e:
-                print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
+                print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
+        if save_camera_metadata:
+            try:
+                _save_camera_metadata(
+                    frames_dir=frames_dir,
+                    frame_prefix=frame_prefix,
+                    frame_idx=frame_counter,
+                    camera=camera,
+                    orthographic=False,
+                )
+            except Exception as e:
+                print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
 
         # Also write to video if requested
         if video:
@@ -1873,6 +2309,8 @@ def render_actor_follow_sequence(
     video: bool,
     save_rgb_frames: bool,
     save_depth_maps: bool,
+    save_camera_metadata: bool,
+    depth_bit_depth: int,
     frames_dir: Path,
     frame_prefix: str,
     debug: bool,
@@ -1886,6 +2324,15 @@ def render_actor_follow_sequence(
     sh_degree: int,
     gpu_only: bool,
     metrics: PathMetricRecorder | None = None,
+    npc_enabled: bool = False,
+    npc_config: NPCDensityConfig | None = None,
+    npc_free_mask: np.ndarray | None = None,
+    npc_meta: dict | None = None,
+    npc_seed_base: int = 0,
+    npc_wedge_max_range: float | None = None,
+    npc_forward_fn=None,
+    npc_goal: np.ndarray | None = None,
+    npc_actor_runtime: ActorRuntime | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Render combined scene+actor frames using either CPU or GPU composition."""
 
@@ -1907,6 +2354,23 @@ def render_actor_follow_sequence(
     anim_step = (options.fps / float(DEFAULT_VIDEO_FPS)) * cycle_mod
     anim_cursor = 0.0
     num_actor_frames = len(sequence.frames)
+
+    npc_active = (
+        npc_enabled
+        and npc_config is not None
+        and npc_free_mask is not None
+        and npc_meta is not None
+        and npc_actor_runtime is not None
+    )
+    npc_sequence = npc_actor_runtime.sequence if npc_active else None
+    npc_options = npc_actor_runtime.options if npc_active else None
+    npc_ground_z = floor_z + (npc_options.foot_offset if npc_options is not None else 0.0)
+    npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1))) if npc_options is not None else 1
+    npc_anim_step = (
+        (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod if npc_options is not None else 0.0
+    )
+    npc_num_frames = len(npc_sequence.frames) if npc_sequence is not None else 0
+    npc_shortfall_total = 0
 
     frame_plans: list[ActorFramePlan] = []
     camera_positions: list[np.ndarray] = []
@@ -2005,45 +2469,8 @@ def render_actor_follow_sequence(
         combined_actor_size: int | None = None
 
         for idx, plan in enumerate(frame_plans):
-            # Transform actor for this frame
-            base_frame = sequence.frames[plan.base_frame_index]
-            actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
-
-            # Dump debug PLY if requested
-            if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
-                actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
-                entries = []
-                if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
-                    entries.append(scene_debug_vertices)
-                entries.append(actor_vertices)
-                debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
-                dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
-                _write_debug_ply(dump_path, debug_vertices)
-                dump_count += 1
-
-            if dump and dump.dump_only:
-                continue
-
-            # Convert actor to GPU tensors
-            actor_render = actor_data_to_tensors(
-                actor_data,
-                sequence,
-                device,
-                verbose=verbose,
-                target_rest_dim=scene_rest_dim,
-            )
-
-            # Combine scene + actor
-            current_actor_size = int(actor_render.xyz.shape[0])
-            if combined_model is None or combined_actor_size != current_actor_size:
-                combined_model = CombinedGaussianModel(gaussians, actor_render)
-                combined_actor_size = current_actor_size
-            else:
-                combined_model.update_actor(actor_render)
-
-            # Build camera
             camera_position = camera_positions[idx]
-            forward = forward_direction(camera_positions, idx, window=direction_window)
+            forward = npc_forward_fn(camera_positions, idx, window=direction_window) if npc_forward_fn else forward_direction(camera_positions, idx, window=direction_window)
             if np.linalg.norm(forward[:2]) < EPS:
                 forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
             if stabilize and prev_forward is not None:
@@ -2053,6 +2480,105 @@ def render_actor_follow_sequence(
                     forward = (blended / blended_norm).astype(np.float32)
                     forward[2] = 0.0
             prev_forward = forward.copy()
+
+            # Transform actor for this frame
+            base_frame = sequence.frames[plan.base_frame_index]
+            actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+
+            npc_actor_frames: list[ActorRenderFrame] = []
+            npc_debug_vertices: list[np.ndarray] = []
+            if npc_active and npc_num_frames > 0 and npc_wedge_max_range is not None:
+                wedge_forward = forward[:2]
+                norm_fwd = float(np.linalg.norm(wedge_forward))
+                if norm_fwd < EPS:
+                    wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
+                else:
+                    wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
+                wedge = CameraWedge(
+                    origin_xy=camera_position[:2],
+                    forward_xy=wedge_forward,
+                    fov_deg=fov_deg,
+                    max_range=float(npc_wedge_max_range),
+                    min_range=npc_config.min_distance_from_camera,
+                )
+                npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
+                rng = np.random.default_rng(npc_seed)
+                placement = plan_npc_positions(
+                    wedge=wedge,
+                    free_mask=npc_free_mask,
+                    meta=npc_meta,
+                    rng=rng,
+                    config=npc_config,
+                    goal_xy=npc_goal,
+                    exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
+                )
+                npc_shortfall_total += placement.shortfall
+                if verbose and placement.shortfall > 0:
+                    print(
+                        f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
+                        flush=True,
+                    )
+                orient_rng = np.random.default_rng(npc_seed + 1)
+                for npc_i, npc_xy in enumerate(placement.positions_xy):
+                    yaw = float(orient_rng.uniform(-math.pi, math.pi))
+                    rotation_np = rotation_matrix_z_np(yaw)
+                    translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
+                    transform = build_transform_matrix(rotation_np, translation_vec)
+                    if npc_options.loop:
+                        npc_anim_idx = int((idx * npc_anim_step + npc_i) % npc_num_frames)
+                    else:
+                        npc_anim_idx = min(int(idx * npc_anim_step + npc_i), max(npc_num_frames - 1, 0))
+                    base_npc_frame = npc_sequence.frames[npc_anim_idx]
+                    npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                    if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                        npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
+                    npc_actor_frames.append(
+                        actor_data_to_tensors(
+                            npc_data,
+                            npc_sequence,
+                            device,
+                            verbose=False,
+                            target_rest_dim=scene_rest_dim,
+                        )
+                    )
+
+            # Dump debug PLY if requested
+            if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
+                entries = []
+                if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
+                    entries.append(scene_debug_vertices)
+                entries.append(actor_vertices)
+                if npc_debug_vertices:
+                    entries.extend(npc_debug_vertices)
+                debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+                dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
+                _write_debug_ply(dump_path, debug_vertices)
+                dump_count += 1
+
+            if dump and dump.dump_only:
+                continue
+
+            # Convert actor + NPCs to GPU tensors
+            actor_render = actor_data_to_tensors(
+                actor_data,
+                sequence,
+                device,
+                verbose=verbose,
+                target_rest_dim=scene_rest_dim,
+            )
+            actor_renders = [actor_render]
+            if npc_actor_frames:
+                actor_renders.extend(npc_actor_frames)
+            merged_render = _concat_actor_frames(actor_renders) if len(actor_renders) > 1 else actor_render
+
+            # Combine scene + actor(s)
+            current_actor_size = int(merged_render.xyz.shape[0])
+            if combined_model is None or combined_actor_size != current_actor_size:
+                combined_model = CombinedGaussianModel(gaussians, merged_render)
+                combined_actor_size = current_actor_size
+            else:
+                combined_model.update_actor(merged_render)
 
             target_xy = camera_position[:2] + forward[:2] * look_ahead
             target_z = camera_position[2] - look_down
@@ -2078,9 +2604,9 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Scene features_dc shape: {gaussians.get_features_dc.shape}")
                 print(f"[DEBUG] Scene features_rest shape: {gaussians.get_features_rest.shape}")
                 
-                print(f"[DEBUG] Actor gaussians: {actor_render.xyz.shape[0]}")
-                print(f"[DEBUG] Actor features_dc shape: {actor_render.features_dc.shape}")
-                print(f"[DEBUG] Actor features_rest shape: {actor_render.features_rest.shape}")
+                print(f"[DEBUG] Actor gaussians: {merged_render.xyz.shape[0]}")
+                print(f"[DEBUG] Actor features_dc shape: {merged_render.features_dc.shape}")
+                print(f"[DEBUG] Actor features_rest shape: {merged_render.features_rest.shape}")
                 
                 print(f"[DEBUG] Combined model max_sh_degree: {combined_model.max_sh_degree}, active: {combined_model.active_sh_degree}")
                 print(f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}")
@@ -2106,17 +2632,28 @@ def render_actor_follow_sequence(
                     print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
             if save_depth_maps:
                 try:
-                    _save_depth_and_camera(
+                    _save_depth_map(
                         frames_dir=frames_dir,
                         frame_prefix=frame_prefix,
                         frame_idx=frame_counter,
                         img_pkg=img_pkg,
-                        camera=camera,
                         orthographic=False,
+                        depth_bit_depth=depth_bit_depth,
                         metrics=metrics,
                     )
                 except Exception as e:
-                    print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
+                    print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
+            if save_camera_metadata:
+                try:
+                    _save_camera_metadata(
+                        frames_dir=frames_dir,
+                        frame_prefix=frame_prefix,
+                        frame_idx=frame_counter,
+                        camera=camera,
+                        orthographic=False,
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
             
             # Also write to video if requested (do this AFTER frame saving to avoid corruption)
             if video:
@@ -2150,6 +2687,11 @@ def render_actor_follow_sequence(
                 f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
                 flush=True,
             )
+        if npc_active and verbose and npc_shortfall_total > 0:
+            print(
+                f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
+                flush=True,
+            )
 
         return camera_xy_seq, actor_xy_seq
 
@@ -2169,32 +2711,8 @@ def render_actor_follow_sequence(
     frame_gaussians = GaussianModel(sh_degree=sh_degree)
 
     for idx, plan in enumerate(frame_plans):
-        base_frame = sequence.frames[plan.base_frame_index]
-        actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
-
-        if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
-            actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
-            entries: list[np.ndarray] = []
-            if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
-                entries.append(scene_debug_vertices)
-            entries.append(actor_vertices)
-            debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
-            dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
-            _write_debug_ply(dump_path, debug_vertices)
-            dump_count += 1
-
-        if dump and dump.dump_only:
-            continue
-
-        actor_aligned = ply_utils.align_dtype(actor_data, scene_dtype)
-        combined_vertices = ply_utils.concat_vertices(scene_subset, actor_aligned)
-        scene_template.write(combined_vertices, combined_tmp_path)
-
-        frame_gaussians.load_ply(str(combined_tmp_path))
-
         camera_position = camera_positions[idx]
-
-        forward = forward_direction(camera_positions, idx, window=direction_window)
+        forward = npc_forward_fn(camera_positions, idx, window=direction_window) if npc_forward_fn else forward_direction(camera_positions, idx, window=direction_window)
         if np.linalg.norm(forward[:2]) < EPS:
             forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         if stabilize and prev_forward is not None:
@@ -2204,6 +2722,76 @@ def render_actor_follow_sequence(
                 forward = (blended / blended_norm).astype(np.float32)
                 forward[2] = 0.0
         prev_forward = forward.copy()
+
+        base_frame = sequence.frames[plan.base_frame_index]
+        actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+
+        npc_vertex_entries: list[np.ndarray] = []
+        npc_debug_vertices: list[np.ndarray] = []
+        if npc_active and npc_num_frames > 0 and npc_wedge_max_range is not None:
+            wedge_forward = forward[:2]
+            norm_fwd = float(np.linalg.norm(wedge_forward))
+            if norm_fwd < EPS:
+                wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
+            else:
+                wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
+            wedge = CameraWedge(
+                origin_xy=camera_position[:2],
+                forward_xy=wedge_forward,
+                fov_deg=fov_deg,
+                max_range=float(npc_wedge_max_range),
+                min_range=npc_config.min_distance_from_camera,
+            )
+            npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
+            rng = np.random.default_rng(npc_seed)
+            placement = plan_npc_positions(
+                wedge=wedge,
+                free_mask=npc_free_mask,
+                meta=npc_meta,
+                rng=rng,
+                config=npc_config,
+                goal_xy=npc_goal,
+                exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
+            )
+            npc_shortfall_total += placement.shortfall
+            orient_rng = np.random.default_rng(npc_seed + 1)
+            for npc_i, npc_xy in enumerate(placement.positions_xy):
+                yaw = float(orient_rng.uniform(-math.pi, math.pi))
+                rotation_np = rotation_matrix_z_np(yaw)
+                translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
+                transform = build_transform_matrix(rotation_np, translation_vec)
+                if npc_options.loop:
+                    npc_anim_idx = int((idx * npc_anim_step + npc_i) % npc_num_frames)
+                else:
+                    npc_anim_idx = min(int(idx * npc_anim_step + npc_i), max(npc_num_frames - 1, 0))
+                base_npc_frame = npc_sequence.frames[npc_anim_idx]
+                npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
+                if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                    npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
+
+        if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+            actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
+            entries: list[np.ndarray] = []
+            if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
+                entries.append(scene_debug_vertices)
+            entries.append(actor_vertices)
+            if npc_debug_vertices:
+                entries.extend(npc_debug_vertices)
+            debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+            dump_path = dump.directory / f"{frame_prefix}_{idx:04d}.ply"
+            _write_debug_ply(dump_path, debug_vertices)
+            dump_count += 1
+
+        if dump and dump.dump_only:
+            continue
+
+        actor_aligned = ply_utils.align_dtype(actor_data, scene_dtype)
+        entries_for_concat = [scene_subset, actor_aligned] + npc_vertex_entries
+        combined_vertices = ply_utils.concat_vertices(*entries_for_concat)
+        scene_template.write(combined_vertices, combined_tmp_path)
+
+        frame_gaussians.load_ply(str(combined_tmp_path))
 
         target_xy = camera_position[:2] + forward[:2] * look_ahead
         target_z = camera_position[2] - look_down
@@ -2243,17 +2831,28 @@ def render_actor_follow_sequence(
                 imageio.imwrite(frame_path, render_uint8)
         if save_depth_maps:
             try:
-                _save_depth_and_camera(
+                _save_depth_map(
                     frames_dir=frames_dir,
                     frame_prefix=frame_prefix,
                     frame_idx=frame_counter,
                     img_pkg=img_pkg,
-                    camera=camera,
                     orthographic=False,
+                    depth_bit_depth=depth_bit_depth,
                     metrics=metrics,
                 )
             except Exception as e:
-                print(f"[WARN] Failed to save depth/camera for frame {frame_counter}: {e}", flush=True)
+                print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
+        if save_camera_metadata:
+            try:
+                _save_camera_metadata(
+                    frames_dir=frames_dir,
+                    frame_prefix=frame_prefix,
+                    frame_idx=frame_counter,
+                    camera=camera,
+                    orthographic=False,
+                )
+            except Exception as e:
+                print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
         frame_counter += 1
         if metrics:
             metrics.sample_vram()
@@ -2267,6 +2866,11 @@ def render_actor_follow_sequence(
     if verbose:
         print(
             f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
+            flush=True,
+        )
+    if npc_active and verbose and npc_shortfall_total > 0:
+        print(
+            f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
             flush=True,
         )
 
@@ -2630,6 +3234,8 @@ def render_path_frames(
     mirror_bev_y = False,
     save_rgb_frames: bool = False,
     save_depth_maps: bool = True,
+    save_camera_metadata: bool = True,
+    depth_bit_depth: int = 16,
     save_follow_metadata: bool = True,
     actor_dump_root: Path | None = None,
     actor_dump_stride: int = 30,
@@ -2643,6 +3249,15 @@ def render_path_frames(
     job_slot: int | None = None,
     job_actor_id: str | None = None,
     job_name: str | None = None,
+    npc_render: bool = False,
+    npc_config: NPCDensityConfig | None = None,
+    npc_free_mask: np.ndarray | None = None,
+    npc_meta: dict | None = None,
+    npc_seed_base: int = 0,
+    npc_max_range: float | None = None,
+    npc_forward_fn=None,
+    npc_goal_xy: np.ndarray | None = None,
+    npc_actor_runtime: ActorRuntime | None = None,
 ) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
@@ -2677,6 +3292,23 @@ def render_path_frames(
     positions = [
         np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
     ]
+    npc_enabled = (
+        npc_render
+        and npc_config is not None
+        and npc_free_mask is not None
+        and npc_meta is not None
+        and npc_actor_runtime is not None
+    )
+    npc_goal = npc_goal_xy if npc_goal_xy is not None else (path_xy[-1] if path_xy else None)
+    npc_wedge_max_range = None
+    npc_forward_fn = npc_forward_fn if npc_forward_fn is not None else forward_direction
+    if npc_enabled:
+        npc_wedge_max_range = (
+            npc_max_range
+            if npc_max_range is not None
+            else (npc_config.max_distance_from_camera if npc_config.max_distance_from_camera is not None else 5.0)
+        )
+        npc_wedge_max_range = float(npc_wedge_max_range)
 
     scene_vertices: np.ndarray | None = None
     scene_dtype: np.dtype | None = None
@@ -2742,7 +3374,7 @@ def render_path_frames(
     video_dir = output_dir / scene_id
     video_path = video_dir / f"{json_path.stem}.mp4"
     
-    # Always create frames_dir since we save depth/camera metadata there
+    # Always create frames_dir since per-frame outputs (camera/depth/RGB) live there.
     frames_dir.mkdir(parents=True, exist_ok=True)
     
     if effective_video:
@@ -2814,6 +3446,8 @@ def render_path_frames(
                         video=effective_video,
                         save_rgb_frames=save_rgb_frames,
                         save_depth_maps=save_depth_maps,
+                        save_camera_metadata=save_camera_metadata,
+                        depth_bit_depth=depth_bit_depth,
                         frames_dir=frames_dir,
                         frame_prefix="frame",
                         debug=debug,
@@ -2846,6 +3480,8 @@ def render_path_frames(
                         video=effective_video,
                         save_rgb_frames=save_rgb_frames,
                         save_depth_maps=save_depth_maps,
+                        save_camera_metadata=save_camera_metadata,
+                        depth_bit_depth=depth_bit_depth,
                         frames_dir=frames_dir,
                         frame_prefix="frame",
                         debug=debug,
@@ -2859,6 +3495,15 @@ def render_path_frames(
                         sh_degree=gaussians.max_sh_degree,
                         gpu_only=gpu_only,
                         metrics=metrics_recorder,
+                        npc_enabled=npc_enabled,
+                        npc_config=npc_config,
+                        npc_free_mask=npc_free_mask,
+                        npc_meta=npc_meta,
+                        npc_seed_base=npc_seed_base,
+                        npc_wedge_max_range=npc_wedge_max_range,
+                        npc_forward_fn=npc_forward_fn,
+                        npc_goal=npc_goal,
+                        npc_actor_runtime=npc_actor_runtime,
                     )
                     frames_rendered = len(cam_seq)
                 if render_bev:
@@ -2981,17 +3626,28 @@ def render_path_frames(
                             print(f"[WARN] Failed to save RGB frame {idx}: {e}", flush=True)
                     if save_depth_maps:
                         try:
-                            _save_depth_and_camera(
+                            _save_depth_map(
                                 frames_dir=frames_dir,
                                 frame_prefix="frame",
                                 frame_idx=idx,
                                 img_pkg=img_pkg,
-                                camera=camera,
                                 orthographic=orthographic,
+                                depth_bit_depth=depth_bit_depth,
                                 metrics=metrics_recorder,
                             )
                         except Exception as e:
-                            print(f"[WARN] Failed to save depth/camera for frame {idx}: {e}", flush=True)
+                            print(f"[WARN] Failed to save depth for frame {idx}: {e}", flush=True)
+                    if save_camera_metadata:
+                        try:
+                            _save_camera_metadata(
+                                frames_dir=frames_dir,
+                                frame_prefix="frame",
+                                frame_idx=idx,
+                                camera=camera,
+                                orthographic=orthographic,
+                            )
+                        except Exception as e:
+                            print(f"[WARN] Failed to save camera metadata for frame {idx}: {e}", flush=True)
                     
                     # Also write to video if requested
                     if video:
@@ -3238,13 +3894,29 @@ def parse_args() -> ArgumentParser:
         "--save-depth-maps",
         action=BooleanOptionalAction,
         default=True,
-        help="Persist per-frame depth PNGs and camera metadata (default: on).",
+        help="Persist per-frame depth PNGs (default: on).",
+    )
+    parser.add_argument(
+        "--save-camera-metadata",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Write per-frame camera metadata JSON files (default: on).",
+    )
+    parser.add_argument(
+        "--depth-bit-depth",
+        type=int,
+        choices=sorted(DEPTH_ENCODING_SPECS.keys()),
+        default=16,
+        help=(
+            "Depth PNG quantization: 16-bit=1mm to 65.535m, 12-bit=1mm to 4.095m, "
+            "10-bit=2mm to 2.046m, 8-bit=4cm to 10.2m."
+        ),
     )
     parser.add_argument(
         "--save-follow-metadata",
         action=BooleanOptionalAction,
         default=True,
-        help="Write follow path metadata JSON alongside renders (default: on).",
+        help="Write per-path follow metadata JSON (separate from per-frame camera metadata; default: on).",
     )
     parser.add_argument(
         "--no-mirror-translation",
@@ -3420,10 +4092,150 @@ def parse_args() -> ArgumentParser:
         help="Mirror BEV paths across the Y axis (v -> H-1-v) before drawing (default: on)."
     )
     parser.add_argument(
+        "--navdp-mask-ply",
+        action="store_true",
+        default=False,
+        help="Enable NavDP occupancy-masked PLY exports (default: off).",
+    )
+    parser.add_argument(
         "--navdp-ply-per-scene",
         action="store_true",
         default=False,
-        help="Combine all paths from a scene into a single NavDP PLY instead of one per path.",
+        help="Combine all paths from a scene into a single NavDP PLY instead of one per path (requires --navdp-mask-ply).",
+    )
+    parser.add_argument(
+        "--npc-bev-debug",
+        action="store_true",
+        default=False,
+        help="Generate NPC placement BEV debug images alongside rendering.",
+    )
+    parser.add_argument(
+        "--npc-bev-debug-only",
+        action="store_true",
+        default=False,
+        help="Only generate NPC placement BEV debug images (skip rendering).",
+    )
+    parser.add_argument(
+        "--npc-render",
+        action="store_true",
+        default=False,
+        help="Render NPCs into RGB/depth using the density planner (not just BEV overlays).",
+    )
+    parser.add_argument(
+        "--npc-actor-dir",
+        type=Path,
+        default=None,
+        help="Optional actor sequence directory for NPCs (defaults to --actor-seq-dir or first child of --npc-actor-root).",
+    )
+    parser.add_argument(
+        "--npc-bev-output-dir",
+        type=Path,
+        default=None,
+        help="Output root for NPC BEV debug images (defaults to --output-dir).",
+    )
+    parser.add_argument(
+        "--npc-density-coverage",
+        type=float,
+        default=None,
+        help="Target NPC area coverage fraction (0..1) within the camera wedge.",
+    )
+    parser.add_argument(
+        "--npc-max-count",
+        type=int,
+        default=None,
+        help="Hard cap on NPCs per frame (applied after coverage target).",
+    )
+    parser.add_argument(
+        "--npc-count",
+        type=int,
+        default=None,
+        help="Desired NPC count per frame (soft unless npc-priority=count).",
+    )
+    parser.add_argument(
+        "--npc-priority",
+        type=str,
+        choices=["coverage", "count"],
+        default="coverage",
+        help="Treat coverage or count as the hard requirement (coverage still acts as a cap).",
+    )
+    parser.add_argument(
+        "--npc-density-mode",
+        type=str,
+        choices=["area", "angular"],
+        default="angular",
+        help="Coverage metric: 'area' uses wedge area; 'angular' uses FOV angular span (default: angular).",
+    )
+    parser.add_argument(
+        "--npc-zone-ratio",
+        type=str,
+        default="1:2:1",
+        help="Near:mid:far ratio for distributing NPCs radially (default: 1.0:2.0:1.0; applied when target count >= 12).",
+    )
+    parser.add_argument(
+        "--npc-clearance",
+        type=float,
+        default=0.30,
+        help="NPC collision radius in meters (default: 0.30).",
+    )
+    parser.add_argument(
+        "--npc-min-distance",
+        type=float,
+        default=1.0,
+        help="Minimum radial distance from the camera when placing NPCs (default: 1.0 m).",
+    )
+    parser.add_argument(
+        "--npc-max-range",
+        type=float,
+        default=5.0,
+        help="Maximum radial distance from the camera when placing NPCs (default: 5.0 m).",
+    )
+    parser.add_argument(
+        "--npc-allow-blocking",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Allow NPCs to block the camera->goal line of sight (default: off).",
+    )
+    parser.add_argument(
+        "--npc-free-threshold",
+        type=int,
+        default=250,
+        help="Occupancy pixel threshold treated as free space (default: 250 => near-white only).",
+    )
+    parser.add_argument(
+        "--npc-free-white",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Interpret free space as white pixels >= threshold (default: on). Disable to treat dark pixels <= threshold as free.",
+    )
+    parser.add_argument(
+        "--npc-auto-clearance",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Derive NPC clearance from HumanGS sources (trimmed mean radius) and override the default clearance if larger.",
+    )
+    parser.add_argument(
+        "--npc-actor-root",
+        type=Path,
+        default=BASE_DIR / "data" / "human_gs_source",
+        help="Root directory of HumanGS actor sources for auto clearance computation.",
+    )
+    parser.add_argument(
+        "--npc-radius-samples",
+        type=int,
+        default=80,
+        help="Maximum number of actors to sample when auto-computing clearance (default: 80).",
+    )
+    parser.add_argument(
+        "--npc-max-resamples",
+        type=int,
+        default=50,
+        help="Maximum resampling attempts per NPC placement (default: 50).",
+    )
+    parser.add_argument(
+        "--npc-seed",
+        type=int,
+        default=12345,
+        help="Base seed for NPC placement determinism.",
     )
 
     parser.set_defaults(actor_loop=True)
@@ -3479,8 +4291,12 @@ def main() -> None:
     video_enabled = bool(args.video)
     save_rgb_frames = bool(args.rgb_frames)
     save_depth_maps = bool(args.save_depth_maps)
+    save_camera_metadata = bool(args.save_camera_metadata)
+    depth_bit_depth = int(args.depth_bit_depth)
     save_follow_metadata = bool(args.save_follow_metadata)
+    npc_render_enabled = bool(args.npc_render)
     actor_runtime: ActorRuntime | None = None
+    npc_actor_runtime: ActorRuntime | None = None
     gpu_only_enabled = bool(args.gpu_only)
     actor_dump_root = args.actor_dump_ply_dir
     actor_dump_stride = max(1, int(args.actor_dump_stride))
@@ -3492,9 +4308,49 @@ def main() -> None:
         if args.minimal_frames is not None and int(args.minimal_frames) > 0
         else None
     )
-    navdp_manager = NavdpPlyCoordinator(per_scene=bool(args.navdp_ply_per_scene))
+    navdp_manager = (
+        NavdpPlyCoordinator(per_scene=bool(args.navdp_ply_per_scene))
+        if args.navdp_mask_ply
+        else None
+    )
+    if args.navdp_ply_per_scene and navdp_manager is None:
+        print("  [WARN] --navdp-ply-per-scene ignored without --navdp-mask-ply.", flush=True)
     metrics_enabled = bool(args.metrics_json)
     collected_metrics: list[dict] = []
+    npc_bev_enabled = bool(args.npc_bev_debug or args.npc_bev_debug_only)
+    npc_bev_only = bool(args.npc_bev_debug_only)
+    npc_bev_output_root: Path = args.npc_bev_output_dir if args.npc_bev_output_dir is not None else args.output_dir
+    try:
+        zone_ratio = _parse_zone_ratio(str(args.npc_zone_ratio))
+    except ValueError as exc:
+        raise SystemExit(f"Invalid --npc-zone-ratio: {exc}") from exc
+    npc_density_config = NPCDensityConfig(
+        clearance_radius=float(args.npc_clearance),
+        min_distance_from_camera=float(args.npc_min_distance),
+        max_distance_from_camera=float(args.npc_max_range) if args.npc_max_range is not None and float(args.npc_max_range) > 0 else None,
+        target_coverage=float(args.npc_density_coverage) if args.npc_density_coverage is not None else None,
+        max_npcs=int(args.npc_max_count) if args.npc_max_count is not None and int(args.npc_max_count) > 0 else None,
+        allow_blocking=bool(args.npc_allow_blocking),
+        max_resamples=max(1, int(args.npc_max_resamples)),
+        free_pixel_min=int(args.npc_free_threshold),
+        free_is_white=bool(args.npc_free_white),
+        coverage_mode=str(args.npc_density_mode),
+        desired_count=int(args.npc_count) if args.npc_count is not None and int(args.npc_count) > 0 else None,
+        priority=str(args.npc_priority),
+        zone_weights=zone_ratio,
+    )
+    if args.npc_auto_clearance:
+        try:
+            auto_radius = _compute_default_npc_clearance(
+                actor_root=args.npc_actor_root,
+                sample_limit=max(1, int(args.npc_radius_samples)),
+            )
+            if auto_radius > npc_density_config.clearance_radius:
+                npc_density_config.clearance_radius = auto_radius
+            print(f"  [NPC] Auto clearance radius: {auto_radius:.3f} m (using HumanGS sources)", flush=True)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"  [WARN] Failed to auto-compute NPC clearance; using {npc_density_config.clearance_radius:.3f} m. Reason: {exc}", flush=True)
+    npc_forward_fn = get_forward_fn(args)
 
     if args.actor_seq_dir is not None:
         actor_options = ActorOptions(
@@ -3531,6 +4387,53 @@ def main() -> None:
                 f"[VERBOSE] Actor sequence ready: {len(actor_sequence.frames)} frames from {args.actor_seq_dir}.",
                 flush=True,
             )
+
+    if npc_render_enabled:
+        npc_actor_dir: Path | None = args.npc_actor_dir
+        if npc_actor_dir is None:
+            npc_actor_dir = args.actor_seq_dir or _first_actor_subdir(args.npc_actor_root)
+        if npc_actor_dir is None:
+            print(
+                "[WARN] NPC rendering requested but no actor sequence found (set --npc-actor-dir or --actor-seq-dir); disabling NPCs.",
+                flush=True,
+            )
+            npc_render_enabled = False
+        elif actor_runtime is not None and npc_actor_dir.resolve() == actor_runtime.options.sequence_dir.resolve():
+            npc_actor_runtime = actor_runtime
+            if verbose_enabled:
+                print(
+                    f"[VERBOSE] NPC rendering will reuse actor sequence: {npc_actor_dir}",
+                    flush=True,
+                )
+        else:
+            npc_actor_options = ActorOptions(
+                sequence_dir=npc_actor_dir,
+                pattern=args.actor_pattern,
+                height=float(args.actor_height),
+                follow_distance=float(args.follow_distance),
+                buffer_distance=float(args.follow_buffer),
+                speed=float(args.actor_speed),
+                fps=float(args.actor_fps),
+                loop=bool(args.actor_loop),
+                foot_offset=float(args.actor_foot_offset),
+                animation_cycle_mod=int(args.animation_cycle_mod),
+            )
+            if npc_actor_options.fps <= 0.0:
+                raise ValueError("NPC actor FPS must be positive.")
+            if npc_actor_options.speed <= 0.0:
+                raise ValueError("NPC actor walking speed must be positive.")
+            if npc_actor_options.buffer_distance > npc_actor_options.follow_distance:
+                raise ValueError("NPC follow buffer must be less than or equal to follow distance.")
+            npc_actor_sequence = load_actor_sequence(
+                npc_actor_options,
+                debug=debug_enabled,
+            )
+            npc_actor_runtime = ActorRuntime(options=npc_actor_options, sequence=npc_actor_sequence)
+            if verbose_enabled:
+                print(
+                    f"[VERBOSE] NPC actor sequence ready: {len(npc_actor_sequence.frames)} frames from {npc_actor_dir}.",
+                    flush=True,
+                )
 
     if args.scene:
         scene_ids = list(dict.fromkeys(args.scene))
@@ -3619,6 +4522,23 @@ def main() -> None:
                 )
                 continue
             processed_scenes += 1
+            npc_free_mask = None
+            npc_occ_image = None
+            if npc_bev_enabled or npc_render_enabled:
+                try:
+                    npc_free_mask, _ = load_free_space_mask(
+                        dataset_dir,
+                        threshold=int(args.npc_free_threshold),
+                        free_is_white=bool(args.npc_free_white),
+                    )
+                    if npc_bev_enabled:
+                        occ_img = imageio.imread(dataset_dir / "occupancy.png")
+                        npc_occ_image = _ensure_rgb(np.array(occ_img))
+                    print(f"  [NPC] Free-space mask ready (threshold={args.npc_free_threshold}).", flush=True)
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(f"  [WARN] NPC features disabled for {scene_id}: {exc}", flush=True)
+                    npc_free_mask = None
+                    npc_occ_image = None
 
             if debug_enabled:
                 if label_dir == scene_task_root:
@@ -3638,7 +4558,7 @@ def main() -> None:
                     device,
                 )
 
-            json_files = sorted(label_dir.glob("*.json"))
+            json_files = sorted(p for p in label_dir.glob("*.json") if not p.name.endswith("_detailed.json"))
             if label_filter:
                 json_files = [path for path in json_files if path.stem in label_filter]
             if not json_files:
@@ -3698,6 +4618,39 @@ def main() -> None:
                     f"    [{label_idx:03d}/{total_labels:03d}/{total_paths_found:03d}] -> {json_path.stem}",
                     flush=True,
                 )
+                if npc_bev_enabled and npc_free_mask is not None and npc_occ_image is not None:
+                    npc_summary = generate_npc_bev_debug_for_path(
+                        scene_id=scene_id,
+                        label_id=json_path.stem,
+                        path_xy=prepared.path_xy,
+                        meta=meta,
+                        occ_image=npc_occ_image,
+                        free_mask=npc_free_mask,
+                        config=npc_density_config,
+                        fov_deg=float(args.fov_deg),
+                        seed_base=int(args.npc_seed),
+                        output_root=npc_bev_output_root,
+                        stabilize=stabilize_enabled,
+                        forward_fn=npc_forward_fn,
+                        goal_xy=prepared.path_xy[-1] if prepared.path_xy else None,
+                        npc_max_range=float(args.npc_max_range) if args.npc_max_range is not None else None,
+                        mirror_bev_x=args.bev_mirror_x,
+                        mirror_bev_y=args.bev_mirror_y,
+                    )
+                    if verbose_enabled:
+                        print(
+                            f"[VERBOSE] NPC BEV debug ({npc_summary['frames']} frames, shortfall {npc_summary['shortfall']}) -> {npc_summary['output_dir']}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"      [NPC-BEV] {json_path.stem}: wrote {npc_summary['frames']} frame(s) -> {npc_summary['output_dir']} "
+                            f"(shortfall {npc_summary['shortfall']}, coverage mean/min/max "
+                            f"{npc_summary['coverage_mean']:.2f}/{npc_summary['coverage_min']:.2f}/{npc_summary['coverage_max']:.2f})",
+                            flush=True,
+                        )
+                if npc_bev_only:
+                    continue
                 try:
                     summary = render_path_frames(
                         scene_id=scene_id,
@@ -3725,6 +4678,8 @@ def main() -> None:
                         video=video_enabled,
                         save_rgb_frames=save_rgb_frames,
                         save_depth_maps=save_depth_maps,
+                        save_camera_metadata=save_camera_metadata,
+                        depth_bit_depth=depth_bit_depth,
                         save_follow_metadata=save_follow_metadata,
                         debug=debug_enabled,
                         mirror_translation=not args.no_mirror_translation,
@@ -3747,6 +4702,15 @@ def main() -> None:
                         job_slot=args.job_slot,
                         job_actor_id=args.job_actor_id,
                         job_name=args.job_name,
+                        npc_render=npc_render_enabled,
+                        npc_config=npc_density_config,
+                        npc_free_mask=npc_free_mask,
+                        npc_meta=meta,
+                        npc_seed_base=int(args.npc_seed),
+                        npc_max_range=float(args.npc_max_range) if args.npc_max_range is not None else None,
+                        npc_forward_fn=npc_forward_fn,
+                        npc_goal_xy=prepared.path_xy[-1] if prepared.path_xy else None,
+                        npc_actor_runtime=npc_actor_runtime,
                     )
                     if summary is not None:
                         collected_metrics.append(summary)
@@ -3774,18 +4738,19 @@ def main() -> None:
                     log_file.write("\n")
                     log_file.flush()
 
-            try:
-                navdp_manager.finalize_scene(
-                    scene_id=scene_id,
-                    meta=meta,
-                    gaussians=gaussians,
-                    output_dir=args.output_dir,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                print(
-                    f"      WARNING: Failed to finalize NavDP PLYs for {scene_id}: {exc}",
-                    flush=True,
-                )
+            if not npc_bev_only and navdp_manager is not None:
+                try:
+                    navdp_manager.finalize_scene(
+                        scene_id=scene_id,
+                        meta=meta,
+                        gaussians=gaussians,
+                        output_dir=args.output_dir,
+                    )
+                except Exception as exc:  # pylint: disable=broad-except
+                    print(
+                        f"      WARNING: Failed to finalize NavDP PLYs for {scene_id}: {exc}",
+                        flush=True,
+                    )
 
             print(f"  Finished scene {scene_id}\n", flush=True)
             if nas_offload_dir is not None:

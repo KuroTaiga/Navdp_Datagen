@@ -43,6 +43,8 @@ from render_label_paths import (  # type: ignore
     PathSampler,
 )
 
+FPV_ACTOR_ID = "fpv"
+
 
 @dataclass
 class AssignmentEntry:
@@ -87,16 +89,25 @@ class ProgressTracker:
         "ply_write_sec",
     )
 
-    def __init__(self, *, total_jobs: int, total_paths: int, output_path: Path | None):
+    def __init__(
+        self,
+        *,
+        total_jobs: int,
+        total_paths: int,
+        output_path: Path | None,
+        path_lengths: dict[tuple[str, str], float] | None = None,
+    ):
         self.total_jobs = total_jobs
         self.total_paths = total_paths
         self.completed_jobs = 0
         self.completed_paths = 0
         self.total_render_time = 0.0
         self.total_frames_rendered = 0
+        self.total_path_length = 0.0
         self.stage_totals: defaultdict[str, float] = defaultdict(float)
         self.slot_vram: defaultdict[str, list[float]] = defaultdict(list)
         self.paths: list[dict] = []
+        self.path_lengths = path_lengths or {}
         self.output_path = output_path.resolve() if output_path is not None else None
         if self.output_path is not None:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -108,6 +119,12 @@ class ProgressTracker:
             for entry in job_metrics.get("paths", []) or []:
                 self.paths.append(entry)
                 self.completed_paths += 1
+                length_key = (str(entry.get("scene_id")), str(entry.get("label_id")))
+                try:
+                    length_val = float(self.path_lengths.get(length_key, 0.0))
+                except (TypeError, ValueError):
+                    length_val = 0.0
+                self.total_path_length += length_val
                 try:
                     duration = float(entry.get("duration_sec") or 0.0)
                 except (TypeError, ValueError):
@@ -154,6 +171,11 @@ class ProgressTracker:
             if self.completed_paths > 0
             else None
         )
+        avg_path_length = (
+            self.total_path_length / self.completed_paths
+            if self.completed_paths > 0
+            else None
+        )
         eta_seconds = None
         if avg_path_time is not None and remaining_paths > 0:
             eta_seconds = avg_path_time * remaining_paths
@@ -180,6 +202,7 @@ class ProgressTracker:
             "avg_path_time_sec": avg_path_time,
             "avg_frame_time_sec": avg_frame_time,
             "avg_frames_per_path": avg_frames_per_path,
+            "avg_path_length_m": avg_path_length,
             "eta_seconds": eta_seconds,
             "avg_vram_per_thread": avg_vram_per_thread,
             "stage_ratio": stage_ratios,
@@ -197,6 +220,18 @@ class ProgressTracker:
             "paths": self.paths,
         }
         self.output_path.write_text(json.dumps(payload, indent=2))
+
+    def progress_line(self) -> str:
+        if self.completed_paths <= 0:
+            avg_len = "-"
+            avg_time = "-"
+        else:
+            avg_len = f"{self.total_path_length / self.completed_paths:.2f}m"
+            avg_time = f"{self.total_render_time / self.completed_paths:.2f}s"
+        return (
+            f"[PROGRESS] {self.completed_paths}/{self.total_paths} paths "
+            f"(avg_len={avg_len}, avg_time={avg_time})"
+        )
 
 
 def _load_metrics_json(path: Path) -> dict | None:
@@ -216,6 +251,15 @@ def _load_metrics_json(path: Path) -> dict | None:
         return None
 
 
+def _is_cuda_oom(log_path: Path) -> bool:
+    try:
+        contents = log_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    text = contents.lower()
+    return "cuda out of memory" in text or "[cuda oom" in text
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Shard render_label_paths.py invocations per actor/scene pairing."
@@ -223,14 +267,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--assignment-manifest",
         type=Path,
-        required=True,
-        help="JSON manifest produced by random_actor_assignments.py.",
+        default=None,
+        help="JSON manifest produced by random_actor_assignments.py (required unless --fpv-only).",
     )
     parser.add_argument(
         "--render-script",
         type=Path,
         default=Path(__file__).with_name("render_label_paths.py"),
         help="Path to the render_label_paths.py script (default: alongside this file).",
+    )
+    parser.add_argument(
+        "--fpv-only",
+        action="store_true",
+        help="Skip actor manifests and render FPV-only paths (scene-level parallelism).",
+    )
+    parser.add_argument(
+        "--fpv-follow-distance",
+        type=float,
+        default=0.0,
+        help="Follow distance used for FPV-only jobs and frame estimates (default: 0.0).",
     )
     parser.add_argument(
         "--scenes-dir",
@@ -315,6 +370,24 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("datagen_progress.json"),
         help="Aggregated progress JSON path updated after each job (default: datagen_progress.json).",
+    )
+    parser.add_argument(
+        "--retry-cuda-oom",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Retry jobs that fail with CUDA OOM after other jobs complete.",
+    )
+    parser.add_argument(
+        "--cuda-oom-retry-delay",
+        type=float,
+        default=10.0,
+        help="Seconds to wait between CUDA OOM retry waves.",
+    )
+    parser.add_argument(
+        "--cuda-oom-max-retries",
+        type=int,
+        default=-1,
+        help="Maximum retries per job for CUDA OOM (-1 for unlimited).",
     )
     parser.add_argument(
         "--scene-shard-index",
@@ -461,6 +534,101 @@ def gather_label_tasks(
     return tasks, skipped
 
 
+def gather_fpv_tasks(
+    *,
+    scenes_dir: Path,
+    tasks_dir: Path,
+    stride: int,
+    swap_xy: bool,
+    mirror_translation: bool,
+    minimal_frames: int | None,
+    follow_distance: float,
+) -> tuple[list[LabelTask], list[dict]]:
+    cache_meta: dict[str, dict] = {}
+    tasks: list[LabelTask] = []
+    skipped: list[dict] = []
+
+    def get_meta(scene_id: str) -> dict | None:
+        if scene_id not in cache_meta:
+            dataset_dir = scenes_dir / scene_id
+            if not dataset_dir.is_dir():
+                cache_meta[scene_id] = None
+            else:
+                try:
+                    cache_meta[scene_id] = load_occupancy_metadata(dataset_dir)
+                except Exception:
+                    cache_meta[scene_id] = None
+        return cache_meta[scene_id]
+
+    for scene_dir in sorted([p for p in tasks_dir.iterdir() if p.is_dir()]):
+        scene_id = scene_dir.name
+        label_dir = resolve_label_directory(scene_dir)
+        meta = get_meta(scene_id)
+        if meta is None or label_dir is None:
+            skipped.append(
+                {
+                    "scene": scene_id,
+                    "label": "*",
+                    "reason": "missing_meta_or_labels",
+                }
+            )
+            continue
+        for json_path in sorted(label_dir.glob("*.json")):
+            label_id = json_path.stem
+            try:
+                prepared = prepare_path_data(
+                    json_path=json_path,
+                    meta=meta,
+                    stride=max(1, stride),
+                    mirror_translation=mirror_translation,
+                    swap_xy=swap_xy,
+                )
+                path_length = float(PathSampler(prepared.path_xy).total_length) if len(prepared.path_xy) >= 2 else 0.0
+                estimated_frames = estimate_actor_frame_count(
+                    prepared.path_xy,
+                    follow_distance=follow_distance,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                skipped.append({"scene": scene_id, "label": label_id, "reason": f"prepare_failed: {exc}"})
+                continue
+
+            if minimal_frames is not None and estimated_frames < minimal_frames:
+                skipped.append(
+                    {
+                        "scene": scene_id,
+                        "label": label_id,
+                        "reason": f"below_min_frames({estimated_frames}<{minimal_frames})",
+                    }
+                )
+                continue
+
+            assignment = AssignmentEntry(
+                scene=scene_id,
+                label=label_id,
+                actor_id=FPV_ACTOR_ID,
+                actor_dir=Path("."),
+                actor_pattern="",
+                actor_height=0.0,
+                actor_speed=0.0,
+                actor_fps=0.0,
+                follow_distance=follow_distance,
+                follow_buffer=0.0,
+                actor_foot_offset=0.0,
+                animation_cycle_mod=1,
+                actor_loop=False,
+            )
+            tasks.append(
+                LabelTask(
+                    assignment=assignment,
+                    json_path=json_path,
+                    path_length=path_length,
+                    estimated_frames=estimated_frames,
+                )
+            )
+
+    return tasks, skipped
+
+
 def build_job_plans(tasks: Sequence[LabelTask]) -> list[JobPlan]:
     grouped: dict[tuple[str, str], list[str]] = defaultdict(list)
     assignment_lookup: dict[tuple[str, str], AssignmentEntry] = {}
@@ -542,6 +710,8 @@ def make_command(
     output_dir: Path,
     error_log: Path,
     extra_args: list[str],
+    fpv_only: bool,
+    fpv_follow_distance: float,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -555,36 +725,51 @@ def make_command(
     ]
     for label in plan.labels:
         cmd.extend(["--label-id", label])
-    cmd.extend(
-        [
-            "--actor-seq-dir",
-            str(plan.assignment.actor_dir),
-            "--actor-pattern",
-            plan.assignment.actor_pattern or DEFAULT_ACTOR_PATTERN,
-            "--actor-height",
-            f"{plan.assignment.actor_height:.6f}",
-            "--actor-speed",
-            f"{plan.assignment.actor_speed:.6f}",
-            "--actor-fps",
-            f"{plan.assignment.actor_fps:.6f}",
-            "--follow-distance",
-            f"{plan.assignment.follow_distance:.6f}",
-            "--follow-buffer",
-            f"{plan.assignment.follow_buffer:.6f}",
-            "--actor-foot-offset",
-            f"{plan.assignment.actor_foot_offset:.6f}",
-            "--animation-cycle-mod",
-            str(plan.assignment.animation_cycle_mod),
-            "--output-dir",
-            str(output_dir),
-            "--error-log",
-            str(error_log),
-            "--stride",
-            str(stride),
-        ]
-    )
-    if not plan.assignment.actor_loop:
-        cmd.append("--actor-no-loop")
+    if fpv_only:
+        cmd.extend(
+            [
+                "--follow-distance",
+                f"{fpv_follow_distance:.6f}",
+                "--hide-actor",
+                "--output-dir",
+                str(output_dir),
+                "--error-log",
+                str(error_log),
+                "--stride",
+                str(stride),
+            ]
+        )
+    else:
+        cmd.extend(
+            [
+                "--actor-seq-dir",
+                str(plan.assignment.actor_dir),
+                "--actor-pattern",
+                plan.assignment.actor_pattern or DEFAULT_ACTOR_PATTERN,
+                "--actor-height",
+                f"{plan.assignment.actor_height:.6f}",
+                "--actor-speed",
+                f"{plan.assignment.actor_speed:.6f}",
+                "--actor-fps",
+                f"{plan.assignment.actor_fps:.6f}",
+                "--follow-distance",
+                f"{plan.assignment.follow_distance:.6f}",
+                "--follow-buffer",
+                f"{plan.assignment.follow_buffer:.6f}",
+                "--actor-foot-offset",
+                f"{plan.assignment.actor_foot_offset:.6f}",
+                "--animation-cycle-mod",
+                str(plan.assignment.animation_cycle_mod),
+                "--output-dir",
+                str(output_dir),
+                "--error-log",
+                str(error_log),
+                "--stride",
+                str(stride),
+            ]
+        )
+        if not plan.assignment.actor_loop:
+            cmd.append("--actor-no-loop")
     if swap_xy:
         cmd.append("--swap-xy")
     if not mirror_translation:
@@ -679,29 +864,50 @@ def run_job(
 
 def main() -> None:
     args = parse_args()
-    actor_map, assignments, manifest = load_manifest(args.assignment_manifest)
-    if not assignments:
-        raise SystemExit("Assignment manifest does not contain any label-path pairings.")
+    if args.fpv_only:
+        actor_map = {}
+        assignments = []
+        manifest: dict[str, Any] = {}
+        if args.assignment_manifest is not None:
+            print("[WARN] Ignoring --assignment-manifest because --fpv-only is set.", flush=True)
+    else:
+        if args.assignment_manifest is None:
+            raise SystemExit("--assignment-manifest is required unless --fpv-only is set.")
+        actor_map, assignments, manifest = load_manifest(args.assignment_manifest)
+        if not assignments:
+            raise SystemExit("Assignment manifest does not contain any label-path pairings.")
 
     extra_args: list[str] = []
     for snippet in args.render_extra_args:
         extra_args.extend(shlex.split(snippet))
 
-    tasks, skipped = gather_label_tasks(
-        assignments,
-        scenes_dir=args.scenes_dir,
-        tasks_dir=args.tasks_dir,
-        stride=args.stride,
-        swap_xy=args.swap_xy,
-        mirror_translation=args.mirror_translation,
-        minimal_frames=args.minimal_frames,
-    )
+    if args.fpv_only:
+        tasks, skipped = gather_fpv_tasks(
+            scenes_dir=args.scenes_dir,
+            tasks_dir=args.tasks_dir,
+            stride=args.stride,
+            swap_xy=args.swap_xy,
+            mirror_translation=args.mirror_translation,
+            minimal_frames=args.minimal_frames,
+            follow_distance=args.fpv_follow_distance,
+        )
+    else:
+        tasks, skipped = gather_label_tasks(
+            assignments,
+            scenes_dir=args.scenes_dir,
+            tasks_dir=args.tasks_dir,
+            stride=args.stride,
+            swap_xy=args.swap_xy,
+            mirror_translation=args.mirror_translation,
+            minimal_frames=args.minimal_frames,
+        )
     tasks = filter_tasks_by_scene_shard(tasks, args.scene_shard_index, args.scene_shard_count)
     if not tasks:
         print("[WARN] No label paths satisfied the current filters.", flush=True)
 
     plans = build_job_plans(tasks)
     plans.sort(key=lambda p: (p.scene, p.actor_id))
+    plan_indices = {(plan.scene, plan.actor_id): idx for idx, plan in enumerate(plans, start=1)}
     skipped_jobs_from_log = 0
     if args.skip_completed_log is not None:
         completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
@@ -724,16 +930,21 @@ def main() -> None:
             )
     print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
 
+    path_lengths = {
+        (task.assignment.scene, task.assignment.label): task.path_length for task in tasks
+    }
     progress_tracker = ProgressTracker(
         total_jobs=len(plans),
         total_paths=len(tasks),
         output_path=args.progress_json,
+        path_lengths=path_lengths,
     )
     max_workers = max(1, args.workers)
 
-    results: list[dict] = []
+    results_by_key: dict[tuple[str, str], dict] = {}
     if args.dry_run or not plans:
-        for idx, plan in enumerate(plans, start=1):
+        for plan in plans:
+            idx = plan_indices[(plan.scene, plan.actor_id)]
             cmd = make_command(
                 plan,
                 render_script=args.render_script,
@@ -746,6 +957,8 @@ def main() -> None:
                 output_dir=args.output_dir,
                 error_log=args.error_log,
                 extra_args=extra_args,
+                fpv_only=args.fpv_only,
+                fpv_follow_distance=args.fpv_follow_distance,
             )
             job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
             job_slot = ((idx - 1) % max_workers) + 1
@@ -758,64 +971,108 @@ def main() -> None:
                 dry_run=True,
                 job_name=job_name,
             )
-            results.append(result)
+            results_by_key[(plan.scene, plan.actor_id)] = result
             progress_tracker.record_job(result, None)
+            print(progress_tracker.progress_line(), flush=True)
     else:
         metrics_dir = args.per_job_metrics_dir.resolve()
         metrics_dir.mkdir(parents=True, exist_ok=True)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            future_to_idx: dict[Any, int] = {}
-            for idx, plan in enumerate(plans, start=1):
-                cmd = make_command(
-                    plan,
-                    render_script=args.render_script,
-                    scenes_dir=args.scenes_dir,
-                    tasks_dir=args.tasks_dir,
-                    stride=args.stride,
-                    swap_xy=args.swap_xy,
-                    mirror_translation=args.mirror_translation,
-                    minimal_frames=args.minimal_frames,
-                    output_dir=args.output_dir,
-                    error_log=args.error_log,
-                    extra_args=extra_args,
-                )
-                job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
-                job_slot = ((idx - 1) % max_workers) + 1
-                cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
-                metrics_path = metrics_dir / f"{job_name}.json"
-                cmd.extend(["--metrics-json", str(metrics_path)])
-                future = pool.submit(
-                    run_job,
-                    idx,
-                    plan,
-                    cmd,
-                    log_dir=args.log_dir,
-                    dry_run=False,
-                    job_name=job_name,
-                    metrics_path=metrics_path,
-                )
-                future_to_idx[future] = idx
-            for future in as_completed(future_to_idx):
-                result = future.result()
-                results.append(result)
+        pending_plans = list(plans)
+        retry_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
+        retry_round = 0
+        while pending_plans:
+            if retry_round > 0 and args.cuda_oom_retry_delay > 0:
                 print(
-                    f"[{result['status'].upper()}] scene={result['scene']} actor={result['actor_id']} "
-                    f"labels={len(result['labels'])} returncode={result['returncode']} "
-                    f"pid={result.get('pid')}",
+                    f"[RETRY] Waiting {args.cuda_oom_retry_delay:.1f}s before retrying CUDA OOM jobs.",
                     flush=True,
                 )
-                if result["status"] == "failed":
-                    _print_failure_log(Path(result["log"]))
-                metrics_payload = None
-                metrics_file = result.get("metrics_path")
-                if metrics_file:
-                    metrics_payload = _load_metrics_json(Path(metrics_file))
-                progress_tracker.record_job(result, metrics_payload)
+                time.sleep(args.cuda_oom_retry_delay)
+            retry_round += 1
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_plan: dict[Any, JobPlan] = {}
+                for plan in pending_plans:
+                    idx = plan_indices[(plan.scene, plan.actor_id)]
+                    cmd = make_command(
+                        plan,
+                        render_script=args.render_script,
+                        scenes_dir=args.scenes_dir,
+                        tasks_dir=args.tasks_dir,
+                        stride=args.stride,
+                        swap_xy=args.swap_xy,
+                        mirror_translation=args.mirror_translation,
+                        minimal_frames=args.minimal_frames,
+                        output_dir=args.output_dir,
+                        error_log=args.error_log,
+                        extra_args=extra_args,
+                        fpv_only=args.fpv_only,
+                        fpv_follow_distance=args.fpv_follow_distance,
+                    )
+                    job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
+                    job_slot = ((idx - 1) % max_workers) + 1
+                    cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+                    metrics_path = metrics_dir / f"{job_name}.json"
+                    cmd.extend(["--metrics-json", str(metrics_path)])
+                    future = pool.submit(
+                        run_job,
+                        idx,
+                        plan,
+                        cmd,
+                        log_dir=args.log_dir,
+                        dry_run=False,
+                        job_name=job_name,
+                        metrics_path=metrics_path,
+                    )
+                    future_to_plan[future] = plan
+                pending_plans = []
+                for future in as_completed(future_to_plan):
+                    result = future.result()
+                    plan = future_to_plan[future]
+                    result_key = (plan.scene, plan.actor_id)
+                    retry_due_to_oom = False
+                    if args.retry_cuda_oom and result["status"] == "failed":
+                        log_path = Path(result["log"])
+                        if _is_cuda_oom(log_path):
+                            retry_counts[result_key] += 1
+                            max_retries = args.cuda_oom_max_retries
+                            if max_retries < 0 or retry_counts[result_key] <= max_retries:
+                                retry_due_to_oom = True
+                                pending_plans.append(plan)
+                                print(
+                                    f"[RETRY][CUDA_OOM] scene={plan.scene} actor={plan.actor_id} "
+                                    f"attempt={retry_counts[result_key]}",
+                                    flush=True,
+                                )
+                            else:
+                                print(
+                                    f"[RETRY][CUDA_OOM] scene={plan.scene} actor={plan.actor_id} "
+                                    f"exceeded max retries ({max_retries}).",
+                                    flush=True,
+                                )
+                    if retry_due_to_oom:
+                        continue
+                    results_by_key[result_key] = result
+                    print(
+                        f"[{result['status'].upper()}] scene={result['scene']} actor={result['actor_id']} "
+                        f"labels={len(result['labels'])} returncode={result['returncode']} "
+                        f"pid={result.get('pid')}",
+                        flush=True,
+                    )
+                    if result["status"] == "failed":
+                        _print_failure_log(Path(result["log"]))
+                    metrics_payload = None
+                    metrics_file = result.get("metrics_path")
+                    if metrics_file:
+                        metrics_payload = _load_metrics_json(Path(metrics_file))
+                    progress_tracker.record_job(result, metrics_payload)
+                    print(progress_tracker.progress_line(), flush=True)
 
+    results = [results_by_key[key] for key in plan_indices.keys() if key in results_by_key]
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "assignment_manifest": str(args.assignment_manifest.resolve()),
-        "seed": manifest.get("seed"),
+        "assignment_manifest": str(args.assignment_manifest.resolve()) if args.assignment_manifest else None,
+        "seed": manifest.get("seed") if manifest else None,
+        "fpv_only": args.fpv_only,
+        "fpv_follow_distance": args.fpv_follow_distance,
         "jobs": results,
         "skipped_labels": skipped,
         "total_jobs": len(plans),
