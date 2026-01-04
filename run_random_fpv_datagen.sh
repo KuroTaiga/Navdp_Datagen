@@ -106,6 +106,9 @@ WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
+# Robot camera stats
+HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
+
 # Optional NPC placement/debug. Leave values empty to skip.
 NPC_ENABLE=${NPC_ENABLE:-false}
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}
@@ -135,7 +138,7 @@ ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
 VERBOSE=${VERBOSE:-true}
 
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward"
+render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else

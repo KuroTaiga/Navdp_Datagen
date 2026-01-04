@@ -132,6 +132,8 @@ NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio 
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
 WORKERS=${WORKERS:-36}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
+# Robot camera stats
+HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
 # vram reserve function
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
@@ -148,7 +150,7 @@ ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 
 # Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene"
+render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else

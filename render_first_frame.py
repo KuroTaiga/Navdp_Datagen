@@ -22,8 +22,10 @@ from scene import GaussianModel
 from utils.render_utils import build_perspective_camera, load_raster_world_points_only
 
 
-JSON_DIR = Path("/home/tianhang/habitatbuild/habitat-sim/navdata_multi_terrain_pixelspace_with_gs")
-PLY_PATH = Path("/home/tianhang/NavDP/navdp_api/gaussian_splatting/data/floor30geo_noncut_v1.ply")
+# JSON_DIR = Path("/home/tianhang/habitatbuild/habitat-sim/navdata_multi_terrain_pixelspace_with_gs")
+# PLY_PATH = Path("/home/tianhang/NavDP/navdp_api/gaussian_splatting/data/floor30geo_noncut_v1.ply")
+JSON_DIR = Path("./data/ce_adjusted/0001_839920/123.json")
+PLY_PATH = Path("./data/scenes/0001_839920/3dgs_compressed.ply")
 DEFAULT_ERROR_LOG = JSON_DIR.parent / "errors.log"
 EPS = 1e-6
 CAMERA_HEIGHT_OFFSET = 1.3

@@ -3792,8 +3792,8 @@ def parse_args() -> ArgumentParser:
     parser.add_argument(
         "--height-offset",
         type=float,
-        default=0, #-0.098 for LHM model following scene generations
-        help="Add this many meters above occupancy upper_z when placing the camera (default: 1.0).",
+        default=0.3,  # 0.3 + upper_z(1.0) = 1.3m (H1 height)
+        help="Add this many meters above occupancy upper_z when placing the camera (default: 0.3).",
     )
     parser.add_argument(
         "--view-mode",
