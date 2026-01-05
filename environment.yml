@@ -186,4 +186,3 @@ dependencies:
       - triton==3.1.0
       - typing-extensions==4.15.0
       - typing-inspection==0.4.2
-prefix: /home/dongjk/.conda/envs/cuda121

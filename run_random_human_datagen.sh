@@ -18,25 +18,22 @@ fi
 
 # Tiny helper for consistent usage errors so RESUME mode is easy to discover.
 show_usage_and_exit() {
-  echo "Usage: $(basename "$0") [RESUME <log-file>]" >&2
+  echo "Usage: $(basename "$0") [RESUME]" >&2
   exit 1
 }
 
-# CLI parsing: optional leading "RESUME <log>" pair switches to resume mode and
-# consumes the following logfile argument so the remainder of the script can lean
-# on env vars only.
+# CLI parsing: optional leading RESUME enables resume mode; optional log path is
+# accepted for compatibility but not required.
 RESUME_MODE=false
-RESUME_LOG_PATH="./33w_npc1.log"
+RESUME_LOG_PATH=""
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
     shift
-    if [ $# -lt 1 ]; then
-      echo "[RESUME] ERROR: log file path missing." >&2
-      show_usage_and_exit
+    if [ $# -gt 0 ]; then
+      RESUME_LOG_PATH="$1"
+      shift
     fi
-    RESUME_LOG_PATH="$1"
-    shift
   else
     echo "[ERROR] Unknown argument: $1" >&2
     show_usage_and_exit
@@ -113,6 +110,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-./data1/33w_npc_key1}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w_1}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/random_human_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/random_human_metrics}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_33w_1}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
@@ -132,6 +130,8 @@ NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio 
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
 WORKERS=${WORKERS:-36}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
+# Robot camera stats
+HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
 # vram reserve function
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
@@ -148,7 +148,7 @@ ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 
 # Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene"
+render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else
@@ -548,32 +548,10 @@ generate_assignment_manifest() {
   echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
 }
 
-RESUME_LOG_ABS=""
-# Resume bookkeeping: we reuse the assignment manifest referenced inside the
-# provided log file and disable destructive cleanup so partially-generated data is
-# preserved.
 if $RESUME_MODE; then
-  RESUME_LOG_ABS=$(abspath "$RESUME_LOG_PATH")
-  if [ ! -f "$RESUME_LOG_ABS" ]; then
-    echo "[RESUME] ERROR: Log file not found: $RESUME_LOG_PATH" >&2
-    exit 1
+  if [ -n "$RESUME_LOG_PATH" ]; then
+    echo "[RESUME] NOTE: log path provided but status-json resume is used; ignoring log." >&2
   fi
-  manifest_line=$(grep -m1 "Assignment manifest generated at" "$RESUME_LOG_ABS" || true)
-  if [ -z "$manifest_line" ]; then
-    echo "[RESUME] ERROR: Could not locate assignment manifest line in $RESUME_LOG_PATH" >&2
-    exit 1
-  fi
-  resume_manifest_path="${manifest_line#*Assignment manifest generated at }"
-  resume_manifest_path="${resume_manifest_path%% *}"
-  if [ -z "$resume_manifest_path" ]; then
-    echo "[RESUME] ERROR: Failed to parse assignment manifest path from log." >&2
-    exit 1
-  fi
-  if [[ "$resume_manifest_path" != /* ]]; then
-    resume_manifest_path="${resume_manifest_path#./}"
-    resume_manifest_path="${SCRIPT_DIR}/${resume_manifest_path}"
-  fi
-  ASSIGNMENTS_OUT=$(abspath "$resume_manifest_path")
   if [ ! -f "$ASSIGNMENTS_OUT" ]; then
     echo "[RESUME] WARN: Assignment manifest missing at $ASSIGNMENTS_OUT; regenerating."
     generate_assignment_manifest
@@ -582,7 +560,7 @@ if $RESUME_MODE; then
       exit 1
     fi
   fi
-  echo "[RESUME] Using manifest $ASSIGNMENTS_OUT (derived from $RESUME_LOG_PATH)"
+  echo "[RESUME] Using manifest $ASSIGNMENTS_OUT"
   CLEAR_LOCAL_OUTPUT_DIR=false
 fi
 
@@ -673,6 +651,7 @@ parallel_cmd=(
   --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
   --progress-json "${PROGRESS_JSON}"
+  --status-json "${STATUS_JSON}"
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
   --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
@@ -685,9 +664,6 @@ else
 fi
 # Thread the resume log into the renderer so it can skip completed scene/actor
 # pairs. Remaining CLI snippets (overwrite/offload/etc.) are appended below.
-if [ -n "$RESUME_LOG_ABS" ]; then
-  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_ABS")
-fi
 for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")
 done
