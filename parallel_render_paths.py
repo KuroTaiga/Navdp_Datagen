@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence
 
 from argparse import BooleanOptionalAction
+import fcntl
+from contextlib import contextmanager
 
 from render_label_paths import (  # type: ignore
     DEFAULT_ACTOR_PATTERN,
@@ -44,6 +46,16 @@ from render_label_paths import (  # type: ignore
 )
 
 FPV_ACTOR_ID = "fpv"
+STATUS_NOT_RUN = 0
+STATUS_DONE = 1
+STATUS_RETRY = 2
+STATUS_SKIP = 3
+STATUS_MEANINGS = {
+    "0": "not_run",
+    "1": "done",
+    "2": "retry_or_started",
+    "3": "skip_fatal",
+}
 
 
 @dataclass
@@ -251,13 +263,83 @@ def _load_metrics_json(path: Path) -> dict | None:
         return None
 
 
-def _is_cuda_oom(log_path: Path) -> bool:
+@contextmanager
+def _status_lock(status_path: Path):
+    lock_path = status_path.with_suffix(status_path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _load_status_map(status_path: Path) -> dict[str, dict[str, int]]:
+    if not status_path.exists():
+        return {}
     try:
-        contents = log_path.read_text(encoding="utf-8", errors="ignore")
-    except Exception:
-        return False
-    text = contents.lower()
-    return "cuda out of memory" in text or "[cuda oom" in text
+        data = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception as exc:  # pylint: disable=broad-except
+        print(f"[STATUS] WARN: Failed to read {status_path}: {exc}", flush=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if isinstance(data.get("scenes"), dict):
+        data = data["scenes"]
+    normalized: dict[str, dict[str, int]] = {}
+    for scene_id, labels in data.items():
+        if scene_id == "meta":
+            continue
+        if not isinstance(labels, dict):
+            continue
+        scene_map: dict[str, int] = {}
+        for label_id, status in labels.items():
+            try:
+                scene_map[str(label_id)] = int(status)
+            except (TypeError, ValueError):
+                continue
+        if scene_map:
+            normalized[str(scene_id)] = scene_map
+    return normalized
+
+
+def _write_status_map(status_path: Path, status_map: dict[str, dict[str, int]]) -> None:
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = status_path.with_suffix(status_path.suffix + ".tmp")
+    payload = {
+        "meta": {
+            "status_codes": STATUS_MEANINGS,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        },
+        "scenes": status_map,
+    }
+    tmp_path.write_text(json.dumps(payload, indent=2))
+    os.replace(tmp_path, status_path)
+
+
+def _merge_status_entries(
+    status_map: dict[str, dict[str, int]],
+    entries: Iterable[dict],
+) -> dict[str, dict[str, int]]:
+    for entry in entries:
+        scene_id = str(entry.get("scene_id"))
+        label_id = str(entry.get("label_id"))
+        if not scene_id or not label_id:
+            continue
+        try:
+            status_val = int(entry.get("status", STATUS_NOT_RUN))
+        except (TypeError, ValueError):
+            status_val = STATUS_NOT_RUN
+        scene_map = status_map.setdefault(scene_id, {})
+        scene_map[label_id] = status_val
+    return status_map
+
+
+def _status_should_run(status_val: int | None) -> bool:
+    if status_val is None:
+        return True
+    return int(status_val) % 2 == 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -372,10 +454,16 @@ def parse_args() -> argparse.Namespace:
         help="Aggregated progress JSON path updated after each job (default: datagen_progress.json).",
     )
     parser.add_argument(
+        "--status-json",
+        type=Path,
+        default=None,
+        help="Optional status JSON (scene->label->status) used for resume and OOM retries.",
+    )
+    parser.add_argument(
         "--retry-cuda-oom",
         action=BooleanOptionalAction,
         default=True,
-        help="Retry jobs that fail with CUDA OOM after other jobs complete.",
+        help="Retry CUDA OOM paths after other work completes (requires --status-json).",
     )
     parser.add_argument(
         "--cuda-oom-retry-delay",
@@ -387,7 +475,7 @@ def parse_args() -> argparse.Namespace:
         "--cuda-oom-max-retries",
         type=int,
         default=-1,
-        help="Maximum retries per job for CUDA OOM (-1 for unlimited).",
+        help="Maximum CUDA OOM retry passes (-1 for unlimited).",
     )
     parser.add_argument(
         "--scene-shard-index",
@@ -905,11 +993,47 @@ def main() -> None:
     if not tasks:
         print("[WARN] No label paths satisfied the current filters.", flush=True)
 
-    plans = build_job_plans(tasks)
+    status_path = args.status_json.resolve() if args.status_json is not None else None
+    status_map: dict[str, dict[str, int]] = {}
+    if status_path is not None:
+        if status_path.exists():
+            status_map = _load_status_map(status_path)
+        else:
+            status_map = {}
+            for task in tasks:
+                scene_map = status_map.setdefault(task.assignment.scene, {})
+                scene_map[str(task.assignment.label)] = STATUS_NOT_RUN
+            with _status_lock(status_path):
+                _write_status_map(status_path, status_map)
+
+    tasks_by_key: dict[tuple[str, str], LabelTask] = {
+        (task.assignment.scene, str(task.assignment.label)): task for task in tasks
+    }
+    initial_tasks: list[LabelTask] = []
+    deferred_tasks: list[LabelTask] = []
+    if status_map:
+        for task in tasks:
+            status_val = status_map.get(task.assignment.scene, {}).get(str(task.assignment.label))
+            if status_val == STATUS_RETRY:
+                deferred_tasks.append(task)
+            elif _status_should_run(status_val):
+                initial_tasks.append(task)
+            else:
+                skipped.append(
+                    {
+                        "scene": task.assignment.scene,
+                        "label": task.assignment.label,
+                        "reason": f"status_skip({status_val})",
+                    }
+                )
+    else:
+        initial_tasks = list(tasks)
+
+    plans = build_job_plans(initial_tasks)
     plans.sort(key=lambda p: (p.scene, p.actor_id))
     plan_indices = {(plan.scene, plan.actor_id): idx for idx, plan in enumerate(plans, start=1)}
     skipped_jobs_from_log = 0
-    if args.skip_completed_log is not None:
+    if args.skip_completed_log is not None and status_path is None:
         completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
         if completed_pairs:
             before = len(plans)
@@ -928,145 +1052,182 @@ def main() -> None:
                 f"[RESUME] {len(failed_pairs)} jobs recorded as FAILED in the log will be retried.",
                 flush=True,
             )
-    print(f"[PLAN] {len(plans)} jobs will cover {len(tasks)} label paths (skipped {len(skipped)}).", flush=True)
+    elif args.skip_completed_log is not None and status_path is not None:
+        print("[RESUME] Ignoring --skip-completed-log because --status-json is in use.", flush=True)
+    if deferred_tasks:
+        print(
+            f"[PLAN] {len(plans)} jobs will cover {len(initial_tasks)} label paths "
+            f"(deferred {len(deferred_tasks)}, skipped {len(skipped)}).",
+            flush=True,
+        )
+    else:
+        print(
+            f"[PLAN] {len(plans)} jobs will cover {len(initial_tasks)} label paths (skipped {len(skipped)}).",
+            flush=True,
+        )
 
+    tasks_all = initial_tasks + deferred_tasks
     path_lengths = {
-        (task.assignment.scene, task.assignment.label): task.path_length for task in tasks
+        (task.assignment.scene, str(task.assignment.label)): task.path_length for task in tasks_all
     }
+    deferred_plans = build_job_plans(deferred_tasks) if deferred_tasks else []
     progress_tracker = ProgressTracker(
-        total_jobs=len(plans),
-        total_paths=len(tasks),
+        total_jobs=len(plans) + len(deferred_plans),
+        total_paths=len(tasks_all),
         output_path=args.progress_json,
         path_lengths=path_lengths,
     )
     max_workers = max(1, args.workers)
 
-    results_by_key: dict[tuple[str, str], dict] = {}
-    if args.dry_run or not plans:
-        for plan in plans:
-            idx = plan_indices[(plan.scene, plan.actor_id)]
-            cmd = make_command(
-                plan,
-                render_script=args.render_script,
-                scenes_dir=args.scenes_dir,
-                tasks_dir=args.tasks_dir,
-                stride=args.stride,
-                swap_xy=args.swap_xy,
-                mirror_translation=args.mirror_translation,
-                minimal_frames=args.minimal_frames,
-                output_dir=args.output_dir,
-                error_log=args.error_log,
-                extra_args=extra_args,
-                fpv_only=args.fpv_only,
-                fpv_follow_distance=args.fpv_follow_distance,
-            )
-            job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
-            job_slot = ((idx - 1) % max_workers) + 1
-            cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
-            result = run_job(
-                idx,
-                plan,
-                cmd,
-                log_dir=args.log_dir,
-                dry_run=True,
-                job_name=job_name,
-            )
-            results_by_key[(plan.scene, plan.actor_id)] = result
-            progress_tracker.record_job(result, None)
-            print(progress_tracker.progress_line(), flush=True)
-    else:
-        metrics_dir = args.per_job_metrics_dir.resolve()
-        metrics_dir.mkdir(parents=True, exist_ok=True)
-        pending_plans = list(plans)
-        retry_counts: defaultdict[tuple[str, str], int] = defaultdict(int)
-        retry_round = 0
-        while pending_plans:
-            if retry_round > 0 and args.cuda_oom_retry_delay > 0:
+    results: list[dict] = []
+    metrics_dir = args.per_job_metrics_dir.resolve()
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+
+    def update_status_from_metrics(metrics_payload: dict | None) -> None:
+        if status_path is None or not metrics_payload:
+            return
+        entries = metrics_payload.get("path_statuses") or []
+        if not entries:
+            return
+        with _status_lock(status_path):
+            status_map = _load_status_map(status_path)
+            status_map = _merge_status_entries(status_map, entries)
+            _write_status_map(status_path, status_map)
+
+    def run_plans(
+        pass_plans: list[JobPlan],
+        *,
+        pass_label: str,
+        job_suffix: str,
+    ) -> None:
+        if not pass_plans:
+            return
+        pass_indices = {(plan.scene, plan.actor_id): idx for idx, plan in enumerate(pass_plans, start=1)}
+        if args.dry_run:
+            for plan in pass_plans:
+                idx = pass_indices[(plan.scene, plan.actor_id)]
+                cmd = make_command(
+                    plan,
+                    render_script=args.render_script,
+                    scenes_dir=args.scenes_dir,
+                    tasks_dir=args.tasks_dir,
+                    stride=args.stride,
+                    swap_xy=args.swap_xy,
+                    mirror_translation=args.mirror_translation,
+                    minimal_frames=args.minimal_frames,
+                    output_dir=args.output_dir,
+                    error_log=args.error_log,
+                    extra_args=extra_args,
+                    fpv_only=args.fpv_only,
+                    fpv_follow_distance=args.fpv_follow_distance,
+                )
+                job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}{job_suffix}"
+                job_slot = ((idx - 1) % max_workers) + 1
+                cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+                result = run_job(
+                    idx,
+                    plan,
+                    cmd,
+                    log_dir=args.log_dir,
+                    dry_run=True,
+                    job_name=job_name,
+                )
+                results.append(result)
+                progress_tracker.record_job(result, None)
+                print(progress_tracker.progress_line(), flush=True)
+            return
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_plan: dict[Any, JobPlan] = {}
+            for plan in pass_plans:
+                idx = pass_indices[(plan.scene, plan.actor_id)]
+                cmd = make_command(
+                    plan,
+                    render_script=args.render_script,
+                    scenes_dir=args.scenes_dir,
+                    tasks_dir=args.tasks_dir,
+                    stride=args.stride,
+                    swap_xy=args.swap_xy,
+                    mirror_translation=args.mirror_translation,
+                    minimal_frames=args.minimal_frames,
+                    output_dir=args.output_dir,
+                    error_log=args.error_log,
+                    extra_args=extra_args,
+                    fpv_only=args.fpv_only,
+                    fpv_follow_distance=args.fpv_follow_distance,
+                )
+                job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}{job_suffix}"
+                job_slot = ((idx - 1) % max_workers) + 1
+                cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
+                metrics_path = metrics_dir / f"{job_name}.json"
+                cmd.extend(["--metrics-json", str(metrics_path)])
+                future = pool.submit(
+                    run_job,
+                    idx,
+                    plan,
+                    cmd,
+                    log_dir=args.log_dir,
+                    dry_run=False,
+                    job_name=job_name,
+                    metrics_path=metrics_path,
+                )
+                future_to_plan[future] = plan
+            for future in as_completed(future_to_plan):
+                result = future.result()
+                results.append(result)
                 print(
-                    f"[RETRY] Waiting {args.cuda_oom_retry_delay:.1f}s before retrying CUDA OOM jobs.",
+                    f"[{result['status'].upper()}] scene={result['scene']} actor={result['actor_id']} "
+                    f"labels={len(result['labels'])} returncode={result['returncode']} "
+                    f"pid={result.get('pid')}",
                     flush=True,
                 )
-                time.sleep(args.cuda_oom_retry_delay)
-            retry_round += 1
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_plan: dict[Any, JobPlan] = {}
-                for plan in pending_plans:
-                    idx = plan_indices[(plan.scene, plan.actor_id)]
-                    cmd = make_command(
-                        plan,
-                        render_script=args.render_script,
-                        scenes_dir=args.scenes_dir,
-                        tasks_dir=args.tasks_dir,
-                        stride=args.stride,
-                        swap_xy=args.swap_xy,
-                        mirror_translation=args.mirror_translation,
-                        minimal_frames=args.minimal_frames,
-                        output_dir=args.output_dir,
-                        error_log=args.error_log,
-                        extra_args=extra_args,
-                        fpv_only=args.fpv_only,
-                        fpv_follow_distance=args.fpv_follow_distance,
-                    )
-                    job_name = f"{idx:04d}_{plan.scene}_{plan.actor_id}"
-                    job_slot = ((idx - 1) % max_workers) + 1
-                    cmd.extend(["--job-slot", str(job_slot), "--job-name", job_name, "--job-actor-id", plan.actor_id])
-                    metrics_path = metrics_dir / f"{job_name}.json"
-                    cmd.extend(["--metrics-json", str(metrics_path)])
-                    future = pool.submit(
-                        run_job,
-                        idx,
-                        plan,
-                        cmd,
-                        log_dir=args.log_dir,
-                        dry_run=False,
-                        job_name=job_name,
-                        metrics_path=metrics_path,
-                    )
-                    future_to_plan[future] = plan
-                pending_plans = []
-                for future in as_completed(future_to_plan):
-                    result = future.result()
-                    plan = future_to_plan[future]
-                    result_key = (plan.scene, plan.actor_id)
-                    retry_due_to_oom = False
-                    if args.retry_cuda_oom and result["status"] == "failed":
-                        log_path = Path(result["log"])
-                        if _is_cuda_oom(log_path):
-                            retry_counts[result_key] += 1
-                            max_retries = args.cuda_oom_max_retries
-                            if max_retries < 0 or retry_counts[result_key] <= max_retries:
-                                retry_due_to_oom = True
-                                pending_plans.append(plan)
-                                print(
-                                    f"[RETRY][CUDA_OOM] scene={plan.scene} actor={plan.actor_id} "
-                                    f"attempt={retry_counts[result_key]}",
-                                    flush=True,
-                                )
-                            else:
-                                print(
-                                    f"[RETRY][CUDA_OOM] scene={plan.scene} actor={plan.actor_id} "
-                                    f"exceeded max retries ({max_retries}).",
-                                    flush=True,
-                                )
-                    if retry_due_to_oom:
-                        continue
-                    results_by_key[result_key] = result
+                if result["status"] == "failed":
+                    _print_failure_log(Path(result["log"]))
+                metrics_payload = None
+                metrics_file = result.get("metrics_path")
+                if metrics_file:
+                    metrics_payload = _load_metrics_json(Path(metrics_file))
+                update_status_from_metrics(metrics_payload)
+                progress_tracker.record_job(result, metrics_payload)
+                print(progress_tracker.progress_line(), flush=True)
+
+    run_plans(plans, pass_label="main", job_suffix="")
+
+    if args.retry_cuda_oom:
+        if status_path is None:
+            print("[RETRY] Skipping CUDA OOM pass because --status-json was not provided.", flush=True)
+        else:
+            remaining_retries = args.cuda_oom_max_retries
+            retry_pass = 0
+            while True:
+                if remaining_retries == 0:
+                    break
+                status_snapshot = _load_status_map(status_path)
+                retry_tasks = [
+                    task
+                    for key, task in tasks_by_key.items()
+                    if status_snapshot.get(key[0], {}).get(key[1]) == STATUS_RETRY
+                ]
+                if not retry_tasks:
+                    break
+                retry_pass += 1
+                if args.cuda_oom_retry_delay > 0:
                     print(
-                        f"[{result['status'].upper()}] scene={result['scene']} actor={result['actor_id']} "
-                        f"labels={len(result['labels'])} returncode={result['returncode']} "
-                        f"pid={result.get('pid')}",
+                        f"[RETRY] Waiting {args.cuda_oom_retry_delay:.1f}s before CUDA OOM pass {retry_pass}.",
                         flush=True,
                     )
-                    if result["status"] == "failed":
-                        _print_failure_log(Path(result["log"]))
-                    metrics_payload = None
-                    metrics_file = result.get("metrics_path")
-                    if metrics_file:
-                        metrics_payload = _load_metrics_json(Path(metrics_file))
-                    progress_tracker.record_job(result, metrics_payload)
-                    print(progress_tracker.progress_line(), flush=True)
+                    time.sleep(args.cuda_oom_retry_delay)
+                print(
+                    f"[RETRY] CUDA OOM pass {retry_pass}: {len(retry_tasks)} path(s).",
+                    flush=True,
+                )
+                retry_plans = build_job_plans(retry_tasks)
+                retry_plans.sort(key=lambda p: (p.scene, p.actor_id))
+                run_plans(retry_plans, pass_label=f"oom{retry_pass}", job_suffix=f"_oom{retry_pass}")
+                if remaining_retries is not None and remaining_retries > 0:
+                    remaining_retries -= 1
 
-    results = [results_by_key[key] for key in plan_indices.keys() if key in results_by_key]
+    planned_jobs = len(plans) + len(deferred_plans)
     report = {
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "assignment_manifest": str(args.assignment_manifest.resolve()) if args.assignment_manifest else None,
@@ -1075,12 +1236,13 @@ def main() -> None:
         "fpv_follow_distance": args.fpv_follow_distance,
         "jobs": results,
         "skipped_labels": skipped,
-        "total_jobs": len(plans),
+        "total_jobs": planned_jobs,
         "executed_jobs": sum(1 for r in results if r["status"] not in ("dry-run",)),
         "successful_jobs": sum(1 for r in results if r["status"] == "success"),
         "failed_jobs": sum(1 for r in results if r["status"] == "failed"),
         "skip_completed_log": str(args.skip_completed_log) if args.skip_completed_log else None,
         "jobs_skipped_via_log": skipped_jobs_from_log,
+        "status_json": str(status_path) if status_path is not None else None,
         "path_assignments": [
             {
                 "scene": task.assignment.scene,
@@ -1090,7 +1252,7 @@ def main() -> None:
                 "path_length_m": task.path_length,
                 "estimated_frames": task.estimated_frames,
             }
-            for task in tasks
+            for task in tasks_all
         ],
     }
     args.report_out.parent.mkdir(parents=True, exist_ok=True)

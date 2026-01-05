@@ -15,22 +15,20 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
 fi
 
 show_usage_and_exit() {
-  echo "Usage: $(basename "$0") [RESUME <log-file>]" >&2
+  echo "Usage: $(basename "$0") [RESUME]" >&2
   exit 1
 }
 
 RESUME_MODE=false
-RESUME_LOG_PATH="./0500_fpv.log"
+RESUME_LOG_PATH=""
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
     shift
-    if [ $# -lt 1 ]; then
-      echo "[RESUME] ERROR: log file path missing." >&2
-      show_usage_and_exit
+    if [ $# -gt 0 ]; then
+      RESUME_LOG_PATH="$1"
+      shift
     fi
-    RESUME_LOG_PATH="$1"
-    shift
   else
     echo "[ERROR] Unknown argument: $1" >&2
     show_usage_and_exit
@@ -94,6 +92,7 @@ OUTPUT_DIR=${OUTPUT_DIR:-./data2/0500_fpv}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/fpv_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/fpv_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_metrics}
 PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv.json}
 ERROR_LOG=${ERROR_LOG:-./0500_fpv.log}
@@ -527,14 +526,10 @@ handle_interrupt() {
 }
 trap handle_interrupt INT TERM
 
-RESUME_LOG_ABS=""
 if $RESUME_MODE; then
-  RESUME_LOG_ABS=$(abspath "$RESUME_LOG_PATH")
-  if [ ! -f "$RESUME_LOG_ABS" ]; then
-    echo "[RESUME] ERROR: Log file not found: $RESUME_LOG_PATH" >&2
-    exit 1
+  if [ -n "$RESUME_LOG_PATH" ]; then
+    echo "[RESUME] NOTE: log path provided but status-json resume is used; ignoring log." >&2
   fi
-  echo "[RESUME] Using log $RESUME_LOG_ABS to skip completed scene jobs."
   CLEAR_LOCAL_OUTPUT_DIR=false
 fi
 
@@ -611,6 +606,7 @@ parallel_cmd=(
   --output-dir "${OUTPUT_DIR}"
   --error-log "${ERROR_LOG}"
   --progress-json "${PROGRESS_JSON}"
+  --status-json "${STATUS_JSON}"
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
   --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
@@ -620,9 +616,6 @@ if storage_bool_true "$RETRY_CUDA_OOM"; then
   parallel_cmd+=(--retry-cuda-oom)
 else
   parallel_cmd+=(--no-retry-cuda-oom)
-fi
-if [ -n "$RESUME_LOG_ABS" ]; then
-  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_ABS")
 fi
 for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")

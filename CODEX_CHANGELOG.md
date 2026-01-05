@@ -25,6 +25,9 @@ omitted because the repo will move; follow the bullet order instead.
     path used which actor and whether the render succeeded. Logs are now
     suffixed with the worker PID and any failing job automatically prints its
     captured log back to the console so hidden errors are surfaced immediately.
+  - Added status JSON resume/OOM tracking with codes `0=not_run`, `1=done`,
+    `2=retry_or_started`, `3=skip_fatal`, persisted under a `meta.status_codes`
+    block in the status file for later inspection.
   - Added `--scene-shard-index/--scene-shard-count` so large batches can be
     divided by scene folders (round-robin) and executed in multiple passes
     without different runs touching the same scene simultaneously.
@@ -47,6 +50,11 @@ omitted because the repo will move; follow the bullet order instead.
   - Convenience wrapper that activates `cuda121` and launches
     `parallel_render_paths.py` against `./data/actor_assignments.json` with the
     recommended worker count, minimal-frame filter, and NAS offload arguments.
+  - Resume mode now relies on status JSON instead of log parsing; optional log
+    paths are ignored to keep resume state independent of stdout logs.
+- `navdp_api/gaussian_splatting/run_random_fpv_datagen.sh`
+  - Resume mode now relies on status JSON instead of log parsing; optional log
+    paths are ignored to keep resume state independent of stdout logs.
 - Shared rendering helpers
   - Added `utils/render_utils.py` for camera math (look-at/perspective), occupancy
     metadata loading, pixel↔world transforms, and raster_world loaders.

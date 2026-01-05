@@ -441,6 +441,11 @@ class PathMetricRecorder:
         }
 
 
+def _is_cuda_oom_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return "cuda out of memory" in message or "[cuda oom" in message
+
+
 @contextlib.contextmanager
 def _cuda_oom_trace(label: str, device: torch.device, verbose: bool = False):
     """
@@ -1288,6 +1293,11 @@ DEPTH_ENCODING_SPECS = {
     10: {"step_m": 0.002, "max_m": 0.002 * ((1 << 10) - 1)},
     8: {"step_m": 0.04, "max_m": 0.04 * ((1 << 8) - 1)},
 }
+
+STATUS_NOT_RUN = 0
+STATUS_DONE = 1
+STATUS_RETRY = 2
+STATUS_SKIP = 3
 
 
 def _quantize_depth(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
@@ -4317,6 +4327,15 @@ def main() -> None:
         print("  [WARN] --navdp-ply-per-scene ignored without --navdp-mask-ply.", flush=True)
     metrics_enabled = bool(args.metrics_json)
     collected_metrics: list[dict] = []
+    path_statuses: dict[tuple[str, str], dict] = {}
+
+    def record_path_status(scene_id: str, label_id: str, status: int, error: str | None = None) -> None:
+        path_statuses[(scene_id, label_id)] = {
+            "scene_id": scene_id,
+            "label_id": label_id,
+            "status": int(status),
+            "error": error,
+        }
     npc_bev_enabled = bool(args.npc_bev_debug or args.npc_bev_debug_only)
     npc_bev_only = bool(args.npc_bev_debug_only)
     npc_bev_output_root: Path = args.npc_bev_output_dir if args.npc_bev_output_dir is not None else args.output_dir
@@ -4652,6 +4671,7 @@ def main() -> None:
                 if npc_bev_only:
                     continue
                 try:
+                    record_path_status(scene_id, json_path.stem, STATUS_RETRY, error="started")
                     summary = render_path_frames(
                         scene_id=scene_id,
                         json_path=json_path,
@@ -4712,6 +4732,7 @@ def main() -> None:
                         npc_goal_xy=prepared.path_xy[-1] if prepared.path_xy else None,
                         npc_actor_runtime=npc_actor_runtime,
                     )
+                    record_path_status(scene_id, json_path.stem, STATUS_DONE, error=None)
                     if summary is not None:
                         collected_metrics.append(summary)
                     if nas_offload_dir is not None:
@@ -4727,6 +4748,14 @@ def main() -> None:
                             offloader=offloader,
                         )
                 except Exception as exc:  # pylint: disable=broad-except
+                    is_oom = _is_cuda_oom_error(exc)
+                    status = STATUS_RETRY if is_oom else STATUS_SKIP
+                    record_path_status(
+                        scene_id,
+                        json_path.stem,
+                        status,
+                        error="cuda_oom" if is_oom else "fatal",
+                    )
                     print(f"      WARNING: Rendering {json_path.name} failed: {exc}", flush=True)
                     log_file = ensure_log_file()
                     error_count += 1
@@ -4775,6 +4804,7 @@ def main() -> None:
             "actor_id": args.job_actor_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "paths": collected_metrics,
+            "path_statuses": list(path_statuses.values()),
         }
         metrics_path = args.metrics_json.resolve()
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
