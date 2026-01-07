@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 SRC_ROOT=${SRC_ROOT:-/mnt/nas/jiankundong/SHHQ_walk_fbx_new}
 MESHS_ROOT="${SRC_ROOT%/}/meshes"
-DST_ROOT=${DST_ROOT:-${SCRIPT_DIR}/data/human_gs_source}
+DST_ROOT=${DST_ROOT:-${SCRIPT_DIR}/data/SHHQ_gs/walking}
 DRY_RUN=${DRY_RUN:-false}
 
 echo "[CONFIG] SRC_ROOT=${SRC_ROOT}"

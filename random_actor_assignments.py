@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Sequence
 
+from argparse import BooleanOptionalAction
+
 import numpy as np
 
 from render_label_paths import (  # type: ignore
@@ -38,6 +40,8 @@ DEFAULT_TASK_DIR = BASE_DIR / "data" / "selected_33w"
 DEFAULT_ASSIGNMENT_PATH = BASE_DIR / "data" / "actor_assignment_plan.json"
 FOLLOW_DISTANCE_DEFAULT = 1.5
 BUFFER_DISTANCE_DEFAULT = 0.5
+DETAILED_LABEL_SUFFIX = "_detailed"
+DETAILED_JSON_SUFFIX = f"{DETAILED_LABEL_SUFFIX}.json"
 
 ALIGNMENT_TRANSFORM = np.eye(4, dtype=np.float64)
 ALIGNMENT_TRANSFORM[:3, :3] = ACTOR_AXIS_ALIGNMENT_MATRIX
@@ -161,6 +165,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional text file listing actor UIDs (one per line) to exclude.",
     )
+    parser.add_argument(
+        "--exclude-detailed-labels",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Exclude *_detailed.json label paths (default: True).",
+    )
     return parser.parse_args()
 
 
@@ -195,7 +205,12 @@ def collect_actor_dirs(explicit: Sequence[Path], root: Path | None, banned: set[
     return list(seen.values())
 
 
-def list_label_entries(tasks_root: Path, scene_filter: set[str] | None) -> list[LabelEntry]:
+def list_label_entries(
+    tasks_root: Path,
+    scene_filter: set[str] | None,
+    *,
+    exclude_detailed_labels: bool,
+) -> list[LabelEntry]:
     entries: list[LabelEntry] = []
     for scene_dir in sorted(tasks_root.iterdir()):
         if not scene_dir.is_dir():
@@ -207,6 +222,8 @@ def list_label_entries(tasks_root: Path, scene_filter: set[str] | None) -> list[
         if label_dir is None:
             continue
         for json_path in sorted(label_dir.glob("*.json")):
+            if exclude_detailed_labels and json_path.name.endswith(DETAILED_JSON_SUFFIX):
+                continue
             entries.append(LabelEntry(scene_id=scene_id, label_id=json_path.stem, path=json_path))
     return entries
 
@@ -430,7 +447,11 @@ def main() -> None:
         )
 
     scene_filter = set(args.scene) if args.scene else None
-    labels = list_label_entries(args.tasks_dir, scene_filter)
+    labels = list_label_entries(
+        args.tasks_dir,
+        scene_filter,
+        exclude_detailed_labels=args.exclude_detailed_labels,
+    )
     if not labels:
         raise SystemExit("No label-path JSON files matched the current filters.")
 

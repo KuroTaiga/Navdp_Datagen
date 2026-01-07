@@ -1989,7 +1989,9 @@ def main() -> None:
                     device,
                 )
 
-            json_files = sorted(label_dir.glob("*.json"))
+            json_files = sorted(
+                path for path in label_dir.glob("*.json") if not path.name.endswith("_detailed.json")
+            )
             if label_filter:
                 json_files = [path for path in json_files if path.stem in label_filter]
             if not json_files:

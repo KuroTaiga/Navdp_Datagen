@@ -7,7 +7,7 @@ omitted because the repo will move; follow the bullet order instead.
 ## Tooling Added
 
 - `navdp_api/gaussian_splatting/analyze_actor_sequences.py`
-  - Scans any `/human_gs_source/<uid>/` hierarchy, samples flexible frame names,
+  - Scans any `/SHHQ_gs/walking/<uid>/` hierarchy, samples flexible frame names,
     and writes per-UID stats (bounding boxes, point counts, scale factors,
     percentile-based foot offsets, hip heights, etc.).
   - Shares the same actor-alignment math as `render_label_paths.py` by using a
@@ -42,6 +42,9 @@ omitted because the repo will move; follow the bullet order instead.
     and loop/cycle_mod flags) so downstream tooling can remain deterministic.
   - Added `--ban-list` so a `BanList.txt` of avatar UIDs can be supplied to
     exclude specific humans when generating assignments.
+- `navdp_api/gaussian_splatting/render_label_paths.py`
+  - Clamp NPC follow buffer to the configured follow distance to avoid FPV runs
+    failing when follow distance is zero.
 - `navdp_api/gaussian_splatting/verify_render_outputs.py`
   - New utility that scans a NAS output root, flags videos smaller than a chosen
     threshold, and reports failures per actor and per scene based on the
@@ -67,13 +70,13 @@ omitted because the repo will move; follow the bullet order instead.
 1. **Stats (optional):**
    ```bash
    conda run -n cuda121 python analyze_actor_sequences.py \
-     --source-root ./data/human_gs_source \
+     --source-root ./data/SHHQ_gs/walking \
      --output ./navdp_api/gaussian_splatting/actor_sequence_stats.json
    ```
 2. **Random actor pairing:**
    ```bash
    conda run -n cuda121 python random_actor_assignments.py \
-     --actor-root ./data/human_gs_source \
+     --actor-root ./data/SHHQ_gs/walking \
      --assignments-out ./data/actor_assignments.json \
      --seed 12345
    ```

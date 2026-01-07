@@ -1,0 +1,17 @@
+python render_label_paths.py \
+  --scenes-dir ./data/scenes \
+  --tasks-dir ./data/interiorGS_0500_42 \
+  --scene 0001_839920 \
+  --label-id 73 \
+  --output-dir ./debug_npc_ply \
+  --npc-render --npc-count 8 --npc-priority count --npc-max-range 10 \
+  --npc-free-threshold 250 --npc-free-white \
+  --npc-frame-pool-size 50 \
+  --npc-auto-clearance --npc-actor-root ./data/SHHQ_gs/walking \
+  --actor-dump-ply-dir ./debug_npc_ply \
+  --actor-dump-stride 1 --actor-dump-max 30 \
+  --npc-bev-debug \
+  --npc-bev-render-debug \
+  --rgb-frames --no-video \
+  --no-save-depth-maps --no-save-camera-metadata \
+  --verbose

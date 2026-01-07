@@ -2,7 +2,7 @@
 set -euo pipefail
 
 MESHS_ROOT="/mnt/nas/jiankundong/SHHQ_walk_fbx/gs/meshs"
-DST="./data/human_gs_source"
+DST="./data/SHHQ_gs/walking"
 
 echo "[INFO] MESHS_ROOT = $MESHS_ROOT"
 echo "[INFO] DST        = $DST"

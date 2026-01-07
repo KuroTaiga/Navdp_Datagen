@@ -20,7 +20,7 @@ show_usage_and_exit() {
 }
 
 RESUME_MODE=false
-RESUME_LOG_PATH=""
+RESUME_LOG_PATH="0500_fpv_npc.log"
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
@@ -88,20 +88,20 @@ fi
 CONDA_ENV=${CONDA_ENV:-cuda121}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
 TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data2/0500_fpv}
+OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/fpv_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/fpv_status.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_metrics}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv.json}
-ERROR_LOG=${ERROR_LOG:-./0500_fpv.log}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc.json}
+ERROR_LOG=${ERROR_LOG:-./0500_fpv_npc.log}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_fpv}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-24}
+WORKERS=${WORKERS:-12}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -109,7 +109,7 @@ FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
 
 # Optional NPC placement/debug. Leave values empty to skip.
-NPC_ENABLE=${NPC_ENABLE:-false}
+NPC_ENABLE=${NPC_ENABLE:-true}
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}
 NPC_COUNT=${NPC_COUNT:-8}
 NPC_PRIORITY=${NPC_PRIORITY:-coverage}
@@ -120,13 +120,14 @@ NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}
 NPC_AUTO_CLEARANCE=${NPC_AUTO_CLEARANCE:-true}
-ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
+NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}
+ACTOR_ROOT=${ACTOR_ROOT:-./data/SHHQ_gs/walking}
 
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
 RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
 RETRY_CUDA_OOM=${RETRY_CUDA_OOM:-true}
 CUDA_OOM_RETRY_DELAY=${CUDA_OOM_RETRY_DELAY:-10}
-CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:-20}
+CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:--1}
 
 # To enable per-path BEV debug images, run: ENABLE_BEV_IMAGES=true ./run_random_fpv_datagen.sh
 ENABLE_BEV_IMAGES=${ENABLE_BEV_IMAGES:-false}
@@ -136,6 +137,7 @@ ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
 VERBOSE=${VERBOSE:-true}
+EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
 
 render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
@@ -194,6 +196,9 @@ if storage_bool_true "$NPC_ENABLE"; then
   fi
   if [ -n "${NPC_MAX_RANGE:-}" ]; then
     npc_args+=("--npc-max-range ${NPC_MAX_RANGE}")
+  fi
+  if [ -n "${NPC_FRAME_POOL_SIZE:-}" ]; then
+    npc_args+=("--npc-frame-pool-size ${NPC_FRAME_POOL_SIZE}")
   fi
   if storage_bool_true "$NPC_AUTO_CLEARANCE"; then
     if [ -d "$ACTOR_ROOT" ]; then
@@ -528,7 +533,13 @@ trap handle_interrupt INT TERM
 
 if $RESUME_MODE; then
   if [ -n "$RESUME_LOG_PATH" ]; then
-    echo "[RESUME] NOTE: log path provided but status-json resume is used; ignoring log." >&2
+    if [ -f "$RESUME_LOG_PATH" ]; then
+      RESUME_LOG_PATH="$(abspath "$RESUME_LOG_PATH")"
+      echo "[RESUME] Using resume log ${RESUME_LOG_PATH} to skip completed jobs." >&2
+    else
+      echo "[RESUME] WARN: resume log not found at ${RESUME_LOG_PATH}; continuing with status-json only." >&2
+      RESUME_LOG_PATH=""
+    fi
   fi
   CLEAR_LOCAL_OUTPUT_DIR=false
 fi
@@ -612,6 +623,14 @@ parallel_cmd=(
   --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
   --cuda-oom-max-retries "${CUDA_OOM_MAX_RETRIES}"
 )
+if storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
+  parallel_cmd+=(--exclude-detailed-labels)
+else
+  parallel_cmd+=(--no-exclude-detailed-labels)
+fi
+if $RESUME_MODE && [ -n "$RESUME_LOG_PATH" ]; then
+  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_PATH")
+fi
 if storage_bool_true "$RETRY_CUDA_OOM"; then
   parallel_cmd+=(--retry-cuda-oom)
 else

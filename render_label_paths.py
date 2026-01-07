@@ -9,12 +9,12 @@ $ python render_label_paths.py --npc-bev-debug-only \
     --npc-density-coverage 0.2 --npc-count 8 --npc-priority coverage \
     --npc-density-mode angular --npc-zone-ratio 1:2:1 \
     --npc-max-range 10 --npc-free-threshold 250 --npc-free-white \
-    --npc-auto-clearance --npc-actor-root ./data/human_gs_source --npc-radius-samples 80 \
+    --npc-auto-clearance --npc-actor-root ./data/SHHQ_gs/walking --npc-radius-samples 80 \
     --no-mirror-translation --no-bev-mirror-x --no-bev-mirror-y \
     --npc-seed 12345 --output-dir /tmp/npc_debug
 
 Formal render example (with NPC BEV overlays alongside full renders):
-  python render_label_paths.py --tasks-dir data/task_outputs_10w_4 --scene 0001_839920 --actor-seq-dir ./data/human_gs_source/<actor_id> --npc-bev-debug --npc-density-coverage 0.2 --npc-count 4 --npc-priority coverage --npc-density-mode angular --npc-zone-ratio 1:2:1 --npc-max-range 5 --npc-seed 12345 --output-dir ./data/path_video_frames_10w_4
+  python render_label_paths.py --tasks-dir data/task_outputs_10w_4 --scene 0001_839920 --actor-seq-dir ./data/SHHQ_gs/walking/<actor_id> --npc-bev-debug --npc-density-coverage 0.2 --npc-count 4 --npc-priority coverage --npc-density-mode angular --npc-zone-ratio 1:2:1 --npc-max-range 5 --npc-seed 12345 --output-dir ./data/path_video_frames_10w_4
 
 This utility pairs scene reconstructions under ``data/scenes`` with task
 descriptions in ``data/task_outputs_10w``. For each label-path JSON that
@@ -34,7 +34,7 @@ import glob
 import json
 import math
 from argparse import ArgumentParser, BooleanOptionalAction
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence, TextIO
@@ -70,7 +70,10 @@ from utils.render_utils import (
 from utils.npc_density import (
     CameraWedge,
     NPCDensityConfig,
+    compute_clearance_distance,
+    estimate_npc_target_count,
     load_free_space_mask,
+    load_wall_mask,
     plan_npc_positions,
 )
 
@@ -506,6 +509,7 @@ class ActorSequence:
     frames: list[ActorSequenceFrame]
     height: float
     hip_height: float
+    radius_xy: float
     columns: dict[str, int]
     dtype: np.dtype
     feature_rest_names: list[str]
@@ -685,6 +689,106 @@ def _write_debug_ply(path: Path, data: np.ndarray) -> None:
 class ActorRuntime:
     options: ActorOptions
     sequence: ActorSequence
+
+
+@dataclass
+class NPCActorPool:
+    actor_dirs: list[Path]
+    pattern: str
+    height: float
+    follow_distance: float
+    buffer_distance: float
+    speed: float
+    fps: float
+    loop: bool
+    foot_offset: float
+    animation_cycle_mod: int
+    debug: bool = False
+    verbose: bool = False
+    cache: dict[Path, ActorRuntime] = field(default_factory=dict)
+
+    def get_runtime(self, rng: np.random.Generator) -> ActorRuntime | None:
+        if not self.actor_dirs:
+            return None
+        idx = int(rng.integers(0, len(self.actor_dirs)))
+        actor_dir = self.actor_dirs[idx]
+        cached = self.cache.get(actor_dir)
+        if cached is not None:
+            return cached
+        options = ActorOptions(
+            sequence_dir=actor_dir,
+            pattern=self.pattern,
+            height=self.height,
+            follow_distance=self.follow_distance,
+            buffer_distance=self.buffer_distance,
+            speed=self.speed,
+            fps=self.fps,
+            loop=self.loop,
+            foot_offset=self.foot_offset,
+            animation_cycle_mod=self.animation_cycle_mod,
+        )
+        sequence = load_actor_sequence(options, debug=self.debug)
+        runtime = ActorRuntime(options=options, sequence=sequence)
+        self.cache[actor_dir] = runtime
+        if self.verbose:
+            print(
+                f"[VERBOSE] NPC actor sequence ready: {len(sequence.frames)} frames from {actor_dir}.",
+                flush=True,
+            )
+        return runtime
+
+
+@dataclass(frozen=True)
+class NPCFrameEntry:
+    sequence: ActorSequence
+    source_path: Path
+    radius_xy: float
+
+
+@dataclass
+class NPCFramePool:
+    frame_paths: list[Path]
+    pool_size: int
+    height: float
+    foot_offset: float
+    debug: bool = False
+    verbose: bool = False
+    entries: list[NPCFrameEntry] = field(default_factory=list)
+
+    def populate(self, rng: np.random.Generator) -> None:
+        if self.entries or self.pool_size <= 0 or not self.frame_paths:
+            return
+        order = list(range(len(self.frame_paths)))
+        rng.shuffle(order)
+        for idx in order:
+            path = self.frame_paths[idx]
+            try:
+                sequence = load_actor_frame_sequence(path, height=self.height, debug=self.debug)
+            except Exception as exc:  # pylint: disable=broad-except
+                if self.verbose:
+                    print(f"[WARN] Failed to load NPC frame {path}: {exc}", flush=True)
+                continue
+            self.entries.append(
+                NPCFrameEntry(
+                    sequence=sequence,
+                    source_path=path,
+                    radius_xy=float(sequence.radius_xy),
+                )
+            )
+            if len(self.entries) >= self.pool_size:
+                break
+        if self.verbose:
+            print(
+                f"[VERBOSE] NPC frame pool ready: {len(self.entries)} frame(s) "
+                f"from {len(self.frame_paths)} candidate PLYs.",
+                flush=True,
+            )
+
+    def get_entry(self, rng: np.random.Generator) -> NPCFrameEntry | None:
+        if not self.entries:
+            return None
+        idx = int(rng.integers(0, len(self.entries)))
+        return self.entries[idx]
 
 
 @dataclass(frozen=True)
@@ -904,6 +1008,37 @@ def _meters_to_px(meta: dict, meters: float) -> int:
         return 0
     return int(round(meters / float(meta["scale"])))
 
+
+def _meters_to_px_ceil(meta: dict, meters: float) -> int:
+    """Convert meters to occupancy pixel units (rounded up)."""
+    if meters <= 0.0:
+        return 0
+    return int(math.ceil(meters / float(meta["scale"])))
+
+def _resolve_npc_bloom_radius_m(
+    *,
+    config: NPCDensityConfig | None,
+    frame_pool: NPCFramePool | None,
+    actor_pool: NPCActorPool | None,
+    actor_runtime: ActorRuntime | None,
+) -> float:
+    """Return the max radius among loaded NPC assets (meters)."""
+    radius = float(config.clearance_radius) if config is not None else 0.0
+    if frame_pool is not None and frame_pool.entries:
+        radius = max(radius, max(entry.radius_xy for entry in frame_pool.entries if entry.radius_xy > 0.0))
+    if actor_runtime is not None and actor_runtime.sequence.radius_xy > 0.0:
+        radius = max(radius, float(actor_runtime.sequence.radius_xy))
+    if actor_pool is not None and actor_pool.cache:
+        radius = max(
+            radius,
+            max(
+                runtime.sequence.radius_xy
+                for runtime in actor_pool.cache.values()
+                if runtime.sequence.radius_xy > 0.0
+            ),
+        )
+    return radius
+
 def _rotate_xy(vec: np.ndarray, angle_rad: float) -> np.ndarray:
     c, s = math.cos(angle_rad), math.sin(angle_rad)
     x, y = float(vec[0]), float(vec[1])
@@ -1062,6 +1197,10 @@ def save_npc_bev_debug_image(
     camera_xy: np.ndarray,
     forward_xy: np.ndarray,
     npc_positions: list[np.ndarray],
+    npc_radii: Sequence[float] | None,
+    blocked_mask: np.ndarray | None,
+    bloom_radius_m: float | None,
+    bloom_radius_px: int | None,
     config: NPCDensityConfig,
     fov_deg: float,
     wedge_max_range: float,
@@ -1081,6 +1220,14 @@ def save_npc_bev_debug_image(
     base = np.zeros((h, w + pad_w, 3), dtype=np.uint8)
     base[:, :w, :] = occ_rgb
 
+    if blocked_mask is not None and blocked_mask.shape[:2] == (h, w):
+        overlay = base[:, :w, :]
+        alpha = 0.35
+        tint = np.array([255, 0, 0], dtype=np.float32)
+        mask = blocked_mask.astype(bool)
+        overlay_vals = overlay[mask].astype(np.float32)
+        overlay[mask] = np.clip((1.0 - alpha) * overlay_vals + alpha * tint, 0, 255).astype(np.uint8)
+
     path_px = [_mirror_uv(world_to_pixel(meta, xy), w, h, mirror_bev_x, mirror_bev_y) for xy in path_xy]
     cam_px = _mirror_uv(world_to_pixel(meta, camera_xy), w, h, mirror_bev_x, mirror_bev_y)
     npc_px = [_mirror_uv(world_to_pixel(meta, xy), w, h, mirror_bev_x, mirror_bev_y) for xy in npc_positions]
@@ -1099,7 +1246,7 @@ def save_npc_bev_debug_image(
         origin_xy=camera_xy,
         forward_xy=forward_xy,
         fov_deg=fov_deg,
-        r_min=config.min_distance_from_camera,
+        r_min=config.min_center_distance,
         r_max=wedge_max_range,
         color=(255, 165, 0),
         mirror_x=mirror_bev_x,
@@ -1108,8 +1255,10 @@ def save_npc_bev_debug_image(
     )
 
     # NPC discs
-    npc_radius_px = max(1, _meters_to_px(meta, config.clearance_radius))
-    for xy_px in npc_px:
+    if npc_radii is None or len(npc_radii) != len(npc_positions):
+        npc_radii = [config.clearance_radius] * len(npc_positions)
+    for xy_px, radius_m in zip(npc_px, npc_radii):
+        npc_radius_px = max(1, _meters_to_px(meta, radius_m))
         _draw_disk(base, xy_px, npc_radius_px, (0, 255, 0))
         _draw_disk(base, xy_px, max(1, npc_radius_px // 3), (0, 128, 0))
 
@@ -1123,11 +1272,71 @@ def save_npc_bev_debug_image(
         f"NPCs: {len(npc_positions)}/{requested_count} (shortfall {shortfall})",
         f"Priority: {config.priority} | desired={config.desired_count or '-'} | max={config.max_npcs or '-'}",
         f"Zones (near:mid:far): {config.zone_weights[0]:.1f}:{config.zone_weights[1]:.1f}:{config.zone_weights[2]:.1f}",
-        f"Clearance: {config.clearance_radius:.2f} m",
-        f"Range: {config.min_distance_from_camera:.2f}-{wedge_max_range:.2f} m",
+        f"Clearance: base {config.clearance_radius:.2f} m",
+        f"Range: {config.min_center_distance:.2f}-{wedge_max_range:.2f} m",
         f"FOV: {fov_deg:.1f} deg",
     ]
+    if npc_positions:
+        radius_vals = [float(r) for r in npc_radii]
+        lines.append(
+            f"Radii (m): min/mean/max {min(radius_vals):.2f}/"
+            f"{(sum(radius_vals) / len(radius_vals)):.2f}/{max(radius_vals):.2f}"
+        )
+    if bloom_radius_m is None:
+        if npc_positions:
+            max_radius_m = max(float(r) for r in npc_radii)
+        else:
+            max_radius_m = float(config.clearance_radius)
+        max_radius_px = max(1, _meters_to_px_ceil(meta, max_radius_m))
+    else:
+        max_radius_m = float(bloom_radius_m)
+        max_radius_px = (
+            int(bloom_radius_px)
+            if bloom_radius_px is not None
+            else max(1, _meters_to_px_ceil(meta, max_radius_m))
+        )
+    lines.append(f"Max NPC radius: {max_radius_m:.2f} m / {max_radius_px}px")
 
+    _draw_text_lines(base, lines, origin=(w + 12, 8))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(out_path, base)
+
+def save_npc_bloom_debug_image(
+    *,
+    scene_id: str,
+    label_id: str,
+    frame_idx: int,
+    meta: dict,
+    occ_image: np.ndarray,
+    bloom_mask: np.ndarray,
+    bloom_radius_m: float,
+    bloom_radius_px: int,
+    out_path: Path,
+) -> None:
+    """Save the occupancy image with the NPC placement bloom overlay."""
+
+    occ_rgb = occ_image.copy()
+    h, w = occ_rgb.shape[:2]
+    pad_w = 240
+    base = np.zeros((h, w + pad_w, 3), dtype=np.uint8)
+    base[:, :w, :] = occ_rgb
+
+    if bloom_mask is not None and bloom_mask.shape[:2] == (h, w):
+        overlay = base[:, :w, :]
+        alpha = 0.35
+        tint = np.array([255, 0, 0], dtype=np.float32)
+        mask = bloom_mask.astype(bool)
+        overlay_vals = overlay[mask].astype(np.float32)
+        overlay[mask] = np.clip((1.0 - alpha) * overlay_vals + alpha * tint, 0, 255).astype(np.uint8)
+
+    lines = [
+        f"Scene: {scene_id}",
+        f"Label: {label_id}",
+        f"Frame: {frame_idx}",
+        f"Image: {w}x{h}px  scale:{meta['scale']:.3f} m/px",
+        f"Bloom radius: {bloom_radius_m:.2f} m / {bloom_radius_px}px",
+    ]
     _draw_text_lines(base, lines, origin=(w + 12, 8))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1141,6 +1350,10 @@ def generate_npc_bev_debug_for_path(
     meta: dict,
     occ_image: np.ndarray,
     free_mask: np.ndarray,
+    center_mask: np.ndarray | None,
+    bloom_mask: np.ndarray | None,
+    bloom_radius_m: float | None,
+    bloom_radius_px: int | None,
     config: NPCDensityConfig,
     fov_deg: float,
     seed_base: int,
@@ -1181,7 +1394,7 @@ def generate_npc_bev_debug_for_path(
             forward_xy=forward_xy,
             fov_deg=fov_deg,
             max_range=wedge_max_range,
-            min_range=config.min_distance_from_camera,
+            min_range=config.min_center_distance,
         )
         seed = _npc_frame_seed(seed_base, scene_id, label_id, frame_idx)
         rng = np.random.default_rng(seed)
@@ -1193,6 +1406,7 @@ def generate_npc_bev_debug_for_path(
             config=config,
             goal_xy=goal_xy,
             exclude_discs=exclude_discs,
+            center_mask=center_mask,
         )
 
         out_path = out_dir / f"npc_bev_{frame_idx:04d}.png"
@@ -1206,6 +1420,10 @@ def generate_npc_bev_debug_for_path(
             camera_xy=cam_pos[:2],
             forward_xy=forward_xy,
             npc_positions=placement.positions_xy,
+            npc_radii=None,
+            blocked_mask=bloom_mask,
+            bloom_radius_m=bloom_radius_m,
+            bloom_radius_px=bloom_radius_px,
             config=config,
             fov_deg=fov_deg,
             wedge_max_range=wedge_max_range,
@@ -1361,6 +1579,11 @@ def _npc_frame_seed(base_seed: int, scene_id: str, label_id: str, frame_idx: int
     payload = f"{base_seed}:{scene_id}:{label_id}:{frame_idx}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="little")
 
+
+def _npc_pool_seed(base_seed: int, job_slot: int | None, job_name: str | None) -> int:
+    payload = f"{base_seed}:{job_slot}:{job_name}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="little")
+
 def _compute_ply_radius(ply_path: Path) -> float:
     """Estimate avatar radius from a PLY frame using 95th percentile of XY distances from median center."""
     ply = ply_utils.GaussianPly.read(ply_path)
@@ -1374,19 +1597,24 @@ def _compute_ply_radius(ply_path: Path) -> float:
     return float(np.percentile(dists, 95))
 
 def _compute_default_npc_clearance(actor_root: Path, sample_limit: int = 80) -> float:
-    """Derive a default NPC clearance radius from HumanGS sources (trimmed mean of radii)."""
+    """Derive a default NPC clearance radius from SHHQ sources (trimmed mean of radii)."""
     if not actor_root.is_dir():
         raise FileNotFoundError(f"Actor source root not found: {actor_root}")
     radii: list[float] = []
-    actor_dirs = sorted(p for p in actor_root.iterdir() if p.is_dir())
-    for idx, actor_dir in enumerate(actor_dirs):
-        if idx >= sample_limit:
-            break
-        ply_files = sorted(glob.glob(str(actor_dir / "*.ply")))
-        if not ply_files:
-            continue
+    ply_paths = list_actor_frame_paths_recursive(actor_root, pattern="*.ply")
+    if not ply_paths:
+        raise RuntimeError(f"No valid PLY frames found under {actor_root}")
+
+    rng = np.random.default_rng(0)
+    if len(ply_paths) > sample_limit:
+        indices = rng.choice(len(ply_paths), size=sample_limit, replace=False)
+        samples = [ply_paths[int(i)] for i in indices]
+    else:
+        samples = ply_paths
+
+    for ply_path in samples:
         try:
-            r = _compute_ply_radius(Path(ply_files[0]))
+            r = _compute_ply_radius(Path(ply_path))
             if r > 0.0 and math.isfinite(r):
                 radii.append(r)
         except Exception:
@@ -1584,41 +1812,69 @@ def natural_sort_key(path: Path) -> list[object]:
     return key
 
 
-def list_actor_frame_paths(options: ActorOptions) -> list[Path]:
-    """Return sorted actor frame paths, falling back to *.ply when pattern is too strict."""
+def list_actor_frame_paths_in_dir(sequence_dir: Path, *, pattern: str = "*.ply") -> list[Path]:
+    """Return sorted actor frame paths in a directory, with a fallback to *.ply."""
 
-    if not options.sequence_dir.is_dir():
+    if not sequence_dir.is_dir():
         return []
 
-    pattern = options.pattern or "*.ply"
-    initial = [
-        path
-        for path in options.sequence_dir.glob(pattern)
-        if path.is_file()
-    ]
+    pattern = pattern or "*.ply"
+    initial = [path for path in sequence_dir.glob(pattern) if path.is_file()]
     initial = [path for path in initial if path.suffix.lower() == ".ply"]
 
     if not initial:
-        initial = [
-            path
-            for path in options.sequence_dir.glob("*.ply")
-            if path.is_file()
-    ]
+        initial = [path for path in sequence_dir.glob("*.ply") if path.is_file()]
 
     return sorted(initial, key=natural_sort_key)
+
+
+def list_actor_frame_paths(options: ActorOptions) -> list[Path]:
+    """Return sorted actor frame paths, falling back to *.ply when pattern is too strict."""
+
+    return list_actor_frame_paths_in_dir(options.sequence_dir, pattern=options.pattern)
+
+
+def list_actor_frame_paths_recursive(root: Path, *, pattern: str = "*.ply") -> list[Path]:
+    """Return PLY frame paths under root (recursive), with a fallback to *.ply."""
+
+    if root is None or not root.is_dir():
+        return []
+
+    pattern = pattern or "*.ply"
+    initial = [path for path in root.rglob(pattern) if path.is_file()]
+    initial = [path for path in initial if path.suffix.lower() == ".ply"]
+
+    if not initial:
+        initial = [path for path in root.rglob("*.ply") if path.is_file()]
+
+    return sorted(initial, key=lambda p: p.as_posix())
+
+
+def _dir_has_ply(path: Path, *, pattern: str = "*.ply") -> bool:
+    if not path.is_dir():
+        return False
+    return any(path.glob(pattern)) or any(path.glob("*.ply"))
 
 
 def _first_actor_subdir(root: Path) -> Path | None:
     """Pick the first child directory under root that contains at least one PLY."""
 
+    candidates = _list_actor_subdirs(root, pattern="*.ply")
+    return candidates[0] if candidates else None
+
+
+def _list_actor_subdirs(root: Path, *, pattern: str = "*.ply") -> list[Path]:
+    """Return (recursive) directories under root that contain PLY frames."""
+
     if root is None or not root.is_dir():
-        return None
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
-        if any(child.glob("*.ply")):
-            return child
-    return None
+        return []
+    found: list[Path] = []
+    for dirpath, dirnames, _ in os.walk(root):
+        current = Path(dirpath)
+        if _dir_has_ply(current, pattern=pattern):
+            found.append(current)
+            dirnames[:] = []
+    return sorted(found, key=lambda p: p.as_posix())
 
 
 def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
@@ -1663,6 +1919,17 @@ ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
     dtype=np.float64,
 )
 HIP_HEIGHT_RATIO = 0.6
+
+
+def _compute_frame_radius_xy(data: np.ndarray) -> float:
+    """Estimate actor radius as half the XY bounding-box diagonal."""
+    x = np.asarray(data["x"], dtype=np.float64)
+    y = np.asarray(data["y"], dtype=np.float64)
+    if x.size == 0 or y.size == 0:
+        return 0.0
+    dx = float(np.max(x) - np.min(x))
+    dy = float(np.max(y) - np.min(y))
+    return 0.5 * math.hypot(dx, dy)
 
 
 def load_actor_sequence(
@@ -1737,6 +2004,7 @@ def load_actor_sequence(
     global_max_z = max(float(np.max(ply.data["z"])) for ply in actor_plys)
     adjusted_height = max(global_max_z, EPS)
     hip_height = adjusted_height * HIP_HEIGHT_RATIO
+    radius_xy = max(_compute_frame_radius_xy(ply.data) for ply in actor_plys)
 
     first_ply = actor_plys[0]
     dtype_names = list(first_ply.data.dtype.names or ())
@@ -1772,6 +2040,7 @@ def load_actor_sequence(
         frames=frames,
         height=float(adjusted_height),
         hip_height=float(hip_height),
+        radius_xy=float(radius_xy),
         columns=dict(first_ply.columns),
         dtype=first_ply.data.dtype,
         feature_rest_names=feature_rest_names,
@@ -1781,6 +2050,109 @@ def load_actor_sequence(
         max_sh_degree=max_sh_degree,
         uniform_scale=len(scale_names) == 1,
         max_points=max(frame.base_data.shape[0] for frame in frames),
+    )
+
+
+def load_actor_frame_sequence(
+    ply_path: Path,
+    *,
+    height: float,
+    debug: bool = False,
+) -> ActorSequence:
+    """Load and normalise a single actor PLY frame as a one-frame sequence."""
+
+    if not ply_path.is_file():
+        raise FileNotFoundError(f"Actor frame not found: {ply_path}")
+
+    alignment_transform = np.eye(4, dtype=np.float64)
+    alignment_transform[:3, :3] = ACTOR_AXIS_ALIGNMENT_MATRIX
+
+    ply = load_gaussian_ply(ply_path)
+    ply_utils.apply_transform_inplace(
+        ply,
+        alignment_transform,
+        rotate_normals=True,
+        rotate_sh=True,
+    )
+
+    z_values = ply.data["z"].astype(np.float64)
+    raw_min_z = float(np.min(z_values))
+    raw_max_z = float(np.max(z_values))
+    measured_height = max(raw_max_z - raw_min_z, EPS)
+    target_height = height if height > 0.0 else measured_height
+    scale_factor = target_height / measured_height
+
+    if debug:
+        print(
+            f"[DEBUG] Actor frame {ply_path.name}: "
+            f"raw height {measured_height:.3f} m, applying scale {scale_factor:.3f}",
+            flush=True,
+        )
+
+    if not math.isclose(scale_factor, 1.0, rel_tol=1e-4, abs_tol=1e-4):
+        scale_transform = np.eye(4, dtype=np.float64)
+        scale_transform[:3, :3] *= scale_factor
+        ply_utils.apply_transform_inplace(
+            ply,
+            scale_transform,
+            rotate_normals=True,
+            rotate_sh=True,
+        )
+
+    min_z = float(np.min(ply.data["z"]))
+    translate_transform = np.eye(4, dtype=np.float64)
+    translate_transform[2, 3] = -min_z
+    ply_utils.apply_transform_inplace(
+        ply,
+        translate_transform,
+        rotate_normals=False,
+        rotate_sh=False,
+    )
+
+    max_z = float(np.max(ply.data["z"]))
+    adjusted_height = max(max_z, EPS)
+    hip_height = adjusted_height * HIP_HEIGHT_RATIO
+    radius_xy = _compute_frame_radius_xy(ply.data)
+
+    dtype_names = list(ply.data.dtype.names or ())
+    feature_rest_names = sorted(
+        [name for name in dtype_names if name.startswith("f_rest_")],
+        key=lambda name: int(name.split("_")[-1]),
+    )
+    rest_dim = len(feature_rest_names) // 3 if feature_rest_names else 0
+    scale_names = sorted(
+        [name for name in dtype_names if name.startswith("scale")],
+        key=lambda name: int(name.split("_")[-1]) if "_" in name else 0,
+    )
+    rot_names = sorted(
+        [name for name in dtype_names if name.startswith("rot_")],
+        key=lambda name: int(name.split("_")[-1]),
+    )
+
+    if rest_dim * 3 != len(feature_rest_names):
+        raise ValueError("Unexpected spherical harmonic coefficient layout in actor PLY.")
+    if rot_names and len(rot_names) != 4:
+        raise ValueError("Actor PLY must provide quaternion components rot_0..rot_3.")
+    if scale_names and len(scale_names) not in (1, 3):
+        raise ValueError("Actor PLY scales must appear as scale_0/1/2 or a single scale column.")
+
+    max_sh_degree = int(round(math.sqrt(rest_dim + 1) - 1)) if rest_dim > 0 else 0
+
+    frame = ActorSequenceFrame(base_data=np.array(ply.data, copy=True))
+    return ActorSequence(
+        frames=[frame],
+        height=float(adjusted_height),
+        hip_height=float(hip_height),
+        radius_xy=float(radius_xy),
+        columns=dict(ply.columns),
+        dtype=ply.data.dtype,
+        feature_rest_names=feature_rest_names,
+        scale_names=scale_names,
+        rot_names=rot_names,
+        rest_dim=rest_dim,
+        max_sh_degree=max_sh_degree,
+        uniform_scale=len(scale_names) == 1,
+        max_points=frame.base_data.shape[0],
     )
 
 
@@ -2343,6 +2715,8 @@ def render_actor_follow_sequence(
     npc_forward_fn=None,
     npc_goal: np.ndarray | None = None,
     npc_actor_runtime: ActorRuntime | None = None,
+    npc_actor_pool: NPCActorPool | None = None,
+    npc_frame_pool: NPCFramePool | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Render combined scene+actor frames using either CPU or GPU composition."""
 
@@ -2365,16 +2739,30 @@ def render_actor_follow_sequence(
     anim_cursor = 0.0
     num_actor_frames = len(sequence.frames)
 
+    npc_has_actor = (
+        npc_actor_runtime is not None
+        or npc_actor_pool is not None
+        or npc_frame_pool is not None
+    )
     npc_active = (
         npc_enabled
         and npc_config is not None
         and npc_free_mask is not None
         and npc_meta is not None
-        and npc_actor_runtime is not None
+        and npc_has_actor
     )
-    npc_sequence = npc_actor_runtime.sequence if npc_active else None
-    npc_options = npc_actor_runtime.options if npc_active else None
-    npc_ground_z = floor_z + (npc_options.foot_offset if npc_options is not None else 0.0)
+    npc_use_actor_pool = npc_actor_pool is not None
+    npc_use_frame_pool = npc_frame_pool is not None
+    npc_sequence = (
+        npc_actor_runtime.sequence
+        if npc_active and not npc_use_actor_pool and not npc_use_frame_pool
+        else None
+    )
+    npc_options = (
+        npc_actor_runtime.options
+        if npc_active and not npc_use_actor_pool and not npc_use_frame_pool
+        else None
+    )
     npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1))) if npc_options is not None else 1
     npc_anim_step = (
         (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod if npc_options is not None else 0.0
@@ -2497,60 +2885,172 @@ def render_actor_follow_sequence(
 
             npc_actor_frames: list[ActorRenderFrame] = []
             npc_debug_vertices: list[np.ndarray] = []
-            if npc_active and npc_num_frames > 0 and npc_wedge_max_range is not None:
-                wedge_forward = forward[:2]
-                norm_fwd = float(np.linalg.norm(wedge_forward))
-                if norm_fwd < EPS:
-                    wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
+            if npc_active and npc_wedge_max_range is not None:
+                if not npc_use_actor_pool and not npc_use_frame_pool and npc_num_frames <= 0:
+                    pass
                 else:
-                    wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
-                wedge = CameraWedge(
-                    origin_xy=camera_position[:2],
-                    forward_xy=wedge_forward,
-                    fov_deg=fov_deg,
-                    max_range=float(npc_wedge_max_range),
-                    min_range=npc_config.min_distance_from_camera,
-                )
-                npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
-                rng = np.random.default_rng(npc_seed)
-                placement = plan_npc_positions(
-                    wedge=wedge,
-                    free_mask=npc_free_mask,
-                    meta=npc_meta,
-                    rng=rng,
-                    config=npc_config,
-                    goal_xy=npc_goal,
-                    exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
-                )
-                npc_shortfall_total += placement.shortfall
-                if verbose and placement.shortfall > 0:
-                    print(
-                        f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
-                        flush=True,
-                    )
-                orient_rng = np.random.default_rng(npc_seed + 1)
-                for npc_i, npc_xy in enumerate(placement.positions_xy):
-                    yaw = float(orient_rng.uniform(-math.pi, math.pi))
-                    rotation_np = rotation_matrix_z_np(yaw)
-                    translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
-                    transform = build_transform_matrix(rotation_np, translation_vec)
-                    if npc_options.loop:
-                        npc_anim_idx = int((idx * npc_anim_step + npc_i) % npc_num_frames)
+                    wedge_forward = forward[:2]
+                    norm_fwd = float(np.linalg.norm(wedge_forward))
+                    if norm_fwd < EPS:
+                        wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
                     else:
-                        npc_anim_idx = min(int(idx * npc_anim_step + npc_i), max(npc_num_frames - 1, 0))
-                    base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                    npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
-                    if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
-                        npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
-                    npc_actor_frames.append(
-                        actor_data_to_tensors(
-                            npc_data,
-                            npc_sequence,
-                            device,
-                            verbose=False,
-                            target_rest_dim=scene_rest_dim,
-                        )
+                        wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
+                    wedge = CameraWedge(
+                        origin_xy=camera_position[:2],
+                        forward_xy=wedge_forward,
+                        fov_deg=fov_deg,
+                        max_range=float(npc_wedge_max_range),
+                        min_range=npc_config.min_center_distance,
                     )
+                    npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
+                    rng = np.random.default_rng(npc_seed)
+                    orient_rng = np.random.default_rng(npc_seed + 1)
+                    actor_rng = np.random.default_rng(npc_seed + 2)
+                    target_count, _ = estimate_npc_target_count(
+                        wedge=wedge,
+                        config=npc_config,
+                        radius_m=npc_config.clearance_radius,
+                    )
+                    npc_entries: list[ActorRuntime | NPCFrameEntry] = []
+                    npc_radii: list[float] = []
+                    if target_count > 0:
+                        for _ in range(target_count):
+                            if npc_use_frame_pool:
+                                npc_entry = (
+                                    npc_frame_pool.get_entry(actor_rng)
+                                    if npc_frame_pool is not None
+                                    else None
+                                )
+                                if npc_entry is None:
+                                    continue
+                                npc_entries.append(npc_entry)
+                                radius = (
+                                    npc_entry.radius_xy
+                                    if npc_entry.radius_xy > 0
+                                    else npc_config.clearance_radius
+                                )
+                                npc_radii.append(radius)
+                            else:
+                                npc_runtime = (
+                                    npc_actor_pool.get_runtime(actor_rng)
+                                    if npc_use_actor_pool
+                                    else npc_actor_runtime
+                                )
+                                if npc_runtime is None:
+                                    continue
+                                npc_entries.append(npc_runtime)
+                                radius = (
+                                    npc_runtime.sequence.radius_xy
+                                    if npc_runtime.sequence.radius_xy > 0
+                                    else npc_config.clearance_radius
+                                )
+                                npc_radii.append(radius)
+                    placement = plan_npc_positions(
+                        wedge=wedge,
+                        free_mask=npc_free_mask,
+                        meta=npc_meta,
+                        rng=rng,
+                        config=npc_config,
+                        goal_xy=npc_goal,
+                        exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
+                        radii_m=npc_radii,
+                        center_mask=npc_center_mask,
+                    )
+                    placed_radii = [
+                        npc_radii[idx]
+                        for idx in placement.accepted_indices
+                        if 0 <= idx < len(npc_radii)
+                    ]
+                    if len(placed_radii) != len(placement.positions_xy):
+                        placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                    if npc_bev_render_debug and npc_occ_image is not None:
+                        out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
+                        save_npc_bev_debug_image(
+                            scene_id=scene_id,
+                            label_id=label_id,
+                            frame_idx=idx,
+                            meta=npc_meta,
+                            occ_image=npc_occ_image,
+                            path_xy=path_xy,
+                            camera_xy=camera_position[:2],
+                            forward_xy=wedge_forward,
+                            npc_positions=placement.positions_xy,
+                            npc_radii=placed_radii,
+                            blocked_mask=npc_bloom_mask,
+                            bloom_radius_m=npc_bloom_radius_m,
+                            bloom_radius_px=npc_bloom_radius_px,
+                            config=npc_config,
+                            fov_deg=fov_deg,
+                            wedge_max_range=float(npc_wedge_max_range),
+                            achieved_coverage=placement.achieved_coverage,
+                            requested_count=placement.requested_count,
+                            shortfall=placement.shortfall,
+                            target_coverage=npc_config.target_coverage,
+                            mirror_bev_x=mirror_bev_x,
+                            mirror_bev_y=mirror_bev_y,
+                            out_path=out_path,
+                        )
+                    npc_shortfall_total += placement.shortfall
+                    if verbose and placement.shortfall > 0:
+                        print(
+                            f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
+                            flush=True,
+                        )
+                    for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                        entry_idx = (
+                            placement.accepted_indices[placement_idx]
+                            if placement_idx < len(placement.accepted_indices)
+                            else None
+                        )
+                        if entry_idx is None or entry_idx >= len(npc_entries):
+                            continue
+                        entry = npc_entries[entry_idx]
+                        npc_sequence = None
+                        npc_options = None
+                        base_npc_frame = None
+                        npc_ground_z = floor_z
+                        if npc_use_frame_pool:
+                            npc_entry = entry
+                            npc_sequence = npc_entry.sequence
+                            if not npc_sequence.frames:
+                                continue
+                            base_npc_frame = npc_sequence.frames[0]
+                            npc_ground_z = floor_z + npc_frame_pool.foot_offset
+                        else:
+                            npc_runtime = entry
+                            npc_sequence = npc_runtime.sequence
+                            npc_options = npc_runtime.options
+                            npc_num_frames = len(npc_sequence.frames)
+                            if npc_num_frames <= 0:
+                                continue
+                            npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1)))
+                            npc_anim_step = (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod
+                            npc_ground_z = floor_z + npc_options.foot_offset
+                        yaw = float(orient_rng.uniform(-math.pi, math.pi))
+                        rotation_np = rotation_matrix_z_np(yaw)
+                        translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
+                        transform = build_transform_matrix(rotation_np, translation_vec)
+                        if base_npc_frame is None:
+                            if npc_options.loop:
+                                npc_anim_idx = int((idx * npc_anim_step + placement_idx) % npc_num_frames)
+                            else:
+                                npc_anim_idx = min(
+                                    int(idx * npc_anim_step + placement_idx),
+                                    max(npc_num_frames - 1, 0),
+                                )
+                            base_npc_frame = npc_sequence.frames[npc_anim_idx]
+                        npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                        if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                            npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
+                        npc_actor_frames.append(
+                            actor_data_to_tensors(
+                                npc_data,
+                                npc_sequence,
+                                device,
+                                verbose=False,
+                                target_rest_dim=scene_rest_dim,
+                            )
+                        )
 
             # Dump debug PLY if requested
             if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
@@ -2738,47 +3238,159 @@ def render_actor_follow_sequence(
 
         npc_vertex_entries: list[np.ndarray] = []
         npc_debug_vertices: list[np.ndarray] = []
-        if npc_active and npc_num_frames > 0 and npc_wedge_max_range is not None:
-            wedge_forward = forward[:2]
-            norm_fwd = float(np.linalg.norm(wedge_forward))
-            if norm_fwd < EPS:
-                wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
+        if npc_active and npc_wedge_max_range is not None:
+            if not npc_use_actor_pool and not npc_use_frame_pool and npc_num_frames <= 0:
+                pass
             else:
-                wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
-            wedge = CameraWedge(
-                origin_xy=camera_position[:2],
-                forward_xy=wedge_forward,
-                fov_deg=fov_deg,
-                max_range=float(npc_wedge_max_range),
-                min_range=npc_config.min_distance_from_camera,
-            )
-            npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
-            rng = np.random.default_rng(npc_seed)
-            placement = plan_npc_positions(
-                wedge=wedge,
-                free_mask=npc_free_mask,
-                meta=npc_meta,
-                rng=rng,
-                config=npc_config,
-                goal_xy=npc_goal,
-                exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
-            )
-            npc_shortfall_total += placement.shortfall
-            orient_rng = np.random.default_rng(npc_seed + 1)
-            for npc_i, npc_xy in enumerate(placement.positions_xy):
-                yaw = float(orient_rng.uniform(-math.pi, math.pi))
-                rotation_np = rotation_matrix_z_np(yaw)
-                translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
-                transform = build_transform_matrix(rotation_np, translation_vec)
-                if npc_options.loop:
-                    npc_anim_idx = int((idx * npc_anim_step + npc_i) % npc_num_frames)
+                wedge_forward = forward[:2]
+                norm_fwd = float(np.linalg.norm(wedge_forward))
+                if norm_fwd < EPS:
+                    wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
                 else:
-                    npc_anim_idx = min(int(idx * npc_anim_step + npc_i), max(npc_num_frames - 1, 0))
-                base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
-                npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
-                if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
-                    npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
+                    wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
+                wedge = CameraWedge(
+                    origin_xy=camera_position[:2],
+                    forward_xy=wedge_forward,
+                    fov_deg=fov_deg,
+                    max_range=float(npc_wedge_max_range),
+                    min_range=npc_config.min_center_distance,
+                )
+                npc_seed = _npc_frame_seed(npc_seed_base, scene_id, label_id, idx)
+                rng = np.random.default_rng(npc_seed)
+                orient_rng = np.random.default_rng(npc_seed + 1)
+                actor_rng = np.random.default_rng(npc_seed + 2)
+                target_count, _ = estimate_npc_target_count(
+                    wedge=wedge,
+                    config=npc_config,
+                    radius_m=npc_config.clearance_radius,
+                )
+                npc_entries: list[ActorRuntime | NPCFrameEntry] = []
+                npc_radii: list[float] = []
+                if target_count > 0:
+                    for _ in range(target_count):
+                        if npc_use_frame_pool:
+                            npc_entry = (
+                                npc_frame_pool.get_entry(actor_rng)
+                                if npc_frame_pool is not None
+                                else None
+                            )
+                            if npc_entry is None:
+                                continue
+                            npc_entries.append(npc_entry)
+                            radius = (
+                                npc_entry.radius_xy
+                                if npc_entry.radius_xy > 0
+                                else npc_config.clearance_radius
+                            )
+                            npc_radii.append(radius)
+                        else:
+                            npc_runtime = (
+                                npc_actor_pool.get_runtime(actor_rng)
+                                if npc_use_actor_pool
+                                else npc_actor_runtime
+                            )
+                            if npc_runtime is None:
+                                continue
+                            npc_entries.append(npc_runtime)
+                            radius = (
+                                npc_runtime.sequence.radius_xy
+                                if npc_runtime.sequence.radius_xy > 0
+                                else npc_config.clearance_radius
+                            )
+                            npc_radii.append(radius)
+                placement = plan_npc_positions(
+                    wedge=wedge,
+                    free_mask=npc_free_mask,
+                    meta=npc_meta,
+                    rng=rng,
+                    config=npc_config,
+                    goal_xy=npc_goal,
+                    exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
+                    radii_m=npc_radii,
+                    center_mask=npc_center_mask,
+                )
+                placed_radii = [
+                    npc_radii[idx]
+                    for idx in placement.accepted_indices
+                    if 0 <= idx < len(npc_radii)
+                ]
+                if len(placed_radii) != len(placement.positions_xy):
+                    placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                if npc_bev_render_debug and npc_occ_image is not None:
+                    out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
+                    save_npc_bev_debug_image(
+                        scene_id=scene_id,
+                        label_id=label_id,
+                        frame_idx=idx,
+                        meta=npc_meta,
+                        occ_image=npc_occ_image,
+                        path_xy=path_xy,
+                        camera_xy=camera_position[:2],
+                        forward_xy=wedge_forward,
+                        npc_positions=placement.positions_xy,
+                        npc_radii=placed_radii,
+                        blocked_mask=npc_bloom_mask,
+                        bloom_radius_m=npc_bloom_radius_m,
+                        bloom_radius_px=npc_bloom_radius_px,
+                        config=npc_config,
+                        fov_deg=fov_deg,
+                        wedge_max_range=float(npc_wedge_max_range),
+                        achieved_coverage=placement.achieved_coverage,
+                        requested_count=placement.requested_count,
+                        shortfall=placement.shortfall,
+                        target_coverage=npc_config.target_coverage,
+                        mirror_bev_x=mirror_bev_x,
+                        mirror_bev_y=mirror_bev_y,
+                        out_path=out_path,
+                    )
+                npc_shortfall_total += placement.shortfall
+                for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                    entry_idx = (
+                        placement.accepted_indices[placement_idx]
+                        if placement_idx < len(placement.accepted_indices)
+                        else None
+                    )
+                    if entry_idx is None or entry_idx >= len(npc_entries):
+                        continue
+                    entry = npc_entries[entry_idx]
+                    npc_sequence = None
+                    npc_options = None
+                    base_npc_frame = None
+                    npc_ground_z = floor_z
+                    if npc_use_frame_pool:
+                        npc_entry = entry
+                        npc_sequence = npc_entry.sequence
+                        if not npc_sequence.frames:
+                            continue
+                        base_npc_frame = npc_sequence.frames[0]
+                        npc_ground_z = floor_z + npc_frame_pool.foot_offset
+                    else:
+                        npc_runtime = entry
+                        npc_sequence = npc_runtime.sequence
+                        npc_options = npc_runtime.options
+                        npc_num_frames = len(npc_sequence.frames)
+                        if npc_num_frames <= 0:
+                            continue
+                        npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1)))
+                        npc_anim_step = (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod
+                        npc_ground_z = floor_z + npc_options.foot_offset
+                    yaw = float(orient_rng.uniform(-math.pi, math.pi))
+                    rotation_np = rotation_matrix_z_np(yaw)
+                    translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
+                    transform = build_transform_matrix(rotation_np, translation_vec)
+                    if base_npc_frame is None:
+                        if npc_options.loop:
+                            npc_anim_idx = int((idx * npc_anim_step + placement_idx) % npc_num_frames)
+                        else:
+                            npc_anim_idx = min(
+                                int(idx * npc_anim_step + placement_idx),
+                                max(npc_num_frames - 1, 0),
+                            )
+                        base_npc_frame = npc_sequence.frames[npc_anim_idx]
+                    npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                    npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
+                    if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                        npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
 
         if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
             actor_vertices = _build_actor_debug_vertices(actor_data, sequence)
@@ -3268,6 +3880,14 @@ def render_path_frames(
     npc_forward_fn=None,
     npc_goal_xy: np.ndarray | None = None,
     npc_actor_runtime: ActorRuntime | None = None,
+    npc_actor_pool: NPCActorPool | None = None,
+    npc_frame_pool: NPCFramePool | None = None,
+    npc_bev_render_debug: bool = False,
+    npc_occ_image: np.ndarray | None = None,
+    npc_center_mask: np.ndarray | None = None,
+    npc_bloom_mask: np.ndarray | None = None,
+    npc_bloom_radius_m: float | None = None,
+    npc_bloom_radius_px: int | None = None,
 ) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
@@ -3302,12 +3922,17 @@ def render_path_frames(
     positions = [
         np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
     ]
+    npc_has_actor = (
+        npc_actor_runtime is not None
+        or npc_actor_pool is not None
+        or npc_frame_pool is not None
+    )
     npc_enabled = (
         npc_render
         and npc_config is not None
         and npc_free_mask is not None
         and npc_meta is not None
-        and npc_actor_runtime is not None
+        and npc_has_actor
     )
     npc_goal = npc_goal_xy if npc_goal_xy is not None else (path_xy[-1] if path_xy else None)
     npc_wedge_max_range = None
@@ -3319,6 +3944,31 @@ def render_path_frames(
             else (npc_config.max_distance_from_camera if npc_config.max_distance_from_camera is not None else 5.0)
         )
         npc_wedge_max_range = float(npc_wedge_max_range)
+    npc_center_mask = npc_center_mask if npc_center_mask is not None else npc_free_mask
+    if npc_bloom_radius_m is None and npc_config is not None:
+        npc_bloom_radius_m = float(npc_config.clearance_radius)
+    if npc_bloom_radius_px is None and npc_bloom_radius_m is not None and npc_meta is not None:
+        npc_bloom_radius_px = max(1, _meters_to_px_ceil(npc_meta, npc_bloom_radius_m))
+    if npc_bev_render_debug and npc_bloom_mask is None and npc_free_mask is not None and verbose:
+        print("[WARN] npc_bev_render_debug missing bloom mask; overlay disabled.", flush=True)
+    npc_use_actor_pool = npc_actor_pool is not None
+    npc_use_frame_pool = npc_frame_pool is not None
+    npc_sequence = (
+        npc_actor_runtime.sequence
+        if npc_enabled and not npc_use_actor_pool and not npc_use_frame_pool
+        else None
+    )
+    npc_options = (
+        npc_actor_runtime.options
+        if npc_enabled and not npc_use_actor_pool and not npc_use_frame_pool
+        else None
+    )
+    npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1))) if npc_options is not None else 1
+    npc_anim_step = (
+        (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod if npc_options is not None else 0.0
+    )
+    npc_num_frames = len(npc_sequence.frames) if npc_sequence is not None else 0
+    npc_shortfall_total = 0
 
     scene_vertices: np.ndarray | None = None
     scene_dtype: np.dtype | None = None
@@ -3329,10 +3979,13 @@ def render_path_frames(
         combined_tmp_dir = output_dir / scene_id / "__tmp_actor_combined"
 
     dump_options: ActorDumpOptions | None = None
-    if actor_dump_only and actor_runtime is None:
-        raise ValueError("--actor-dump-only requires an animated actor sequence.")
-    if actor_dump_only and hide_actor_enabled:
-        raise ValueError("--actor-dump-only is incompatible with --hide-actor.")
+    npc_dump_ok = npc_render and (
+        npc_actor_runtime is not None or npc_actor_pool is not None or npc_frame_pool is not None
+    )
+    if actor_dump_only and actor_runtime is None and not npc_dump_ok:
+        raise ValueError("--actor-dump-only requires an animated actor sequence or --npc-render.")
+    if actor_dump_only and hide_actor_enabled and actor_runtime is not None:
+        raise ValueError("--actor-dump-only is incompatible with --hide-actor when an actor is present.")
     if actor_dump_root is not None:
         label_dump_dir = actor_dump_root / scene_id / json_path.stem
         max_frames_opt: int | None = None
@@ -3383,6 +4036,7 @@ def render_path_frames(
     frames_dir = output_dir / scene_id / json_path.stem
     video_dir = output_dir / scene_id
     video_path = video_dir / f"{json_path.stem}.mp4"
+    npc_bev_render_dir = frames_dir / "__npc_bev_debug_render"
     
     # Always create frames_dir since per-frame outputs (camera/depth/RGB) live there.
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -3514,6 +4168,8 @@ def render_path_frames(
                         npc_forward_fn=npc_forward_fn,
                         npc_goal=npc_goal,
                         npc_actor_runtime=npc_actor_runtime,
+                        npc_actor_pool=npc_actor_pool,
+                        npc_frame_pool=npc_frame_pool,
                     )
                     frames_rendered = len(cam_seq)
                 if render_bev:
@@ -3568,12 +4224,34 @@ def render_path_frames(
                         flush=True,
                     )
 
+                frame_prefix = "frame"
+                dump_enabled = dump_options is not None and dump_options.directory is not None
+                dump_stride = max(dump_options.stride, 1) if dump_enabled else 1
+                dump_max = dump_options.max_frames if dump_enabled else None
+                dump_count = 0
+                scene_debug_vertices = None
+                if dump_enabled and dump_options.include_scene:
+                    scene_array = np.array(scene_template.data, copy=False)
+                    scene_debug_vertices = _build_scene_debug_vertices(scene_array.copy())
+
+                combined_model: CombinedGaussianModel | None = None
+                combined_actor_size: int | None = None
+                scene_rest_dim = int(gaussians.get_features_rest.shape[1]) if gpu_only and npc_enabled else 0
+                frame_gaussians: GaussianModel | None = None
+                combined_tmp_path: Path | None = None
+                if not gpu_only and npc_enabled:
+                    if combined_tmp_dir is None:
+                        raise ValueError("CPU compositor requires scene vertex data; rerun without --gpu-only.")
+                    combined_tmp_dir.mkdir(parents=True, exist_ok=True)
+                    combined_tmp_path = combined_tmp_dir / f"{json_path.stem}_combined.ply"
+                    frame_gaussians = GaussianModel(sh_degree=gaussians.max_sh_degree)
+
                 for idx, position in enumerate(positions):
-                    if view_mode == "forward":
+                    forward: np.ndarray | None = None
+                    if view_mode == "forward" or npc_enabled:
                         forward = forward_direction(positions, idx, window=direction_window)
                         if np.linalg.norm(forward[:2]) < EPS:
                             forward = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-
                         if stabilize and prev_forward is not None:
                             blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + forward * FORWARD_SMOOTH_BLEND
                             blended_norm = float(np.linalg.norm(blended))
@@ -3582,6 +4260,197 @@ def render_path_frames(
                                 forward[2] = 0.0
                         prev_forward = forward.copy()
 
+                    npc_actor_frames: list[ActorRenderFrame] = []
+                    npc_vertex_entries: list[np.ndarray] = []
+                    npc_debug_vertices: list[np.ndarray] = []
+                    if npc_enabled and npc_wedge_max_range is not None and forward is not None:
+                        if not npc_use_actor_pool and not npc_use_frame_pool and npc_num_frames <= 0:
+                            pass
+                        else:
+                            wedge_forward = forward[:2]
+                            norm_fwd = float(np.linalg.norm(wedge_forward))
+                            if norm_fwd < EPS:
+                                wedge_forward = np.array([0.0, 1.0], dtype=np.float32)
+                            else:
+                                wedge_forward = (wedge_forward / norm_fwd).astype(np.float32)
+                            wedge = CameraWedge(
+                                origin_xy=position[:2],
+                                forward_xy=wedge_forward,
+                                fov_deg=fov_deg,
+                                max_range=float(npc_wedge_max_range),
+                                min_range=npc_config.min_center_distance,
+                            )
+                            npc_seed = _npc_frame_seed(npc_seed_base, scene_id, json_path.stem, idx)
+                            rng = np.random.default_rng(npc_seed)
+                            orient_rng = np.random.default_rng(npc_seed + 1)
+                            actor_rng = np.random.default_rng(npc_seed + 2)
+                            target_count, _ = estimate_npc_target_count(
+                                wedge=wedge,
+                                config=npc_config,
+                                radius_m=npc_config.clearance_radius,
+                            )
+                            npc_entries: list[ActorRuntime | NPCFrameEntry] = []
+                            npc_radii: list[float] = []
+                            if target_count > 0:
+                                for _ in range(target_count):
+                                    if npc_use_frame_pool:
+                                        npc_entry = (
+                                            npc_frame_pool.get_entry(actor_rng)
+                                            if npc_frame_pool is not None
+                                            else None
+                                        )
+                                        if npc_entry is None:
+                                            continue
+                                        npc_entries.append(npc_entry)
+                                        radius = (
+                                            npc_entry.radius_xy
+                                            if npc_entry.radius_xy > 0
+                                            else npc_config.clearance_radius
+                                        )
+                                        npc_radii.append(radius)
+                                    else:
+                                        npc_runtime = (
+                                            npc_actor_pool.get_runtime(actor_rng)
+                                            if npc_use_actor_pool
+                                            else npc_actor_runtime
+                                        )
+                                        if npc_runtime is None:
+                                            continue
+                                        npc_entries.append(npc_runtime)
+                                        radius = (
+                                            npc_runtime.sequence.radius_xy
+                                            if npc_runtime.sequence.radius_xy > 0
+                                            else npc_config.clearance_radius
+                                        )
+                                        npc_radii.append(radius)
+                            placement = plan_npc_positions(
+                                wedge=wedge,
+                                free_mask=npc_free_mask,
+                                meta=npc_meta,
+                                rng=rng,
+                                config=npc_config,
+                                goal_xy=npc_goal,
+                                exclude_discs=[],
+                                radii_m=npc_radii,
+                                center_mask=npc_center_mask,
+                            )
+                            placed_radii = [
+                                npc_radii[idx]
+                                for idx in placement.accepted_indices
+                                if 0 <= idx < len(npc_radii)
+                            ]
+                            if len(placed_radii) != len(placement.positions_xy):
+                                placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                            if npc_bev_render_debug and npc_occ_image is not None:
+                                out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
+                                save_npc_bev_debug_image(
+                                    scene_id=scene_id,
+                                    label_id=json_path.stem,
+                                    frame_idx=idx,
+                                    meta=npc_meta,
+                                    occ_image=npc_occ_image,
+                                    path_xy=path_xy,
+                                    camera_xy=position[:2],
+                                    forward_xy=wedge_forward,
+                                    npc_positions=placement.positions_xy,
+                                    npc_radii=placed_radii,
+                                    blocked_mask=npc_bloom_mask,
+                                    bloom_radius_m=npc_bloom_radius_m,
+                                    bloom_radius_px=npc_bloom_radius_px,
+                                    config=npc_config,
+                                    fov_deg=fov_deg,
+                                    wedge_max_range=float(npc_wedge_max_range),
+                                    achieved_coverage=placement.achieved_coverage,
+                                    requested_count=placement.requested_count,
+                                    shortfall=placement.shortfall,
+                                    target_coverage=npc_config.target_coverage,
+                                    mirror_bev_x=mirror_bev_x,
+                                    mirror_bev_y=mirror_bev_y,
+                                    out_path=out_path,
+                                )
+                            npc_shortfall_total += placement.shortfall
+                            if verbose and placement.shortfall > 0:
+                                print(
+                                    f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
+                                    flush=True,
+                                )
+                            for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                                entry_idx = (
+                                    placement.accepted_indices[placement_idx]
+                                    if placement_idx < len(placement.accepted_indices)
+                                    else None
+                                )
+                                if entry_idx is None or entry_idx >= len(npc_entries):
+                                    continue
+                                entry = npc_entries[entry_idx]
+                                npc_sequence = None
+                                npc_options = None
+                                base_npc_frame = None
+                                npc_ground_z = floor_z
+                                if npc_use_frame_pool:
+                                    npc_entry = entry
+                                    npc_sequence = npc_entry.sequence
+                                    if not npc_sequence.frames:
+                                        continue
+                                    base_npc_frame = npc_sequence.frames[0]
+                                    npc_ground_z = floor_z + npc_frame_pool.foot_offset
+                                else:
+                                    npc_runtime = entry
+                                    npc_sequence = npc_runtime.sequence
+                                    npc_options = npc_runtime.options
+                                    npc_num_frames = len(npc_sequence.frames)
+                                    if npc_num_frames <= 0:
+                                        continue
+                                    npc_cycle_mod = max(1, int(getattr(npc_options, "animation_cycle_mod", 1)))
+                                    npc_anim_step = (npc_options.fps / float(DEFAULT_VIDEO_FPS)) * npc_cycle_mod
+                                    npc_ground_z = floor_z + npc_options.foot_offset
+                                yaw = float(orient_rng.uniform(-math.pi, math.pi))
+                                rotation_np = rotation_matrix_z_np(yaw)
+                                translation_vec = np.array([npc_xy[0], npc_xy[1], npc_ground_z], dtype=np.float64)
+                                transform = build_transform_matrix(rotation_np, translation_vec)
+                                if base_npc_frame is None:
+                                    if npc_options.loop:
+                                        npc_anim_idx = int((idx * npc_anim_step + placement_idx) % npc_num_frames)
+                                    else:
+                                        npc_anim_idx = min(
+                                            int(idx * npc_anim_step + placement_idx),
+                                            max(npc_num_frames - 1, 0),
+                                        )
+                                    base_npc_frame = npc_sequence.frames[npc_anim_idx]
+                                npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                                if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                                    npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
+                                if gpu_only:
+                                    npc_actor_frames.append(
+                                        actor_data_to_tensors(
+                                            npc_data,
+                                            npc_sequence,
+                                            device,
+                                            verbose=False,
+                                            target_rest_dim=scene_rest_dim,
+                                        )
+                                    )
+                                else:
+                                    npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
+
+                    if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
+                        entries: list[np.ndarray] = []
+                        if scene_debug_vertices is not None and scene_debug_vertices.size > 0:
+                            entries.append(scene_debug_vertices)
+                        if npc_debug_vertices:
+                            entries.extend(npc_debug_vertices)
+                        if entries:
+                            debug_vertices = entries[0] if len(entries) == 1 else np.concatenate(entries, axis=0)
+                            dump_path = dump_options.directory / f"{frame_prefix}_{idx:04d}.ply"
+                            _write_debug_ply(dump_path, debug_vertices)
+                            dump_count += 1
+
+                    if dump_options is not None and dump_options.dump_only:
+                        continue
+
+                    if view_mode == "forward":
+                        if forward is None:
+                            forward = forward_direction(positions, idx, window=direction_window)
                         target_xy = position[:2] + forward[:2] * look_ahead
                         target_z = position[2] - look_down
                         target_z = max(target_z, floor_z + 0.05)
@@ -3609,12 +4478,41 @@ def render_path_frames(
                     else:
                         raise ValueError(f"Unsupported view mode: {view_mode}")
 
+                    render_gaussians = gaussians
+                    merged_render: ActorRenderFrame | None = None
+                    if gpu_only and npc_actor_frames:
+                        merged_render = (
+                            _concat_actor_frames(npc_actor_frames)
+                            if len(npc_actor_frames) > 1
+                            else npc_actor_frames[0]
+                        )
+                        current_actor_size = int(merged_render.xyz.shape[0])
+                        if combined_model is None or combined_actor_size != current_actor_size:
+                            combined_model = CombinedGaussianModel(gaussians, merged_render)
+                            combined_actor_size = current_actor_size
+                        else:
+                            combined_model.update_actor(merged_render)
+                        render_gaussians = combined_model
+                    elif not gpu_only and npc_vertex_entries:
+                        if (
+                            scene_vertices is None
+                            or scene_dtype is None
+                            or combined_tmp_dir is None
+                            or frame_gaussians is None
+                            or combined_tmp_path is None
+                        ):
+                            raise ValueError("CPU compositor requires scene vertex data; rerun without --gpu-only.")
+                        combined_vertices = ply_utils.concat_vertices(scene_vertices, *npc_vertex_entries)
+                        scene_template.write(combined_vertices, combined_tmp_path)
+                        frame_gaussians.load_ply(str(combined_tmp_path))
+                        render_gaussians = frame_gaussians
+
                     with _cuda_oom_trace(
                         f"Scene {scene_id} / {json_path.stem}: base render_or frame {idx}",
                         device,
                         verbose,
                     ):
-                        img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
+                        img_pkg = render_or(camera, render_gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
                     render = img_pkg["render"].detach().cpu().numpy()
                     render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
                     if orthographic:
@@ -3675,6 +4573,9 @@ def render_path_frames(
 
                     if metrics_recorder is not None:
                         metrics_recorder.sample_vram()
+                    if gpu_only and merged_render is not None:
+                        del merged_render
+                        torch.cuda.empty_cache()
 
                     if verbose and (idx % 10 == 0 or idx == total_positions - 1):
                         print(
@@ -3682,6 +4583,11 @@ def render_path_frames(
                             flush=True,
                         )
                 frames_rendered = total_positions
+                if npc_enabled and verbose and npc_shortfall_total > 0:
+                    print(
+                        f"[VERBOSE] Scene {scene_id} / {json_path.stem}: NPC placement shortfall total {npc_shortfall_total}.",
+                        flush=True,
+                    )
 
             if verbose:
                 print(
@@ -4126,6 +5032,12 @@ def parse_args() -> ArgumentParser:
         help="Only generate NPC placement BEV debug images (skip rendering).",
     )
     parser.add_argument(
+        "--npc-bev-render-debug",
+        action="store_true",
+        default=False,
+        help="Write per-frame NPC BEV debug images using actual rendered placements.",
+    )
+    parser.add_argument(
         "--npc-render",
         action="store_true",
         default=False,
@@ -4135,7 +5047,7 @@ def parse_args() -> ArgumentParser:
         "--npc-actor-dir",
         type=Path,
         default=None,
-        help="Optional actor sequence directory for NPCs (defaults to --actor-seq-dir or first child of --npc-actor-root).",
+        help="Optional NPC actor directory (used as the frame root when --npc-frame-pool-size > 0).",
     )
     parser.add_argument(
         "--npc-bev-output-dir",
@@ -4191,7 +5103,7 @@ def parse_args() -> ArgumentParser:
         "--npc-min-distance",
         type=float,
         default=1.0,
-        help="Minimum radial distance from the camera when placing NPCs (default: 1.0 m).",
+        help="Minimum camera-to-NPC-center distance before adding radius (default: 1.0 m).",
     )
     parser.add_argument(
         "--npc-max-range",
@@ -4218,16 +5130,46 @@ def parse_args() -> ArgumentParser:
         help="Interpret free space as white pixels >= threshold (default: on). Disable to treat dark pixels <= threshold as free.",
     )
     parser.add_argument(
+        "--npc-wall-mask",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Constrain NPC placement to wall_mask.png when present (default: on).",
+    )
+    parser.add_argument(
+        "--npc-wall-threshold",
+        type=int,
+        default=128,
+        help="Threshold for wall_mask.png free space (default: 128).",
+    )
+    parser.add_argument(
+        "--npc-wall-white",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Treat wall_mask.png white pixels as allowed space (default: on).",
+    )
+    parser.add_argument(
         "--npc-auto-clearance",
         action=BooleanOptionalAction,
         default=False,
-        help="Derive NPC clearance from HumanGS sources (trimmed mean radius) and override the default clearance if larger.",
+        help="Derive NPC clearance from SHHQ sources (trimmed mean radius) and override the default clearance if larger.",
     )
     parser.add_argument(
         "--npc-actor-root",
         type=Path,
-        default=BASE_DIR / "data" / "human_gs_source",
-        help="Root directory of HumanGS actor sources for auto clearance computation.",
+        default=BASE_DIR / "data" / "SHHQ_gs" / "walking",
+        help="Root directory of SHHQ actor sources for NPC frame pooling and auto clearance (e.g., ./data/SHHQ_gs).",
+    )
+    parser.add_argument(
+        "--npc-random-actors",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Randomize NPC actor sequences per NPC (ignored when --npc-frame-pool-size > 0).",
+    )
+    parser.add_argument(
+        "--npc-frame-pool-size",
+        type=int,
+        default=50,
+        help="Number of NPC PLY frames to preload per worker (0 to disable and use actor sequences).",
     )
     parser.add_argument(
         "--npc-radius-samples",
@@ -4307,6 +5249,9 @@ def main() -> None:
     npc_render_enabled = bool(args.npc_render)
     actor_runtime: ActorRuntime | None = None
     npc_actor_runtime: ActorRuntime | None = None
+    npc_actor_pool: NPCActorPool | None = None
+    npc_frame_pool: NPCFramePool | None = None
+    npc_frame_pool_size = max(0, int(args.npc_frame_pool_size))
     gpu_only_enabled = bool(args.gpu_only)
     actor_dump_root = args.actor_dump_ply_dir
     actor_dump_stride = max(1, int(args.actor_dump_stride))
@@ -4338,6 +5283,7 @@ def main() -> None:
         }
     npc_bev_enabled = bool(args.npc_bev_debug or args.npc_bev_debug_only)
     npc_bev_only = bool(args.npc_bev_debug_only)
+    npc_bev_render_debug = bool(args.npc_bev_render_debug)
     npc_bev_output_root: Path = args.npc_bev_output_dir if args.npc_bev_output_dir is not None else args.output_dir
     try:
         zone_ratio = _parse_zone_ratio(str(args.npc_zone_ratio))
@@ -4345,7 +5291,7 @@ def main() -> None:
         raise SystemExit(f"Invalid --npc-zone-ratio: {exc}") from exc
     npc_density_config = NPCDensityConfig(
         clearance_radius=float(args.npc_clearance),
-        min_distance_from_camera=float(args.npc_min_distance),
+        min_center_distance=float(args.npc_min_distance),
         max_distance_from_camera=float(args.npc_max_range) if args.npc_max_range is not None and float(args.npc_max_range) > 0 else None,
         target_coverage=float(args.npc_density_coverage) if args.npc_density_coverage is not None else None,
         max_npcs=int(args.npc_max_count) if args.npc_max_count is not None and int(args.npc_max_count) > 0 else None,
@@ -4366,7 +5312,7 @@ def main() -> None:
             )
             if auto_radius > npc_density_config.clearance_radius:
                 npc_density_config.clearance_radius = auto_radius
-            print(f"  [NPC] Auto clearance radius: {auto_radius:.3f} m (using HumanGS sources)", flush=True)
+            print(f"  [NPC] Auto clearance radius: {auto_radius:.3f} m (using SHHQ sources)", flush=True)
         except Exception as exc:  # pylint: disable=broad-except
             print(f"  [WARN] Failed to auto-compute NPC clearance; using {npc_density_config.clearance_radius:.3f} m. Reason: {exc}", flush=True)
     npc_forward_fn = get_forward_fn(args)
@@ -4408,51 +5354,175 @@ def main() -> None:
             )
 
     if npc_render_enabled:
-        npc_actor_dir: Path | None = args.npc_actor_dir
-        if npc_actor_dir is None:
-            npc_actor_dir = args.actor_seq_dir or _first_actor_subdir(args.npc_actor_root)
-        if npc_actor_dir is None:
+        npc_random_actors = bool(args.npc_random_actors)
+        npc_follow_distance = max(float(args.follow_distance), 0.0)
+        npc_follow_buffer = max(float(args.follow_buffer), 0.0)
+        if npc_follow_buffer > npc_follow_distance:
             print(
-                "[WARN] NPC rendering requested but no actor sequence found (set --npc-actor-dir or --actor-seq-dir); disabling NPCs.",
+                "[WARN] NPC follow buffer "
+                f"{npc_follow_buffer:.3f} > follow distance {npc_follow_distance:.3f}; "
+                f"clamping buffer to {npc_follow_distance:.3f}.",
                 flush=True,
             )
-            npc_render_enabled = False
-        elif actor_runtime is not None and npc_actor_dir.resolve() == actor_runtime.options.sequence_dir.resolve():
-            npc_actor_runtime = actor_runtime
-            if verbose_enabled:
+            npc_follow_buffer = npc_follow_distance
+
+        if npc_frame_pool_size > 0:
+            frame_root = args.npc_actor_dir or args.npc_actor_root
+            if args.npc_actor_dir is not None:
+                frame_paths = list_actor_frame_paths_in_dir(
+                    args.npc_actor_dir,
+                    pattern=args.actor_pattern,
+                )
+            else:
+                frame_paths = list_actor_frame_paths_recursive(
+                    args.npc_actor_root,
+                    pattern=args.actor_pattern,
+                )
+                if args.actor_seq_dir is not None:
+                    frame_paths.extend(
+                        list_actor_frame_paths_in_dir(
+                            args.actor_seq_dir,
+                            pattern=args.actor_pattern,
+                        )
+                    )
+
+            seen_paths: set[Path] = set()
+            deduped_frames: list[Path] = []
+            for frame_path in frame_paths:
+                resolved = frame_path.resolve()
+                if resolved in seen_paths:
+                    continue
+                seen_paths.add(resolved)
+                deduped_frames.append(frame_path)
+
+            if not deduped_frames:
                 print(
-                    f"[VERBOSE] NPC rendering will reuse actor sequence: {npc_actor_dir}",
+                    "[WARN] NPC rendering requested but no PLY frames found under --npc-actor-root; disabling NPCs.",
                     flush=True,
                 )
+                npc_render_enabled = False
+            else:
+                npc_frame_pool = NPCFramePool(
+                    frame_paths=deduped_frames,
+                    pool_size=npc_frame_pool_size,
+                    height=float(args.actor_height),
+                    foot_offset=float(args.actor_foot_offset),
+                    debug=debug_enabled,
+                    verbose=verbose_enabled,
+                )
+                pool_seed = _npc_pool_seed(int(args.npc_seed), args.job_slot, args.job_name)
+                npc_frame_pool.populate(np.random.default_rng(pool_seed))
+                if not npc_frame_pool.entries:
+                    print(
+                        "[WARN] NPC frame pool failed to load any frames; disabling NPCs.",
+                        flush=True,
+                    )
+                    npc_render_enabled = False
+                elif verbose_enabled:
+                    print(
+                        f"[VERBOSE] NPC frame pool ready: {len(npc_frame_pool.entries)} "
+                        f"frame(s) from {frame_root}.",
+                        flush=True,
+                    )
         else:
-            npc_actor_options = ActorOptions(
-                sequence_dir=npc_actor_dir,
-                pattern=args.actor_pattern,
-                height=float(args.actor_height),
-                follow_distance=float(args.follow_distance),
-                buffer_distance=float(args.follow_buffer),
-                speed=float(args.actor_speed),
-                fps=float(args.actor_fps),
-                loop=bool(args.actor_loop),
-                foot_offset=float(args.actor_foot_offset),
-                animation_cycle_mod=int(args.animation_cycle_mod),
-            )
-            if npc_actor_options.fps <= 0.0:
+            if float(args.actor_fps) <= 0.0:
                 raise ValueError("NPC actor FPS must be positive.")
-            if npc_actor_options.speed <= 0.0:
+            if float(args.actor_speed) <= 0.0:
                 raise ValueError("NPC actor walking speed must be positive.")
-            if npc_actor_options.buffer_distance > npc_actor_options.follow_distance:
-                raise ValueError("NPC follow buffer must be less than or equal to follow distance.")
-            npc_actor_sequence = load_actor_sequence(
-                npc_actor_options,
-                debug=debug_enabled,
-            )
-            npc_actor_runtime = ActorRuntime(options=npc_actor_options, sequence=npc_actor_sequence)
-            if verbose_enabled:
-                print(
-                    f"[VERBOSE] NPC actor sequence ready: {len(npc_actor_sequence.frames)} frames from {npc_actor_dir}.",
-                    flush=True,
-                )
+
+            npc_actor_dir: Path | None = args.npc_actor_dir
+            if npc_random_actors and npc_actor_dir is None:
+                npc_actor_dirs = _list_actor_subdirs(args.npc_actor_root, pattern=args.actor_pattern)
+                if args.actor_seq_dir is not None:
+                    npc_actor_dirs.append(args.actor_seq_dir)
+                seen_dirs: set[Path] = set()
+                deduped_dirs: list[Path] = []
+                for actor_dir in npc_actor_dirs:
+                    resolved = actor_dir.resolve()
+                    if resolved in seen_dirs:
+                        continue
+                    seen_dirs.add(resolved)
+                    deduped_dirs.append(actor_dir)
+                if not deduped_dirs:
+                    print(
+                        "[WARN] NPC rendering requested but no actor sequences found under --npc-actor-root; disabling NPCs.",
+                        flush=True,
+                    )
+                    npc_render_enabled = False
+                else:
+                    npc_actor_pool = NPCActorPool(
+                        actor_dirs=deduped_dirs,
+                        pattern=args.actor_pattern,
+                        height=float(args.actor_height),
+                        follow_distance=npc_follow_distance,
+                        buffer_distance=npc_follow_buffer,
+                        speed=float(args.actor_speed),
+                        fps=float(args.actor_fps),
+                        loop=bool(args.actor_loop),
+                        foot_offset=float(args.actor_foot_offset),
+                        animation_cycle_mod=int(args.animation_cycle_mod),
+                        debug=debug_enabled,
+                        verbose=verbose_enabled,
+                    )
+                    if verbose_enabled:
+                        print(
+                            f"[VERBOSE] NPC actor pool ready: {len(deduped_dirs)} actor(s).",
+                            flush=True,
+                        )
+            else:
+                if npc_actor_dir is None:
+                    npc_actor_dir = args.actor_seq_dir or _first_actor_subdir(args.npc_actor_root)
+                if npc_actor_dir is None:
+                    print(
+                        "[WARN] NPC rendering requested but no actor sequence found (set --npc-actor-dir or --actor-seq-dir); disabling NPCs.",
+                        flush=True,
+                    )
+                    npc_render_enabled = False
+                elif actor_runtime is not None and npc_actor_dir.resolve() == actor_runtime.options.sequence_dir.resolve():
+                    npc_actor_runtime = actor_runtime
+                    if verbose_enabled:
+                        print(
+                            f"[VERBOSE] NPC rendering will reuse actor sequence: {npc_actor_dir}",
+                            flush=True,
+                        )
+                else:
+                    npc_actor_options = ActorOptions(
+                        sequence_dir=npc_actor_dir,
+                        pattern=args.actor_pattern,
+                        height=float(args.actor_height),
+                        follow_distance=npc_follow_distance,
+                        buffer_distance=npc_follow_buffer,
+                        speed=float(args.actor_speed),
+                        fps=float(args.actor_fps),
+                        loop=bool(args.actor_loop),
+                        foot_offset=float(args.actor_foot_offset),
+                        animation_cycle_mod=int(args.animation_cycle_mod),
+                    )
+                    if npc_actor_options.fps <= 0.0:
+                        raise ValueError("NPC actor FPS must be positive.")
+                    if npc_actor_options.speed <= 0.0:
+                        raise ValueError("NPC actor walking speed must be positive.")
+                    npc_actor_sequence = load_actor_sequence(
+                        npc_actor_options,
+                        debug=debug_enabled,
+                    )
+                    npc_actor_runtime = ActorRuntime(options=npc_actor_options, sequence=npc_actor_sequence)
+                    if verbose_enabled:
+                        print(
+                            f"[VERBOSE] NPC actor sequence ready: {len(npc_actor_sequence.frames)} frames from {npc_actor_dir}.",
+                            flush=True,
+                        )
+
+    npc_bloom_radius_m: float | None = None
+    if npc_bev_enabled or npc_bev_render_debug or npc_render_enabled:
+        npc_bloom_radius_m = _resolve_npc_bloom_radius_m(
+            config=npc_density_config,
+            frame_pool=npc_frame_pool,
+            actor_pool=npc_actor_pool,
+            actor_runtime=npc_actor_runtime,
+        )
+        if npc_bloom_radius_m is not None and npc_bloom_radius_m <= 0.0:
+            npc_bloom_radius_m = None
 
     if args.scene:
         scene_ids = list(dict.fromkeys(args.scene))
@@ -4543,14 +5613,40 @@ def main() -> None:
             processed_scenes += 1
             npc_free_mask = None
             npc_occ_image = None
-            if npc_bev_enabled or npc_render_enabled:
+            npc_bloom_free_mask = None
+            npc_bloom_mask = None
+            npc_bloom_radius_px: int | None = None
+            if npc_bev_enabled or npc_bev_render_debug or npc_render_enabled:
                 try:
                     npc_free_mask, _ = load_free_space_mask(
                         dataset_dir,
                         threshold=int(args.npc_free_threshold),
                         free_is_white=bool(args.npc_free_white),
                     )
-                    if npc_bev_enabled:
+                    if npc_free_mask is not None and bool(args.npc_wall_mask):
+                        try:
+                            wall_mask = load_wall_mask(
+                                dataset_dir,
+                                threshold=int(args.npc_wall_threshold),
+                                white_is_inside=bool(args.npc_wall_white),
+                            )
+                            if wall_mask.shape != npc_free_mask.shape:
+                                if verbose_enabled:
+                                    print(
+                                        f"  [NPC] wall_mask.png shape {wall_mask.shape} does not match occupancy {npc_free_mask.shape}; ignoring wall mask.",
+                                        flush=True,
+                                    )
+                            else:
+                                npc_free_mask = npc_free_mask & wall_mask
+                                if verbose_enabled:
+                                    print(
+                                        f"  [NPC] Wall mask applied (threshold={args.npc_wall_threshold}).",
+                                        flush=True,
+                                    )
+                        except FileNotFoundError:
+                            if verbose_enabled:
+                                print("  [NPC] wall_mask.png not found; skipping wall constraint.", flush=True)
+                    if npc_bev_enabled or npc_bev_render_debug:
                         occ_img = imageio.imread(dataset_dir / "occupancy.png")
                         npc_occ_image = _ensure_rgb(np.array(occ_img))
                     print(f"  [NPC] Free-space mask ready (threshold={args.npc_free_threshold}).", flush=True)
@@ -4558,6 +5654,28 @@ def main() -> None:
                     print(f"  [WARN] NPC features disabled for {scene_id}: {exc}", flush=True)
                     npc_free_mask = None
                     npc_occ_image = None
+
+            if npc_free_mask is not None and npc_bloom_radius_m is not None:
+                npc_bloom_radius_px = max(1, _meters_to_px_ceil(meta, npc_bloom_radius_m))
+                clearance_px = compute_clearance_distance(npc_free_mask)
+                if clearance_px is None:
+                    if verbose_enabled:
+                        print(
+                            "  [WARN] NPC bloom mask needs scipy; using raw free-space mask.",
+                            flush=True,
+                        )
+                    npc_bloom_free_mask = npc_free_mask
+                else:
+                    npc_bloom_mask = npc_free_mask & (clearance_px <= npc_bloom_radius_px)
+                    npc_bloom_free_mask = npc_free_mask & (clearance_px > npc_bloom_radius_px)
+            if npc_free_mask is not None and npc_bloom_free_mask is None:
+                npc_bloom_free_mask = npc_free_mask
+            if verbose_enabled and npc_bloom_radius_m is not None and npc_bloom_radius_px is not None:
+                print(
+                    f"  [NPC] Bloom radius (max loaded): {npc_bloom_radius_m:.3f} m "
+                    f"({npc_bloom_radius_px}px).",
+                    flush=True,
+                )
 
             if debug_enabled:
                 if label_dir == scene_task_root:
@@ -4637,6 +5755,28 @@ def main() -> None:
                     f"    [{label_idx:03d}/{total_labels:03d}/{total_paths_found:03d}] -> {json_path.stem}",
                     flush=True,
                 )
+                if (
+                    (npc_bev_enabled or npc_bev_render_debug)
+                    and npc_bloom_mask is not None
+                    and npc_occ_image is not None
+                    and npc_bloom_radius_m is not None
+                    and npc_bloom_radius_px is not None
+                ):
+                    bloom_dir = npc_bev_output_root / scene_id / json_path.stem / "__npc_bev_bloom"
+                    bloom_path = bloom_dir / "npc_bloom.png"
+                    save_npc_bloom_debug_image(
+                        scene_id=scene_id,
+                        label_id=json_path.stem,
+                        frame_idx=0,
+                        meta=meta,
+                        occ_image=npc_occ_image,
+                        bloom_mask=npc_bloom_mask,
+                        bloom_radius_m=float(npc_bloom_radius_m),
+                        bloom_radius_px=int(npc_bloom_radius_px),
+                        out_path=bloom_path,
+                    )
+                    if verbose_enabled:
+                        print(f"[VERBOSE] NPC bloom debug -> {bloom_path}", flush=True)
                 if npc_bev_enabled and npc_free_mask is not None and npc_occ_image is not None:
                     npc_summary = generate_npc_bev_debug_for_path(
                         scene_id=scene_id,
@@ -4645,6 +5785,10 @@ def main() -> None:
                         meta=meta,
                         occ_image=npc_occ_image,
                         free_mask=npc_free_mask,
+                        center_mask=npc_bloom_free_mask,
+                        bloom_mask=npc_bloom_mask,
+                        bloom_radius_m=npc_bloom_radius_m,
+                        bloom_radius_px=npc_bloom_radius_px,
                         config=npc_density_config,
                         fov_deg=float(args.fov_deg),
                         seed_base=int(args.npc_seed),
@@ -4706,7 +5850,7 @@ def main() -> None:
                         actor_runtime=actor_runtime,
                         default_follow_distance=float(args.follow_distance),
                         verbose=verbose_enabled,
-                        hide_actor_enabled = hide_actor_enabled,
+                        hide_actor_enabled=hide_actor_enabled,
                         render_bev=args.show_BEV,
                         mirror_bev_x=args.bev_mirror_x,
                         mirror_bev_y=args.bev_mirror_y,
@@ -4731,6 +5875,14 @@ def main() -> None:
                         npc_forward_fn=npc_forward_fn,
                         npc_goal_xy=prepared.path_xy[-1] if prepared.path_xy else None,
                         npc_actor_runtime=npc_actor_runtime,
+                        npc_actor_pool=npc_actor_pool,
+                        npc_frame_pool=npc_frame_pool,
+                        npc_bev_render_debug=npc_bev_render_debug,
+                        npc_occ_image=npc_occ_image,
+                        npc_center_mask=npc_bloom_free_mask,
+                        npc_bloom_mask=npc_bloom_mask,
+                        npc_bloom_radius_m=npc_bloom_radius_m,
+                        npc_bloom_radius_px=npc_bloom_radius_px,
                     )
                     record_path_status(scene_id, json_path.stem, STATUS_DONE, error=None)
                     if summary is not None:

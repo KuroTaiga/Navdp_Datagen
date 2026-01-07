@@ -8,6 +8,11 @@ from typing import Literal, Sequence
 import imageio.v2 as imageio
 import numpy as np
 
+try:
+    from scipy import ndimage as _ndimage
+except Exception:  # pragma: no cover - optional dependency
+    _ndimage = None
+
 from utils.render_utils import load_occupancy_metadata, world_to_pixel
 
 EPS = 1e-6
@@ -29,7 +34,7 @@ class NPCDensityConfig:
     """Knobs for NPC placement inside a camera wedge."""
 
     clearance_radius: float = 0.30  # meters
-    min_distance_from_camera: float = 1.0  # meters
+    min_center_distance: float = 1.0  # meters (camera -> NPC center, before adding radius)
     max_distance_from_camera: float | None = None  # meters (None => use wedge.max_range)
     target_coverage: float | None = None  # fraction of wedge area to occupy (0..1)
     max_npcs: int | None = None  # hard cap regardless of coverage target
@@ -54,6 +59,16 @@ class NPCPlacementResult:
     rejected_clearance: int
     rejected_oob: int
     shortfall: int
+    accepted_indices: list[int]
+
+
+def rgb_to_luma_u8(mask: np.ndarray) -> np.ndarray:
+    """Convert RGB mask to uint8 luma (Rec. 709); pass through non-RGB arrays."""
+    if mask.ndim == 3:
+        return np.round(
+            0.2126 * mask[..., 0] + 0.7152 * mask[..., 1] + 0.0722 * mask[..., 2]
+        ).astype(np.uint8)
+    return mask
 
 
 def load_free_space_mask(dataset_dir: Path, *, threshold: int = 128, free_is_white: bool = True) -> tuple[np.ndarray, dict]:
@@ -67,14 +82,20 @@ def load_free_space_mask(dataset_dir: Path, *, threshold: int = 128, free_is_whi
     if not occ_png.is_file():
         raise FileNotFoundError(f"Missing occupancy.png in {dataset_dir}")
 
-    mask = imageio.imread(occ_png)
-    if mask.ndim == 3:
-        # Convert RGB occupancy to luma
-        mask = np.round(
-            0.2126 * mask[..., 0] + 0.7152 * mask[..., 1] + 0.0722 * mask[..., 2]
-        ).astype(np.uint8)
+    mask = rgb_to_luma_u8(imageio.imread(occ_png))
     free = mask >= threshold if free_is_white else mask <= threshold
     return free.astype(bool), meta
+
+
+def load_wall_mask(dataset_dir: Path, *, threshold: int = 128, white_is_inside: bool = True) -> np.ndarray:
+    """Load wall_mask.png and return a boolean mask of allowed placement."""
+    wall_path = dataset_dir / "wall_mask.png"
+    if not wall_path.is_file():
+        raise FileNotFoundError(f"Missing wall_mask.png in {dataset_dir}")
+
+    mask = rgb_to_luma_u8(imageio.imread(wall_path))
+    allowed = mask >= threshold if white_is_inside else mask <= threshold
+    return allowed.astype(bool)
 
 
 def _normalize(vec: np.ndarray) -> np.ndarray:
@@ -163,6 +184,16 @@ def _inside_mask(meta: dict, free_mask: np.ndarray, xy: np.ndarray, radius_m: fl
     # Occupancy is free if all covered pixels are above the threshold
     return bool(np.all(region[circle]))
 
+def _inside_center_mask(meta: dict, center_mask: np.ndarray, xy: np.ndarray, free_pixel_min: int) -> bool:
+    """Check if xy is in-bounds and allowed by a pre-cleared center mask."""
+    h, w = center_mask.shape[:2]
+    u, v = world_to_pixel(meta, xy)
+    if u < 0 or v < 0 or u >= w or v >= h:
+        return False
+    if center_mask.dtype == bool:
+        return bool(center_mask[v, u])
+    return bool(center_mask[v, u] >= free_pixel_min)
+
 
 def _estimate_target_count(
     *,
@@ -196,6 +227,67 @@ def _estimate_target_count(
     if max_npcs is not None and max_npcs > 0:
         target = max_npcs if target == 0 else min(target, max_npcs)
     return target
+
+
+def estimate_npc_target_count(
+    *,
+    wedge: CameraWedge,
+    config: NPCDensityConfig,
+    radius_m: float | None = None,
+) -> tuple[int, int | None]:
+    """Estimate the desired NPC count and coverage cap for a wedge."""
+    base_min = max(config.min_center_distance, wedge.min_range)
+    r_max = (
+        wedge.max_range
+        if config.max_distance_from_camera is None
+        else min(wedge.max_range, config.max_distance_from_camera)
+    )
+    if r_max <= base_min:
+        return 0, 0
+
+    fov_rad = math.radians(wedge.fov_deg)
+    wedge_area = _wedge_area(fov_rad, base_min, r_max)
+    radius = float(radius_m) if radius_m is not None else float(config.clearance_radius)
+    disc_area = _disc_area(radius)
+
+    coverage_cap: int | None = None
+    if config.target_coverage is not None and config.target_coverage > 0.0:
+        cov = min(1.0, max(0.0, config.target_coverage))
+        if config.coverage_mode == "area":
+            coverage_cap = (
+                int(math.floor(cov * wedge_area / disc_area))
+                if wedge_area > 0.0 and disc_area > 0.0
+                else 0
+            )
+        else:
+            ang = _disc_angular_width(radius, max(r_max, radius + EPS))
+            ang = min(ang, fov_rad)
+            coverage_cap = (
+                int(math.floor(cov * fov_rad / ang))
+                if ang > 0.0 and fov_rad > 0.0
+                else 0
+            )
+        coverage_cap = max(0, coverage_cap)
+
+    desired = config.desired_count if (config.desired_count is not None and config.desired_count > 0) else None
+    target_count = 0
+    if config.priority == "count":
+        if desired is not None:
+            target_count = desired
+        elif coverage_cap is not None:
+            target_count = coverage_cap
+    else:  # coverage priority
+        if coverage_cap is not None:
+            target_count = coverage_cap
+        elif desired is not None:
+            target_count = desired
+
+    if coverage_cap is not None and target_count > coverage_cap:
+        target_count = coverage_cap
+    if config.max_npcs is not None and config.max_npcs > 0:
+        target_count = min(target_count, config.max_npcs)
+
+    return target_count, coverage_cap
 
 
 def _zone_bounds(r_min: float, r_max: float) -> list[tuple[float, float]]:
@@ -240,6 +332,8 @@ def plan_npc_positions(
     config: NPCDensityConfig,
     goal_xy: np.ndarray | None = None,
     exclude_discs: Sequence[tuple[np.ndarray, float]] | None = None,
+    radii_m: Sequence[float] | None = None,
+    center_mask: np.ndarray | None = None,
 ) -> NPCPlacementResult:
     """
     Sample NPC positions inside the camera wedge with disc clearance.
@@ -248,12 +342,17 @@ def plan_npc_positions(
     It rejects candidates that collide with obstacles/other NPCs, fall outside the mask, or
     block the camera->goal segment when blocking is disabled. Optional exclude_discs are treated
     as occupied (collide but do not contribute to coverage).
+    If center_mask is provided, it is treated as a pre-cleared mask of allowed centers.
     """
     forward_xy = _normalize(wedge.forward_xy)
     fov_rad = math.radians(wedge.fov_deg)
-    r_min = max(config.min_distance_from_camera, wedge.min_range)
-    r_max = wedge.max_range if config.max_distance_from_camera is None else min(wedge.max_range, config.max_distance_from_camera)
-    if r_max <= r_min:
+    base_min = max(config.min_center_distance, wedge.min_range)
+    r_max = (
+        wedge.max_range
+        if config.max_distance_from_camera is None
+        else min(wedge.max_range, config.max_distance_from_camera)
+    )
+    if r_max <= base_min:
         return NPCPlacementResult(
             positions_xy=[],
             requested_count=0,
@@ -264,40 +363,24 @@ def plan_npc_positions(
             rejected_clearance=0,
             rejected_oob=0,
             shortfall=0,
+            accepted_indices=[],
         )
 
-    wedge_area = _wedge_area(fov_rad, r_min, r_max)
-    disc_area = _disc_area(config.clearance_radius)
-    coverage_cap: int | None = None
-    if config.target_coverage is not None and config.target_coverage > 0.0:
-        cov = min(1.0, max(0.0, config.target_coverage))
-        if config.coverage_mode == "area":
-            coverage_cap = int(math.floor(cov * wedge_area / disc_area)) if wedge_area > 0.0 and disc_area > 0.0 else 0
-        else:
-            ang = _disc_angular_width(config.clearance_radius, max(r_max, config.clearance_radius + EPS))
-            ang = min(ang, fov_rad)
-            coverage_cap = int(math.floor(cov * fov_rad / ang)) if ang > 0.0 and fov_rad > 0.0 else 0
-        coverage_cap = max(0, coverage_cap)
+    base_radius = max(float(config.clearance_radius), EPS)
+    target_count, coverage_cap = estimate_npc_target_count(
+        wedge=wedge,
+        config=config,
+        radius_m=base_radius,
+    )
+    if radii_m is not None:
+        radii = [max(float(r), EPS) for r in radii_m]
+        if config.max_npcs is not None and config.max_npcs > 0:
+            radii = radii[: config.max_npcs]
+        target_count = len(radii)
+    else:
+        radii = [base_radius] * target_count
 
-    desired = config.desired_count if (config.desired_count is not None and config.desired_count > 0) else None
-    target_count = 0
-    if config.priority == "count":
-        if desired is not None:
-            target_count = desired
-        elif coverage_cap is not None:
-            target_count = coverage_cap
-    else:  # coverage priority
-        if coverage_cap is not None:
-            target_count = coverage_cap
-        elif desired is not None:
-            target_count = desired
-
-    if coverage_cap is not None and target_count > coverage_cap:
-        target_count = coverage_cap
-    if config.max_npcs is not None and config.max_npcs > 0:
-        target_count = min(target_count, config.max_npcs)
-
-    if target_count <= 0:
+    if target_count <= 0 or not radii:
         return NPCPlacementResult(
             positions_xy=[],
             requested_count=0,
@@ -308,37 +391,57 @@ def plan_npc_positions(
             rejected_clearance=0,
             rejected_oob=0,
             shortfall=0,
+            accepted_indices=[],
         )
 
-    zones = _zone_bounds(r_min, r_max)
+    zones = _zone_bounds(base_min, r_max)
     effective_weights = config.zone_weights if target_count >= 12 else (1.0, 1.0, 1.0)
     zone_counts = _distribute_counts(target_count, effective_weights)
 
-    placements: list[np.ndarray] = []
+    placements: list[tuple[np.ndarray, float, int]] = []
     rejected_blocking = rejected_clearance = rejected_oob = 0
     attempts = 0
     max_attempts = max(config.max_resamples * max(target_count, 1), config.max_resamples)
+    radius_idx = 0
 
     for zone_idx, need in enumerate(zone_counts):
         z_min, z_max = zones[zone_idx]
-        while need > 0 and attempts < max_attempts:
+        while need > 0 and attempts < max_attempts and radius_idx < len(radii):
+            radius = radii[radius_idx]
+            min_center = base_min + radius
+            if min_center > r_max:
+                rejected_oob += 1
+                radius_idx += 1
+                need -= 1
+                continue
+            z_min_eff = max(z_min, min_center)
+            z_max_eff = max(z_min_eff, z_max)
             attempts += 1
             angle = rng.uniform(-0.5 * fov_rad, 0.5 * fov_rad)
-            r = math.sqrt(rng.uniform(z_min * z_min, z_max * z_max)) if z_max > z_min else z_min
+            r = (
+                math.sqrt(rng.uniform(z_min_eff * z_min_eff, z_max_eff * z_max_eff))
+                if z_max_eff > z_min_eff
+                else z_min_eff
+            )
             direction = _rotate(forward_xy, angle)
             candidate = wedge.origin_xy + direction * r
 
-            if not _inside_mask(meta, free_mask, candidate, config.clearance_radius, config.free_pixel_min):
-                rejected_oob += 1
-                continue
+            if center_mask is not None:
+                if not _inside_center_mask(meta, center_mask, candidate, config.free_pixel_min):
+                    rejected_oob += 1
+                    continue
+            else:
+                if not _inside_mask(meta, free_mask, candidate, radius, config.free_pixel_min):
+                    rejected_oob += 1
+                    continue
 
             too_close = any(
-                float(np.linalg.norm(candidate - placed)) < 2.0 * config.clearance_radius - EPS
-                for placed in placements
+                float(np.linalg.norm(candidate - placed)) < (radius + placed_radius - EPS)
+                for placed, placed_radius, _ in placements
             )
             if not too_close and exclude_discs:
-                for center, radius in exclude_discs:
-                    if float(np.linalg.norm(candidate - center)) < (radius + config.clearance_radius - EPS):
+                for center, exclude_radius in exclude_discs:
+                    if float(np.linalg.norm(candidate - center)) < (exclude_radius + radius - EPS):
                         too_close = True
                         break
             if too_close:
@@ -348,29 +451,32 @@ def plan_npc_positions(
             if (
                 not config.allow_blocking
                 and goal_xy is not None
-                and _blocks_goal(wedge.origin_xy, goal_xy, candidate, config.clearance_radius)
+                and _blocks_goal(wedge.origin_xy, goal_xy, candidate, radius)
             ):
                 rejected_blocking += 1
                 continue
 
-            placements.append(candidate.astype(np.float32))
+            placements.append((candidate.astype(np.float32), radius, radius_idx))
+            radius_idx += 1
             need -= 1
 
     achieved_coverage = 0.0
     if placements:
         if config.coverage_mode == "area":
+            wedge_area = _wedge_area(fov_rad, base_min, r_max)
             if wedge_area > 0.0:
-                achieved_coverage = min(1.0, len(placements) * disc_area / wedge_area)
+                covered_area = sum(_disc_area(r) for _, r, _ in placements)
+                achieved_coverage = min(1.0, covered_area / wedge_area)
         else:
             total_angle = 0.0
             fov_half = 0.5 * fov_rad
-            for pos in placements:
+            for pos, radius, _ in placements:
                 offset = pos - wedge.origin_xy
                 dist = float(np.linalg.norm(offset))
                 center_angle = _angle_between(forward_xy, offset)
                 span = _effective_disc_span(
-                    config.clearance_radius,
-                    max(dist, config.clearance_radius + EPS),
+                    radius,
+                    max(dist, radius + EPS),
                     fov_half,
                     center_angle,
                 )
@@ -380,7 +486,7 @@ def plan_npc_positions(
     shortfall = max(0, target_count - len(placements))
 
     return NPCPlacementResult(
-        positions_xy=placements,
+        positions_xy=[pos for pos, _, _ in placements],
         requested_count=target_count,
         achieved_coverage=achieved_coverage,
         target_coverage=config.target_coverage,
@@ -389,6 +495,7 @@ def plan_npc_positions(
         rejected_clearance=rejected_clearance,
         rejected_oob=rejected_oob,
         shortfall=shortfall,
+        accepted_indices=[idx for _, _, idx in placements],
     )
 
 
@@ -399,8 +506,19 @@ def estimate_coverage_for_positions(
     config: NPCDensityConfig,
 ) -> float:
     """Compute coverage achieved by already-placed NPCs."""
-    wedge_area = _wedge_area(math.radians(wedge.fov_deg), max(wedge.min_range, config.min_distance_from_camera), wedge.max_range)
+    wedge_area = _wedge_area(
+        math.radians(wedge.fov_deg),
+        max(wedge.min_range, config.min_center_distance),
+        wedge.max_range,
+    )
     disc_area = _disc_area(config.clearance_radius)
     if wedge_area <= 0.0 or disc_area <= 0.0:
         return 0.0
     return min(1.0, len(list(positions_xy)) * disc_area / wedge_area)
+
+
+def compute_clearance_distance(free_mask: np.ndarray) -> np.ndarray | None:
+    """Return per-pixel distance (in pixels) to the nearest blocked cell."""
+    if _ndimage is None:
+        return None
+    return _ndimage.distance_transform_edt(free_mask)
