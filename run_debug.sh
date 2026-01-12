@@ -4,14 +4,17 @@ python render_label_paths.py \
   --scene 0001_839920 \
   --label-id 73 \
   --output-dir ./debug_npc_ply \
-  --npc-render --npc-count 8 --npc-priority count --npc-max-range 10 \
+  --npc-render --npc-count 8 --npc-priority count --npc-max-range 50 \
   --npc-free-threshold 250 --npc-free-white \
+  --npc-rotate-mask-180 \
   --npc-frame-pool-size 50 \
   --npc-auto-clearance --npc-actor-root ./data/SHHQ_gs/walking \
   --actor-dump-ply-dir ./debug_npc_ply \
   --actor-dump-stride 1 --actor-dump-max 30 \
   --npc-bev-debug \
   --npc-bev-render-debug \
+  --npc-bev-use-mask \
+  --overwrite \
   --rgb-frames --no-video \
   --no-save-depth-maps --no-save-camera-metadata \
   --verbose

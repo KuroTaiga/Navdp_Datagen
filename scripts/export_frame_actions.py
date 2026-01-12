@@ -319,6 +319,7 @@ def process_scene(
     debug_arrow_width_px: int,
     debug_bev_mirror_center: bool,
     debug_yaw_plot: bool,
+    skip_existing: bool,
 ) -> tuple[str, int, int]:
     def log(msg: str) -> None:
         if verbose:
@@ -361,6 +362,21 @@ def process_scene(
         labels_seen += 1
         output_name = output_template.replace("{label}", label_dir.name)
         output_path = scene_dir / output_name
+        if skip_existing and not debug_clean:
+            expected_paths = []
+            if not skip_actions:
+                expected_paths.append(output_path)
+            if debug_yaw:
+                expected_paths.append(debug_root / debug_yaw_template.replace("{label}", label_dir.name))
+                if debug_yaw_plot:
+                    expected_paths.append(
+                        debug_root / debug_yaw_plot_template.replace("{label}", label_dir.name)
+                    )
+            if debug_bev:
+                expected_paths.append(debug_root / debug_bev_template.replace("{label}", label_dir.name))
+            if expected_paths and all(path.exists() for path in expected_paths):
+                log(f"[skip] {scene_id}/{label_dir.name}: outputs already exist")
+                continue
         if clean:
             legacy_json = label_dir / "frame_actions.json"
             if legacy_json.exists():
@@ -675,6 +691,11 @@ def main() -> int:
         help="Skip writing action JSON outputs (debug-only runs).",
     )
     parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip labels when expected outputs already exist.",
+    )
+    parser.add_argument(
         "--debug-yaw",
         action="store_true",
         help="Write per-frame yaw debug JSON for each label (default: off).",
@@ -824,6 +845,7 @@ def main() -> int:
             args.debug_arrow_width_px,
             args.debug_bev_mirror_center,
             args.debug_yaw_plot,
+            args.skip_existing,
         )
         for scene_dir in scene_dirs
     ]

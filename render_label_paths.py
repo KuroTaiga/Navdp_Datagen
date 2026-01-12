@@ -34,7 +34,7 @@ import glob
 import json
 import math
 from argparse import ArgumentParser, BooleanOptionalAction
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from collections import defaultdict
 from pathlib import Path
 from typing import Sequence, TextIO
@@ -895,6 +895,74 @@ def _ensure_rgb(img: np.ndarray) -> np.ndarray:
         return img[..., :3]
     return img
 
+def _mask_to_bev_image(mask: np.ndarray) -> np.ndarray:
+    base = (mask.astype(np.uint8) * 255).astype(np.uint8)
+    return _ensure_rgb(base)
+
+def _dilate_mask_disk(mask: np.ndarray, radius_px: int) -> np.ndarray:
+    if radius_px <= 0:
+        return mask.astype(bool, copy=True)
+    src = mask.astype(bool, copy=False)
+    h, w = src.shape[:2]
+    result = np.zeros((h, w), dtype=bool)
+    rr = radius_px * radius_px
+    for dv in range(-radius_px, radius_px + 1):
+        for du in range(-radius_px, radius_px + 1):
+            if du * du + dv * dv > rr:
+                continue
+            v0_src = max(0, -dv)
+            v1_src = min(h, h - dv)
+            u0_src = max(0, -du)
+            u1_src = min(w, w - du)
+            v0_dst = max(0, dv)
+            v1_dst = min(h, h + dv)
+            u0_dst = max(0, du)
+            u1_dst = min(w, w + du)
+            if v0_src >= v1_src or u0_src >= u1_src:
+                continue
+            result[v0_dst:v1_dst, u0_dst:u1_dst] |= src[v0_src:v1_src, u0_src:u1_src]
+    return result
+
+def _filter_npc_positions_by_mask(
+    *,
+    positions_xy: list[np.ndarray],
+    radii_m: Sequence[float],
+    accepted_indices: list[int],
+    meta: dict,
+    center_mask: np.ndarray | None,
+) -> tuple[list[np.ndarray], list[float], list[int], int]:
+    if center_mask is None or not positions_xy:
+        return positions_xy, list(radii_m), list(accepted_indices), 0
+    h, w = center_mask.shape[:2]
+    kept_positions: list[np.ndarray] = []
+    kept_radii: list[float] = []
+    kept_indices: list[int] = []
+    dropped = 0
+    for pos, radius, idx in zip(positions_xy, radii_m, accepted_indices):
+        u, v = world_to_pixel(meta, pos)
+        if 0 <= u < w and 0 <= v < h and bool(center_mask[v, u]):
+            kept_positions.append(pos)
+            kept_radii.append(float(radius))
+            kept_indices.append(int(idx))
+        else:
+            dropped += 1
+    return kept_positions, kept_radii, kept_indices, dropped
+
+def save_npc_mask_debug_image(
+    *,
+    mask: np.ndarray,
+    out_path: Path,
+    highlight_mask: np.ndarray | None = None,
+    highlight_color: tuple[int, int, int] = (255, 0, 0),
+) -> None:
+    """Save a boolean mask as a white-on-black RGB PNG with optional highlights."""
+    base = np.zeros((*mask.shape[:2], 3), dtype=np.uint8)
+    base[mask.astype(bool)] = (255, 255, 255)
+    if highlight_mask is not None:
+        base[highlight_mask.astype(bool)] = highlight_color
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    imageio.imwrite(out_path, base)
+
 def _blend_pixel(img: np.ndarray, u: int, v: int, color: tuple[int, int, int], alpha: float | None) -> None:
     """Blend a pixel with optional alpha; defaults to overwrite when alpha is None/1."""
     if alpha is None or alpha >= 1.0:
@@ -1407,6 +1475,7 @@ def generate_npc_bev_debug_for_path(
             goal_xy=goal_xy,
             exclude_discs=exclude_discs,
             center_mask=center_mask,
+            center_mask_is_bloomed=bloom_mask is not None,
         )
 
         out_path = out_dir / f"npc_bev_{frame_idx:04d}.png"
@@ -1584,19 +1653,38 @@ def _npc_pool_seed(base_seed: int, job_slot: int | None, job_name: str | None) -
     payload = f"{base_seed}:{job_slot}:{job_name}".encode("utf-8")
     return int.from_bytes(hashlib.sha256(payload).digest()[:8], byteorder="little")
 
-def _compute_ply_radius(ply_path: Path) -> float:
+def _compute_ply_radius(ply_path: Path, *, target_height: float | None = None) -> float:
     """Estimate avatar radius from a PLY frame using 95th percentile of XY distances from median center."""
-    ply = ply_utils.GaussianPly.read(ply_path)
+    ply = load_gaussian_ply(ply_path)
+    alignment_transform = np.eye(4, dtype=np.float64)
+    alignment_transform[:3, :3] = ACTOR_AXIS_ALIGNMENT_MATRIX
+    ply_utils.apply_transform_inplace(
+        ply,
+        alignment_transform,
+        rotate_normals=True,
+        rotate_sh=True,
+    )
+
     x = np.asarray(ply.data["x"], dtype=np.float64)
     y = np.asarray(ply.data["y"], dtype=np.float64)
-    if x.size == 0 or y.size == 0:
+    z = np.asarray(ply.data["z"], dtype=np.float64)
+    if x.size == 0 or y.size == 0 or z.size == 0:
         return 0.0
+    measured_height = max(float(np.max(z) - np.min(z)), EPS)
+    scale_factor = 1.0
+    if target_height is not None and target_height > 0.0:
+        scale_factor = target_height / measured_height
     xy = np.stack((x, y), axis=1)
     center = np.median(xy, axis=0)
     dists = np.linalg.norm(xy - center[None, :], axis=1)
-    return float(np.percentile(dists, 95))
+    return float(np.percentile(dists, 95) * scale_factor)
 
-def _compute_default_npc_clearance(actor_root: Path, sample_limit: int = 80) -> float:
+def _compute_default_npc_clearance(
+    actor_root: Path,
+    *,
+    sample_limit: int = 80,
+    target_height: float | None = None,
+) -> float:
     """Derive a default NPC clearance radius from SHHQ sources (trimmed mean of radii)."""
     if not actor_root.is_dir():
         raise FileNotFoundError(f"Actor source root not found: {actor_root}")
@@ -1614,7 +1702,7 @@ def _compute_default_npc_clearance(actor_root: Path, sample_limit: int = 80) -> 
 
     for ply_path in samples:
         try:
-            r = _compute_ply_radius(Path(ply_path))
+            r = _compute_ply_radius(Path(ply_path), target_height=target_height)
             if r > 0.0 and math.isfinite(r):
                 radii.append(r)
         except Exception:
@@ -1922,14 +2010,15 @@ HIP_HEIGHT_RATIO = 0.6
 
 
 def _compute_frame_radius_xy(data: np.ndarray) -> float:
-    """Estimate actor radius as half the XY bounding-box diagonal."""
+    """Estimate actor radius as the 95th percentile of XY distances from the median center."""
     x = np.asarray(data["x"], dtype=np.float64)
     y = np.asarray(data["y"], dtype=np.float64)
     if x.size == 0 or y.size == 0:
         return 0.0
-    dx = float(np.max(x) - np.min(x))
-    dy = float(np.max(y) - np.min(y))
-    return 0.5 * math.hypot(dx, dy)
+    xy = np.stack((x, y), axis=1)
+    center = np.median(xy, axis=0)
+    dists = np.linalg.norm(xy - center[None, :], axis=1)
+    return float(np.percentile(dists, 95))
 
 
 def load_actor_sequence(
@@ -2955,6 +3044,7 @@ def render_actor_follow_sequence(
                         exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
                         radii_m=npc_radii,
                         center_mask=npc_center_mask,
+                        center_mask_is_bloomed=npc_center_mask_is_bloomed,
                     )
                     placed_radii = [
                         npc_radii[idx]
@@ -2963,6 +3053,14 @@ def render_actor_follow_sequence(
                     ]
                     if len(placed_radii) != len(placement.positions_xy):
                         placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                    npc_positions, placed_radii, accepted_indices, dropped = _filter_npc_positions_by_mask(
+                        positions_xy=placement.positions_xy,
+                        radii_m=placed_radii,
+                        accepted_indices=placement.accepted_indices,
+                        meta=npc_meta,
+                        center_mask=npc_center_mask,
+                    )
+                    shortfall = placement.shortfall + dropped
                     if npc_bev_render_debug and npc_occ_image is not None:
                         out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
                         save_npc_bev_debug_image(
@@ -2974,7 +3072,7 @@ def render_actor_follow_sequence(
                             path_xy=path_xy,
                             camera_xy=camera_position[:2],
                             forward_xy=wedge_forward,
-                            npc_positions=placement.positions_xy,
+                            npc_positions=npc_positions,
                             npc_radii=placed_radii,
                             blocked_mask=npc_bloom_mask,
                             bloom_radius_m=npc_bloom_radius_m,
@@ -2984,22 +3082,22 @@ def render_actor_follow_sequence(
                             wedge_max_range=float(npc_wedge_max_range),
                             achieved_coverage=placement.achieved_coverage,
                             requested_count=placement.requested_count,
-                            shortfall=placement.shortfall,
+                            shortfall=shortfall,
                             target_coverage=npc_config.target_coverage,
                             mirror_bev_x=mirror_bev_x,
                             mirror_bev_y=mirror_bev_y,
                             out_path=out_path,
                         )
-                    npc_shortfall_total += placement.shortfall
-                    if verbose and placement.shortfall > 0:
+                    npc_shortfall_total += shortfall
+                    if verbose and shortfall > 0:
                         print(
-                            f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
+                            f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                             flush=True,
                         )
-                    for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                    for placement_idx, npc_xy in enumerate(npc_positions):
                         entry_idx = (
-                            placement.accepted_indices[placement_idx]
-                            if placement_idx < len(placement.accepted_indices)
+                            accepted_indices[placement_idx]
+                            if placement_idx < len(accepted_indices)
                             else None
                         )
                         if entry_idx is None or entry_idx >= len(npc_entries):
@@ -3308,6 +3406,7 @@ def render_actor_follow_sequence(
                     exclude_discs=[(plan.actor_pos_xy, npc_config.clearance_radius)],
                     radii_m=npc_radii,
                     center_mask=npc_center_mask,
+                    center_mask_is_bloomed=npc_center_mask_is_bloomed,
                 )
                 placed_radii = [
                     npc_radii[idx]
@@ -3316,6 +3415,14 @@ def render_actor_follow_sequence(
                 ]
                 if len(placed_radii) != len(placement.positions_xy):
                     placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                npc_positions, placed_radii, accepted_indices, dropped = _filter_npc_positions_by_mask(
+                    positions_xy=placement.positions_xy,
+                    radii_m=placed_radii,
+                    accepted_indices=placement.accepted_indices,
+                    meta=npc_meta,
+                    center_mask=npc_center_mask,
+                )
+                shortfall = placement.shortfall + dropped
                 if npc_bev_render_debug and npc_occ_image is not None:
                     out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
                     save_npc_bev_debug_image(
@@ -3327,7 +3434,7 @@ def render_actor_follow_sequence(
                         path_xy=path_xy,
                         camera_xy=camera_position[:2],
                         forward_xy=wedge_forward,
-                        npc_positions=placement.positions_xy,
+                        npc_positions=npc_positions,
                         npc_radii=placed_radii,
                         blocked_mask=npc_bloom_mask,
                         bloom_radius_m=npc_bloom_radius_m,
@@ -3337,17 +3444,17 @@ def render_actor_follow_sequence(
                         wedge_max_range=float(npc_wedge_max_range),
                         achieved_coverage=placement.achieved_coverage,
                         requested_count=placement.requested_count,
-                        shortfall=placement.shortfall,
+                        shortfall=shortfall,
                         target_coverage=npc_config.target_coverage,
                         mirror_bev_x=mirror_bev_x,
                         mirror_bev_y=mirror_bev_y,
                         out_path=out_path,
                     )
-                npc_shortfall_total += placement.shortfall
-                for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                npc_shortfall_total += shortfall
+                for placement_idx, npc_xy in enumerate(npc_positions):
                     entry_idx = (
-                        placement.accepted_indices[placement_idx]
-                        if placement_idx < len(placement.accepted_indices)
+                        accepted_indices[placement_idx]
+                        if placement_idx < len(accepted_indices)
                         else None
                     )
                     if entry_idx is None or entry_idx >= len(npc_entries):
@@ -3885,6 +3992,7 @@ def render_path_frames(
     npc_bev_render_debug: bool = False,
     npc_occ_image: np.ndarray | None = None,
     npc_center_mask: np.ndarray | None = None,
+    npc_center_mask_is_bloomed: bool = False,
     npc_bloom_mask: np.ndarray | None = None,
     npc_bloom_radius_m: float | None = None,
     npc_bloom_radius_px: int | None = None,
@@ -4333,6 +4441,7 @@ def render_path_frames(
                                 exclude_discs=[],
                                 radii_m=npc_radii,
                                 center_mask=npc_center_mask,
+                                center_mask_is_bloomed=npc_center_mask_is_bloomed,
                             )
                             placed_radii = [
                                 npc_radii[idx]
@@ -4341,6 +4450,14 @@ def render_path_frames(
                             ]
                             if len(placed_radii) != len(placement.positions_xy):
                                 placed_radii = [npc_config.clearance_radius] * len(placement.positions_xy)
+                            npc_positions, placed_radii, accepted_indices, dropped = _filter_npc_positions_by_mask(
+                                positions_xy=placement.positions_xy,
+                                radii_m=placed_radii,
+                                accepted_indices=placement.accepted_indices,
+                                meta=npc_meta,
+                                center_mask=npc_center_mask,
+                            )
+                            shortfall = placement.shortfall + dropped
                             if npc_bev_render_debug and npc_occ_image is not None:
                                 out_path = npc_bev_render_dir / f"npc_bev_{idx:04d}.png"
                                 save_npc_bev_debug_image(
@@ -4352,7 +4469,7 @@ def render_path_frames(
                                     path_xy=path_xy,
                                     camera_xy=position[:2],
                                     forward_xy=wedge_forward,
-                                    npc_positions=placement.positions_xy,
+                                    npc_positions=npc_positions,
                                     npc_radii=placed_radii,
                                     blocked_mask=npc_bloom_mask,
                                     bloom_radius_m=npc_bloom_radius_m,
@@ -4362,22 +4479,22 @@ def render_path_frames(
                                     wedge_max_range=float(npc_wedge_max_range),
                                     achieved_coverage=placement.achieved_coverage,
                                     requested_count=placement.requested_count,
-                                    shortfall=placement.shortfall,
+                                    shortfall=shortfall,
                                     target_coverage=npc_config.target_coverage,
                                     mirror_bev_x=mirror_bev_x,
                                     mirror_bev_y=mirror_bev_y,
                                     out_path=out_path,
                                 )
-                            npc_shortfall_total += placement.shortfall
-                            if verbose and placement.shortfall > 0:
+                            npc_shortfall_total += shortfall
+                            if verbose and shortfall > 0:
                                 print(
-                                    f"[VERBOSE] NPC shortfall frame {idx}: {placement.shortfall} (requested {placement.requested_count})",
+                                    f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                                     flush=True,
                                 )
-                            for placement_idx, npc_xy in enumerate(placement.positions_xy):
+                            for placement_idx, npc_xy in enumerate(npc_positions):
                                 entry_idx = (
-                                    placement.accepted_indices[placement_idx]
-                                    if placement_idx < len(placement.accepted_indices)
+                                    accepted_indices[placement_idx]
+                                    if placement_idx < len(accepted_indices)
                                     else None
                                 )
                                 if entry_idx is None or entry_idx >= len(npc_entries):
@@ -5038,6 +5155,12 @@ def parse_args() -> ArgumentParser:
         help="Write per-frame NPC BEV debug images using actual rendered placements.",
     )
     parser.add_argument(
+        "--npc-bev-use-mask",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Use the placement mask (after threshold/wall/bloom) as the BEV base instead of occupancy.png.",
+    )
+    parser.add_argument(
         "--npc-render",
         action="store_true",
         default=False,
@@ -5078,7 +5201,7 @@ def parse_args() -> ArgumentParser:
         type=str,
         choices=["coverage", "count"],
         default="coverage",
-        help="Treat coverage or count as the hard requirement (coverage still acts as a cap).",
+        help="Treat coverage or count as the hard requirement (count ignores coverage cap when set).",
     )
     parser.add_argument(
         "--npc-density-mode",
@@ -5136,6 +5259,12 @@ def parse_args() -> ArgumentParser:
         help="Constrain NPC placement to wall_mask.png when present (default: on).",
     )
     parser.add_argument(
+        "--npc-rotate-mask-180",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Rotate NPC free/bloom masks 180 degrees around the image center before placement.",
+    )
+    parser.add_argument(
         "--npc-wall-threshold",
         type=int,
         default=128,
@@ -5152,6 +5281,12 @@ def parse_args() -> ArgumentParser:
         action=BooleanOptionalAction,
         default=False,
         help="Derive NPC clearance from SHHQ sources (trimmed mean radius) and override the default clearance if larger.",
+    )
+    parser.add_argument(
+        "--npc-auto-clearance-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor applied to auto-computed NPC clearance (default: 1.0).",
     )
     parser.add_argument(
         "--npc-actor-root",
@@ -5188,6 +5323,12 @@ def parse_args() -> ArgumentParser:
         type=int,
         default=12345,
         help="Base seed for NPC placement determinism.",
+    )
+    parser.add_argument(
+        "--npc-bloom-radius-px",
+        type=int,
+        default=5,
+        help="Override NPC bloom radius in pixels (default: 5; set <=0 to use clearance).",
     )
 
     parser.set_defaults(actor_loop=True)
@@ -5247,6 +5388,15 @@ def main() -> None:
     depth_bit_depth = int(args.depth_bit_depth)
     save_follow_metadata = bool(args.save_follow_metadata)
     npc_render_enabled = bool(args.npc_render)
+    npc_bev_use_mask = bool(args.npc_bev_use_mask)
+    npc_bloom_radius_px_override = (
+        int(args.npc_bloom_radius_px)
+        if args.npc_bloom_radius_px is not None and int(args.npc_bloom_radius_px) > 0
+        else None
+    )
+    npc_auto_clearance_scale = float(args.npc_auto_clearance_scale)
+    if npc_auto_clearance_scale <= 0.0:
+        raise ValueError("--npc-auto-clearance-scale must be > 0.")
     actor_runtime: ActorRuntime | None = None
     npc_actor_runtime: ActorRuntime | None = None
     npc_actor_pool: NPCActorPool | None = None
@@ -5309,10 +5459,17 @@ def main() -> None:
             auto_radius = _compute_default_npc_clearance(
                 actor_root=args.npc_actor_root,
                 sample_limit=max(1, int(args.npc_radius_samples)),
+                target_height=float(args.actor_height),
             )
+            if npc_auto_clearance_scale != 1.0:
+                auto_radius *= npc_auto_clearance_scale
             if auto_radius > npc_density_config.clearance_radius:
-                npc_density_config.clearance_radius = auto_radius
-            print(f"  [NPC] Auto clearance radius: {auto_radius:.3f} m (using SHHQ sources)", flush=True)
+                npc_density_config = replace(npc_density_config, clearance_radius=auto_radius)
+            print(
+                f"  [NPC] Auto clearance radius: {auto_radius:.3f} m "
+                f"(scale {npc_auto_clearance_scale:.2f}, SHHQ sources)",
+                flush=True,
+            )
         except Exception as exc:  # pylint: disable=broad-except
             print(f"  [WARN] Failed to auto-compute NPC clearance; using {npc_density_config.clearance_radius:.3f} m. Reason: {exc}", flush=True)
     npc_forward_fn = get_forward_fn(args)
@@ -5646,25 +5803,33 @@ def main() -> None:
                         except FileNotFoundError:
                             if verbose_enabled:
                                 print("  [NPC] wall_mask.png not found; skipping wall constraint.", flush=True)
-                    if npc_bev_enabled or npc_bev_render_debug:
-                        occ_img = imageio.imread(dataset_dir / "occupancy.png")
-                        npc_occ_image = _ensure_rgb(np.array(occ_img))
+                    if npc_free_mask is not None and bool(args.npc_rotate_mask_180):
+                        npc_free_mask = np.rot90(npc_free_mask, 2)
+                        if verbose_enabled:
+                            print("  [NPC] Free-space mask rotated 180 degrees.", flush=True)
                     print(f"  [NPC] Free-space mask ready (threshold={args.npc_free_threshold}).", flush=True)
                 except Exception as exc:  # pylint: disable=broad-except
                     print(f"  [WARN] NPC features disabled for {scene_id}: {exc}", flush=True)
                     npc_free_mask = None
                     npc_occ_image = None
 
-            if npc_free_mask is not None and npc_bloom_radius_m is not None:
-                npc_bloom_radius_px = max(1, _meters_to_px_ceil(meta, npc_bloom_radius_m))
+            if npc_free_mask is not None and (npc_bloom_radius_m is not None or npc_bloom_radius_px_override is not None):
+                if npc_bloom_radius_px_override is not None:
+                    npc_bloom_radius_px = max(1, int(npc_bloom_radius_px_override))
+                    npc_bloom_radius_m = float(npc_bloom_radius_px) * float(meta["scale"])
+                else:
+                    npc_bloom_radius_px = max(1, _meters_to_px_ceil(meta, npc_bloom_radius_m))
                 clearance_px = compute_clearance_distance(npc_free_mask)
                 if clearance_px is None:
                     if verbose_enabled:
                         print(
-                            "  [WARN] NPC bloom mask needs scipy; using raw free-space mask.",
+                            "  [WARN] NPC bloom mask needs scipy; using numpy dilation fallback.",
                             flush=True,
                         )
-                    npc_bloom_free_mask = npc_free_mask
+                    blocked = ~npc_free_mask
+                    blocked_dilated = _dilate_mask_disk(blocked, npc_bloom_radius_px)
+                    npc_bloom_mask = npc_free_mask & blocked_dilated
+                    npc_bloom_free_mask = npc_free_mask & (~blocked_dilated)
                 else:
                     npc_bloom_mask = npc_free_mask & (clearance_px <= npc_bloom_radius_px)
                     npc_bloom_free_mask = npc_free_mask & (clearance_px > npc_bloom_radius_px)
@@ -5676,6 +5841,15 @@ def main() -> None:
                     f"({npc_bloom_radius_px}px).",
                     flush=True,
                 )
+            if (npc_bev_enabled or npc_bev_render_debug) and npc_free_mask is not None:
+                if npc_bev_use_mask:
+                    base_mask = npc_bloom_free_mask if npc_bloom_free_mask is not None else npc_free_mask
+                    npc_occ_image = _mask_to_bev_image(base_mask)
+                    if bool(args.npc_rotate_mask_180):
+                        npc_occ_image = np.rot90(npc_occ_image, 2)
+                else:
+                    occ_img = imageio.imread(dataset_dir / "occupancy.png")
+                    npc_occ_image = _ensure_rgb(np.array(occ_img))
 
             if debug_enabled:
                 if label_dir == scene_task_root:
@@ -5750,6 +5924,14 @@ def main() -> None:
                 flush=True,
             )
 
+            npc_bloom_mask_debug = npc_bloom_mask
+            npc_bloom_free_mask_debug = npc_bloom_free_mask
+            if bool(args.npc_rotate_mask_180):
+                if npc_bloom_mask is not None:
+                    npc_bloom_mask_debug = np.rot90(npc_bloom_mask, 2)
+                if npc_bloom_free_mask is not None:
+                    npc_bloom_free_mask_debug = np.rot90(npc_bloom_free_mask, 2)
+
             for label_idx, (json_path, prepared, _) in enumerate(render_plan, start=1):
                 print(
                     f"    [{label_idx:03d}/{total_labels:03d}/{total_paths_found:03d}] -> {json_path.stem}",
@@ -5757,7 +5939,7 @@ def main() -> None:
                 )
                 if (
                     (npc_bev_enabled or npc_bev_render_debug)
-                    and npc_bloom_mask is not None
+                    and npc_bloom_mask_debug is not None
                     and npc_occ_image is not None
                     and npc_bloom_radius_m is not None
                     and npc_bloom_radius_px is not None
@@ -5770,13 +5952,24 @@ def main() -> None:
                         frame_idx=0,
                         meta=meta,
                         occ_image=npc_occ_image,
-                        bloom_mask=npc_bloom_mask,
+                        bloom_mask=npc_bloom_mask_debug,
                         bloom_radius_m=float(npc_bloom_radius_m),
                         bloom_radius_px=int(npc_bloom_radius_px),
                         out_path=bloom_path,
                     )
                     if verbose_enabled:
                         print(f"[VERBOSE] NPC bloom debug -> {bloom_path}", flush=True)
+                if (npc_bev_enabled or npc_bev_render_debug) and npc_bloom_free_mask_debug is not None:
+                    free_dir = npc_bev_output_root / scene_id / json_path.stem / "__npc_bev_bloom"
+                    free_path = free_dir / "npc_bloom_free_mask.png"
+                    save_npc_mask_debug_image(
+                        mask=npc_bloom_free_mask_debug,
+                        highlight_mask=npc_bloom_mask_debug,
+                        highlight_color=(255, 0, 0),
+                        out_path=free_path,
+                    )
+                    if verbose_enabled:
+                        print(f"[VERBOSE] NPC bloom free mask -> {free_path}", flush=True)
                 if npc_bev_enabled and npc_free_mask is not None and npc_occ_image is not None:
                     npc_summary = generate_npc_bev_debug_for_path(
                         scene_id=scene_id,
@@ -5786,7 +5979,7 @@ def main() -> None:
                         occ_image=npc_occ_image,
                         free_mask=npc_free_mask,
                         center_mask=npc_bloom_free_mask,
-                        bloom_mask=npc_bloom_mask,
+                        bloom_mask=npc_bloom_mask_debug,
                         bloom_radius_m=npc_bloom_radius_m,
                         bloom_radius_px=npc_bloom_radius_px,
                         config=npc_density_config,
@@ -5880,7 +6073,8 @@ def main() -> None:
                         npc_bev_render_debug=npc_bev_render_debug,
                         npc_occ_image=npc_occ_image,
                         npc_center_mask=npc_bloom_free_mask,
-                        npc_bloom_mask=npc_bloom_mask,
+                        npc_center_mask_is_bloomed=bool(npc_bloom_mask is not None),
+                        npc_bloom_mask=npc_bloom_mask_debug,
                         npc_bloom_radius_m=npc_bloom_radius_m,
                         npc_bloom_radius_px=npc_bloom_radius_px,
                     )

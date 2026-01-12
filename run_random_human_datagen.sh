@@ -127,7 +127,7 @@ NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}              # angular|area
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio (applied when count>=12)
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
 NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}             # preload this many NPC PLY frames per worker
-WORKERS=${WORKERS:-16}
+WORKERS=${WORKERS:-32}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 # Robot camera stats
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}

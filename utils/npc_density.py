@@ -270,11 +270,12 @@ def estimate_npc_target_count(
         coverage_cap = max(0, coverage_cap)
 
     desired = config.desired_count if (config.desired_count is not None and config.desired_count > 0) else None
+    count_priority = config.priority == "count" and desired is not None
     target_count = 0
-    if config.priority == "count":
-        if desired is not None:
-            target_count = desired
-        elif coverage_cap is not None:
+    if count_priority:
+        target_count = desired
+    elif config.priority == "count":
+        if coverage_cap is not None:
             target_count = coverage_cap
     else:  # coverage priority
         if coverage_cap is not None:
@@ -282,7 +283,7 @@ def estimate_npc_target_count(
         elif desired is not None:
             target_count = desired
 
-    if coverage_cap is not None and target_count > coverage_cap:
+    if coverage_cap is not None and target_count > coverage_cap and not count_priority:
         target_count = coverage_cap
     if config.max_npcs is not None and config.max_npcs > 0:
         target_count = min(target_count, config.max_npcs)
@@ -334,6 +335,7 @@ def plan_npc_positions(
     exclude_discs: Sequence[tuple[np.ndarray, float]] | None = None,
     radii_m: Sequence[float] | None = None,
     center_mask: np.ndarray | None = None,
+    center_mask_is_bloomed: bool = False,
 ) -> NPCPlacementResult:
     """
     Sample NPC positions inside the camera wedge with disc clearance.
@@ -343,6 +345,7 @@ def plan_npc_positions(
     block the camera->goal segment when blocking is disabled. Optional exclude_discs are treated
     as occupied (collide but do not contribute to coverage).
     If center_mask is provided, it is treated as a pre-cleared mask of allowed centers.
+    When center_mask_is_bloomed is True, the clearance check against free_mask is skipped.
     """
     forward_xy = _normalize(wedge.forward_xy)
     fov_rad = math.radians(wedge.fov_deg)
@@ -430,7 +433,8 @@ def plan_npc_positions(
                 if not _inside_center_mask(meta, center_mask, candidate, config.free_pixel_min):
                     rejected_oob += 1
                     continue
-            else:
+            if not center_mask_is_bloomed:
+                # Use the raw free mask for clearance so bloom/center masks don't double-shrink space.
                 if not _inside_mask(meta, free_mask, candidate, radius, config.free_pixel_min):
                     rejected_oob += 1
                     continue

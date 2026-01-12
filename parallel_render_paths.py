@@ -108,11 +108,13 @@ class ProgressTracker:
         *,
         total_jobs: int,
         total_paths: int,
+        worker_count: int = 1,
         output_path: Path | None,
         path_lengths: dict[tuple[str, str], float] | None = None,
     ):
         self.total_jobs = total_jobs
         self.total_paths = total_paths
+        self.worker_count = max(1, int(worker_count))
         self.completed_jobs = 0
         self.completed_paths = 0
         self.total_render_time = 0.0
@@ -192,7 +194,7 @@ class ProgressTracker:
         )
         eta_seconds = None
         if avg_path_time is not None and remaining_paths > 0:
-            eta_seconds = avg_path_time * remaining_paths
+            eta_seconds = (avg_path_time * remaining_paths) / self.worker_count
 
         stage_total = sum(self.stage_totals.get(stage, 0.0) for stage in self.STAGE_KEYS)
         stage_ratios = {}
@@ -218,6 +220,7 @@ class ProgressTracker:
             "avg_frames_per_path": avg_frames_per_path,
             "avg_path_length_m": avg_path_length,
             "eta_seconds": eta_seconds,
+            "worker_count": self.worker_count,
             "avg_vram_per_thread": avg_vram_per_thread,
             "stage_ratio": stage_ratios,
         }
@@ -239,13 +242,36 @@ class ProgressTracker:
         if self.completed_paths <= 0:
             avg_len = "-"
             avg_time = "-"
+            eta_str = "-"
         else:
             avg_len = f"{self.total_path_length / self.completed_paths:.2f}m"
             avg_time = f"{self.total_render_time / self.completed_paths:.2f}s"
+            remaining_paths = max(self.total_paths - self.completed_paths, 0)
+            eta_seconds = None
+            if remaining_paths > 0:
+                avg_path_time = self.total_render_time / self.completed_paths
+                eta_seconds = (avg_path_time * remaining_paths) / self.worker_count
+            eta_str = self._format_eta(eta_seconds)
         return (
             f"[PROGRESS] {self.completed_paths}/{self.total_paths} paths "
-            f"(avg_len={avg_len}, avg_time={avg_time})"
+            f"(avg_len={avg_len}, avg_time={avg_time}, eta={eta_str}, workers={self.worker_count})"
         )
+
+    @staticmethod
+    def _format_eta(seconds: float | None) -> str:
+        if seconds is None:
+            return "-"
+        try:
+            seconds_int = int(round(seconds))
+        except (TypeError, ValueError):
+            return "-"
+        if seconds_int < 0:
+            seconds_int = 0
+        hours, rem = divmod(seconds_int, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
 
 def _load_metrics_json(path: Path) -> dict | None:
@@ -1128,14 +1154,15 @@ def main() -> None:
     path_lengths = {
         (task.assignment.scene, str(task.assignment.label)): task.path_length for task in tasks_all
     }
+    max_workers = max(1, args.workers)
     deferred_plans = build_job_plans(deferred_tasks) if deferred_tasks else []
     progress_tracker = ProgressTracker(
         total_jobs=len(plans) + len(deferred_plans),
         total_paths=len(tasks_all),
+        worker_count=max_workers,
         output_path=args.progress_json,
         path_lengths=path_lengths,
     )
-    max_workers = max(1, args.workers)
 
     results: list[dict] = []
     metrics_dir = args.per_job_metrics_dir.resolve()
