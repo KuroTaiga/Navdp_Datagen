@@ -46,6 +46,8 @@ from render_label_paths import (  # type: ignore
 )
 
 FPV_ACTOR_ID = "fpv"
+DETAILED_LABEL_SUFFIX = "_detailed"
+DETAILED_JSON_SUFFIX = f"{DETAILED_LABEL_SUFFIX}.json"
 STATUS_NOT_RUN = 0
 STATUS_DONE = 1
 STATUS_RETRY = 2
@@ -106,11 +108,13 @@ class ProgressTracker:
         *,
         total_jobs: int,
         total_paths: int,
+        worker_count: int = 1,
         output_path: Path | None,
         path_lengths: dict[tuple[str, str], float] | None = None,
     ):
         self.total_jobs = total_jobs
         self.total_paths = total_paths
+        self.worker_count = max(1, int(worker_count))
         self.completed_jobs = 0
         self.completed_paths = 0
         self.total_render_time = 0.0
@@ -190,7 +194,7 @@ class ProgressTracker:
         )
         eta_seconds = None
         if avg_path_time is not None and remaining_paths > 0:
-            eta_seconds = avg_path_time * remaining_paths
+            eta_seconds = (avg_path_time * remaining_paths) / self.worker_count
 
         stage_total = sum(self.stage_totals.get(stage, 0.0) for stage in self.STAGE_KEYS)
         stage_ratios = {}
@@ -216,6 +220,7 @@ class ProgressTracker:
             "avg_frames_per_path": avg_frames_per_path,
             "avg_path_length_m": avg_path_length,
             "eta_seconds": eta_seconds,
+            "worker_count": self.worker_count,
             "avg_vram_per_thread": avg_vram_per_thread,
             "stage_ratio": stage_ratios,
         }
@@ -237,13 +242,36 @@ class ProgressTracker:
         if self.completed_paths <= 0:
             avg_len = "-"
             avg_time = "-"
+            eta_str = "-"
         else:
             avg_len = f"{self.total_path_length / self.completed_paths:.2f}m"
             avg_time = f"{self.total_render_time / self.completed_paths:.2f}s"
+            remaining_paths = max(self.total_paths - self.completed_paths, 0)
+            eta_seconds = None
+            if remaining_paths > 0:
+                avg_path_time = self.total_render_time / self.completed_paths
+                eta_seconds = (avg_path_time * remaining_paths) / self.worker_count
+            eta_str = self._format_eta(eta_seconds)
         return (
             f"[PROGRESS] {self.completed_paths}/{self.total_paths} paths "
-            f"(avg_len={avg_len}, avg_time={avg_time})"
+            f"(avg_len={avg_len}, avg_time={avg_time}, eta={eta_str}, workers={self.worker_count})"
         )
+
+    @staticmethod
+    def _format_eta(seconds: float | None) -> str:
+        if seconds is None:
+            return "-"
+        try:
+            seconds_int = int(round(seconds))
+        except (TypeError, ValueError):
+            return "-"
+        if seconds_int < 0:
+            seconds_int = 0
+        hours, rem = divmod(seconds_int, 3600)
+        minutes, secs = divmod(rem, 60)
+        if hours > 0:
+            return f"{hours}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
 
 
 def _load_metrics_json(path: Path) -> dict | None:
@@ -490,6 +518,12 @@ def parse_args() -> argparse.Namespace:
         help="Total number of scene shards. Scenes are sorted alphabetically and distributed round-robin.",
     )
     parser.add_argument(
+        "--exclude-detailed-labels",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Exclude *_detailed.json label paths (default: True).",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Plan jobs and write the report but skip spawning render_label_paths.py.",
@@ -543,6 +577,7 @@ def gather_label_tasks(
     swap_xy: bool,
     mirror_translation: bool,
     minimal_frames: int | None,
+    exclude_detailed_labels: bool,
 ) -> tuple[list[LabelTask], list[dict]]:
     cache_meta: dict[str, dict] = {}
     cache_label_dir: dict[str, Path | None] = {}
@@ -568,6 +603,15 @@ def gather_label_tasks(
         return cache_label_dir[scene_id]
 
     for entry in assignments:
+        if exclude_detailed_labels and entry.label.endswith(DETAILED_LABEL_SUFFIX):
+            skipped.append(
+                {
+                    "scene": entry.scene,
+                    "label": entry.label,
+                    "reason": "label_is_detailed",
+                }
+            )
+            continue
         meta = get_meta(entry.scene)
         label_dir = get_label_dir(entry.scene)
         if meta is None or label_dir is None:
@@ -631,6 +675,7 @@ def gather_fpv_tasks(
     mirror_translation: bool,
     minimal_frames: int | None,
     follow_distance: float,
+    exclude_detailed_labels: bool,
 ) -> tuple[list[LabelTask], list[dict]]:
     cache_meta: dict[str, dict] = {}
     tasks: list[LabelTask] = []
@@ -661,7 +706,10 @@ def gather_fpv_tasks(
                 }
             )
             continue
-        for json_path in sorted(label_dir.glob("*.json")):
+        json_paths = sorted(label_dir.glob("*.json"))
+        if exclude_detailed_labels:
+            json_paths = [path for path in json_paths if not path.name.endswith(DETAILED_JSON_SUFFIX)]
+        for json_path in json_paths:
             label_id = json_path.stem
             try:
                 prepared = prepare_path_data(
@@ -978,6 +1026,7 @@ def main() -> None:
             mirror_translation=args.mirror_translation,
             minimal_frames=args.minimal_frames,
             follow_distance=args.fpv_follow_distance,
+            exclude_detailed_labels=args.exclude_detailed_labels,
         )
     else:
         tasks, skipped = gather_label_tasks(
@@ -988,6 +1037,7 @@ def main() -> None:
             swap_xy=args.swap_xy,
             mirror_translation=args.mirror_translation,
             minimal_frames=args.minimal_frames,
+            exclude_detailed_labels=args.exclude_detailed_labels,
         )
     tasks = filter_tasks_by_scene_shard(tasks, args.scene_shard_index, args.scene_shard_count)
     if not tasks:
@@ -1005,6 +1055,41 @@ def main() -> None:
                 scene_map[str(task.assignment.label)] = STATUS_NOT_RUN
             with _status_lock(status_path):
                 _write_status_map(status_path, status_map)
+
+    completed_pairs: set[tuple[str, str]] = set()
+    failed_pairs: set[tuple[str, str]] = set()
+    log_resume_reported = False
+    if args.skip_completed_log is not None:
+        completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
+        if status_path is not None:
+            updated_labels = 0
+            if completed_pairs:
+                for task in tasks:
+                    if (task.assignment.scene, task.assignment.actor_id) in completed_pairs:
+                        scene_map = status_map.setdefault(task.assignment.scene, {})
+                        label_key = str(task.assignment.label)
+                        if scene_map.get(label_key) != STATUS_DONE:
+                            scene_map[label_key] = STATUS_DONE
+                            updated_labels += 1
+            if completed_pairs:
+                print(
+                    f"[RESUME] Loaded {len(completed_pairs)} completed jobs from {args.skip_completed_log}.",
+                    flush=True,
+                )
+                if updated_labels:
+                    with _status_lock(status_path):
+                        _write_status_map(status_path, status_map)
+                    print(f"[RESUME] Marked {updated_labels} labels as done via log.", flush=True)
+                else:
+                    print("[RESUME] Completed jobs already marked done in status JSON.", flush=True)
+            else:
+                print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
+            if failed_pairs:
+                print(
+                    f"[RESUME] {len(failed_pairs)} jobs recorded as FAILED in the log will be retried.",
+                    flush=True,
+                )
+            log_resume_reported = True
 
     tasks_by_key: dict[tuple[str, str], LabelTask] = {
         (task.assignment.scene, str(task.assignment.label)): task for task in tasks
@@ -1034,26 +1119,25 @@ def main() -> None:
     plan_indices = {(plan.scene, plan.actor_id): idx for idx, plan in enumerate(plans, start=1)}
     skipped_jobs_from_log = 0
     if args.skip_completed_log is not None and status_path is None:
-        completed_pairs, failed_pairs = load_resume_statuses_from_log(args.skip_completed_log)
         if completed_pairs:
             before = len(plans)
             plans = [plan for plan in plans if (plan.scene, plan.actor_id) not in completed_pairs]
             skipped_jobs_from_log = before - len(plans)
-            print(
-                f"[RESUME] Loaded {len(completed_pairs)} completed jobs from {args.skip_completed_log}.",
-                flush=True,
-            )
-            if skipped_jobs_from_log:
-                print(f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.", flush=True)
+            if not log_resume_reported:
+                print(
+                    f"[RESUME] Loaded {len(completed_pairs)} completed jobs from {args.skip_completed_log}.",
+                    flush=True,
+                )
+                if skipped_jobs_from_log:
+                    print(f"[RESUME] Skipping {skipped_jobs_from_log} jobs listed as successful.", flush=True)
         else:
-            print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
-        if failed_pairs:
+            if not log_resume_reported:
+                print(f"[RESUME] No [SUCCESS] entries found in {args.skip_completed_log}.", flush=True)
+        if failed_pairs and not log_resume_reported:
             print(
                 f"[RESUME] {len(failed_pairs)} jobs recorded as FAILED in the log will be retried.",
                 flush=True,
             )
-    elif args.skip_completed_log is not None and status_path is not None:
-        print("[RESUME] Ignoring --skip-completed-log because --status-json is in use.", flush=True)
     if deferred_tasks:
         print(
             f"[PLAN] {len(plans)} jobs will cover {len(initial_tasks)} label paths "
@@ -1070,14 +1154,15 @@ def main() -> None:
     path_lengths = {
         (task.assignment.scene, str(task.assignment.label)): task.path_length for task in tasks_all
     }
+    max_workers = max(1, args.workers)
     deferred_plans = build_job_plans(deferred_tasks) if deferred_tasks else []
     progress_tracker = ProgressTracker(
         total_jobs=len(plans) + len(deferred_plans),
         total_paths=len(tasks_all),
+        worker_count=max_workers,
         output_path=args.progress_json,
         path_lengths=path_lengths,
     )
-    max_workers = max(1, args.workers)
 
     results: list[dict] = []
     metrics_dir = args.per_job_metrics_dir.resolve()

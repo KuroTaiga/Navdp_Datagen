@@ -24,8 +24,8 @@ show_usage_and_exit() {
 
 # CLI parsing: optional leading RESUME enables resume mode; optional log path is
 # accepted for compatibility but not required.
-RESUME_MODE=false
-RESUME_LOG_PATH=""
+RESUME_MODE=true
+RESUME_LOG_PATH="0500_follow_1.log"
 if [ $# -gt 0 ]; then
   if [ "$1" = "RESUME" ]; then
     RESUME_MODE=true
@@ -55,10 +55,7 @@ abspath() {
 # -----------------------------------------------------------------------------
 # Storage toggles so the same runner can ship data to different targets.
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
-ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
 ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
-ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
-CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
 ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
 CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-false}
 
@@ -100,13 +97,14 @@ fi
 # DATA roots or seeds via environment variables.
 SEED=${SEED:-1}
 CONDA_ENV=${CONDA_ENV:-cuda121}
+# ACTOR_ROOT=${ACTOR_ROOT:-./data/SHHQ_gs/walking}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
-ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_33w_1_npc.json}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_33w_1_npc.json}
+ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_0500_42_follow.json}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500_42_follow.json}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
-TASKS_DIR=${TASKS_DIR:-./data/selected_33w}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/33w_npc_key1}
+TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
+OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_42_follow_key_1}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w_1}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
@@ -118,7 +116,7 @@ LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
 # Optional NPC placement/debug (applies to FPV or following data). Leave values empty to skip.
-NPC_ENABLE=${NPC_ENABLE:-true}                            # true/false to append NPC args
+NPC_ENABLE=${NPC_ENABLE:-false}                            # true/false to append NPC args
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}          # e.g., 0.2 angular coverage
 NPC_COUNT=${NPC_COUNT:-8}                                  # desired NPC count per frame
 NPC_PRIORITY=${NPC_PRIORITY:-coverage}                     # coverage|count
@@ -128,7 +126,8 @@ NPC_FREE_WHITE=${NPC_FREE_WHITE:-true}                     # true => free is whi
 NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}              # angular|area
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio (applied when count>=12)
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
-WORKERS=${WORKERS:-36}
+NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}             # preload this many NPC PLY frames per worker
+WORKERS=${WORKERS:-32}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 # Robot camera stats
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
@@ -146,6 +145,7 @@ ENABLE_RGB_FRAMES=${ENABLE_RGB_FRAMES:-false}
 ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
+EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
 
 # Default render_label_paths.py snippets appended to every worker invocation.
 render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
@@ -203,7 +203,10 @@ if storage_bool_true "$NPC_ENABLE"; then
   if [ -n "${NPC_MAX_RANGE:-}" ]; then
     npc_args+=("--npc-max-range ${NPC_MAX_RANGE}")
   fi
-  # Auto-clearance from HumanGS sources; keep on by default when NPC_ENABLE is true.
+  if [ -n "${NPC_FRAME_POOL_SIZE:-}" ]; then
+    npc_args+=("--npc-frame-pool-size ${NPC_FRAME_POOL_SIZE}")
+  fi
+  # Auto-clearance from SHHQ sources; keep on by default when NPC_ENABLE is true.
   npc_args+=("--npc-auto-clearance" "--npc-actor-root ${ACTOR_ROOT}")
   if [ -n "${NPC_EXTRA_FLAGS:-}" ]; then
     npc_args+=(${NPC_EXTRA_FLAGS})
@@ -538,19 +541,30 @@ generate_assignment_manifest() {
   manifest_dir="$(dirname "$ASSIGNMENTS_OUT")"
   mkdir -p "$manifest_dir"
   echo "[RUN] Random human data generation, seed ${SEED}"
+  local detailed_flag="--exclude-detailed-labels"
+  if ! storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
+    detailed_flag="--no-exclude-detailed-labels"
+  fi
   conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
     --actor-root "${ACTOR_ROOT}" \
     --ban-list "${BAN_LIST}" \
     --assignments-out "${ASSIGNMENTS_OUT}" \
     --scenes-dir "${SCENES_DIR}" \
     --tasks-dir "${TASKS_DIR}" \
-    --seed "${SEED}"
+    --seed "${SEED}" \
+    "$detailed_flag"
   echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
 }
 
 if $RESUME_MODE; then
   if [ -n "$RESUME_LOG_PATH" ]; then
-    echo "[RESUME] NOTE: log path provided but status-json resume is used; ignoring log." >&2
+    if [ -f "$RESUME_LOG_PATH" ]; then
+      RESUME_LOG_PATH="$(abspath "$RESUME_LOG_PATH")"
+      echo "[RESUME] Using resume log ${RESUME_LOG_PATH} to skip completed jobs." >&2
+    else
+      echo "[RESUME] WARN: resume log not found at ${RESUME_LOG_PATH}; continuing with status-json only." >&2
+      RESUME_LOG_PATH=""
+    fi
   fi
   if [ ! -f "$ASSIGNMENTS_OUT" ]; then
     echo "[RESUME] WARN: Assignment manifest missing at $ASSIGNMENTS_OUT; regenerating."
@@ -657,6 +671,14 @@ parallel_cmd=(
   --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
   --cuda-oom-max-retries "${CUDA_OOM_MAX_RETRIES}"
 )
+if storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
+  parallel_cmd+=(--exclude-detailed-labels)
+else
+  parallel_cmd+=(--no-exclude-detailed-labels)
+fi
+if $RESUME_MODE && [ -n "$RESUME_LOG_PATH" ]; then
+  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_PATH")
+fi
 if storage_bool_true "$RETRY_CUDA_OOM"; then
   parallel_cmd+=(--retry-cuda-oom)
 else

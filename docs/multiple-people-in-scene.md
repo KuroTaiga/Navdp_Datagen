@@ -13,7 +13,7 @@ Tracking plan and decisions for this branch.
 - Collision clearance: model each human as a 30 cm radius cylinder; only accept locations with at least that clearance from scene items and other avatars.
 - Height/grounding: pick avatar heights from a plausible range; snap feet to ground height to avoid sinking or hovering.
 - FOV validity: after placement, verify the avatar remains inside the camera FOV; resample if occluded/out of view.
-- Animation source: drive NPC animation from HumanGS assets for consistency with existing humans.
+- Animation source: drive NPC animation from SHHQ assets for consistency with existing humans.
 - Metadata: log chosen seed, avatar id/height, and world position for debugging.
 
 ## NPC placement/density considerations
@@ -26,7 +26,7 @@ Tracking plan and decisions for this branch.
 - Logging: record chosen density inputs (area target or count), resulting coverage, and any resampling attempts.
 - Following data: exclude the followed person’s space from NPC placement but do not count that person toward coverage.
 - Free-space: by default treat near-white occupancy as free (`--npc-free-white --npc-free-threshold 250`); toggle polarity if your occupancy encodes free as dark.
-- Clearance: can auto-compute clearance radius from HumanGS sources (`--npc-auto-clearance --npc-actor-root ./data/human_gs_source`).
+- Clearance: can auto-compute clearance radius from SHHQ sources (`--npc-auto-clearance --npc-actor-root ./data/SHHQ_gs/walking`).
 
 ## Progress
 - Added `utils/npc_density.py` with an occupancy-based wedge sampler: 30 cm disc clearance, coverage-driven target count + max cap, min-distance band (1 m default), and a goal-blocking filter with an allow-blocking toggle. Outputs attempted/rejected counts and achieved coverage to inform logging.
