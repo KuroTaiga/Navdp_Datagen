@@ -140,6 +140,31 @@ ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
 VERBOSE=${VERBOSE:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
+LIGHT_MODE=${LIGHT_MODE:-none}
+LIGHT_STRENGTH=${LIGHT_STRENGTH:-0.0}
+LIGHT_RADIUS=${LIGHT_RADIUS:-0.45}
+LIGHT_CENTER_X=${LIGHT_CENTER_X:-0.5}
+LIGHT_CENTER_Y=${LIGHT_CENTER_Y:-0.5}
+LIGHT_JITTER=${LIGHT_JITTER:-0.0}
+LIGHT_TEMP_K=${LIGHT_TEMP_K:-0}
+LIGHT_VIGNETTE=${LIGHT_VIGNETTE:-0.0}
+LIGHT_SEED=${LIGHT_SEED:-0}
+CL_ENABLE=${CL_ENABLE:-false}
+CL_STRENGTH=${CL_STRENGTH:-1.0}
+CL_COLOR_R=${CL_COLOR_R:-1.0}
+CL_COLOR_G=${CL_COLOR_G:-1.0}
+CL_COLOR_B=${CL_COLOR_B:-1.0}
+CL_AMBIENT=${CL_AMBIENT:-0.2}
+CL_DIFFUSE=${CL_DIFFUSE:-1.0}
+CL_SPECULAR=${CL_SPECULAR:-0.2}
+CL_SHININESS=${CL_SHININESS:-16.0}
+CL_RANGE=${CL_RANGE:-0.0}
+CL_OFFSET_X=${CL_OFFSET_X:-0.0}
+CL_OFFSET_Y=${CL_OFFSET_Y:-0.0}
+CL_OFFSET_Z=${CL_OFFSET_Z:-0.0}
+CL_SHADOW=${CL_SHADOW:-false}
+CL_SHADOW_BIAS=${CL_SHADOW_BIAS:-0.02}
+CL_SHADOW_STRENGTH=${CL_SHADOW_STRENGTH:-0.2}
 
 render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
@@ -174,6 +199,32 @@ else
 fi
 if storage_bool_true "$VERBOSE"; then
   render_extra_args+=' --verbose'
+fi
+if [ "${LIGHT_MODE}" != "none" ]; then
+  render_extra_args+=" --light-mode ${LIGHT_MODE}"
+  render_extra_args+=" --light-strength ${LIGHT_STRENGTH}"
+  render_extra_args+=" --light-radius ${LIGHT_RADIUS}"
+  render_extra_args+=" --light-center ${LIGHT_CENTER_X} ${LIGHT_CENTER_Y}"
+  render_extra_args+=" --light-jitter ${LIGHT_JITTER}"
+  render_extra_args+=" --light-temp-k ${LIGHT_TEMP_K}"
+  render_extra_args+=" --light-vignette ${LIGHT_VIGNETTE}"
+  render_extra_args+=" --light-seed ${LIGHT_SEED}"
+fi
+if storage_bool_true "$CL_ENABLE"; then
+  render_extra_args+=" --cl-enable"
+  render_extra_args+=" --cl-strength ${CL_STRENGTH}"
+  render_extra_args+=" --cl-color ${CL_COLOR_R} ${CL_COLOR_G} ${CL_COLOR_B}"
+  render_extra_args+=" --cl-ambient ${CL_AMBIENT}"
+  render_extra_args+=" --cl-diffuse ${CL_DIFFUSE}"
+  render_extra_args+=" --cl-specular ${CL_SPECULAR}"
+  render_extra_args+=" --cl-shininess ${CL_SHININESS}"
+  render_extra_args+=" --cl-range ${CL_RANGE}"
+  render_extra_args+=" --cl-offset ${CL_OFFSET_X} ${CL_OFFSET_Y} ${CL_OFFSET_Z}"
+  render_extra_args+=" --cl-shadow-bias ${CL_SHADOW_BIAS}"
+  render_extra_args+=" --cl-shadow-strength ${CL_SHADOW_STRENGTH}"
+  if storage_bool_true "$CL_SHADOW"; then
+    render_extra_args+=" --cl-shadow"
+  fi
 fi
 render_extra_snippets=("$render_extra_args")
 

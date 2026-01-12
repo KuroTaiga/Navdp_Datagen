@@ -57,6 +57,8 @@ from plyfile import PlyData, PlyElement, PlyElementParseError
 
 from utils import gaussian_ply_utils as ply_utils
 from utils.general_utils import inverse_sigmoid
+from lighting.lighting_utils import LightFilterConfig, apply_light_filter, stable_hash_seed
+from lighting.shading import CameraLightConfig, apply_camera_light_shading, intrinsics_from_camera
 from utils.render_utils import (
     build_look_at,
     build_perspective_camera,
@@ -365,6 +367,7 @@ class PathMetricRecorder:
     VIDEO_STAGE = "mp4_write_sec"
     PNG_STAGE = "perframe_png_sec"
     DEPTH_STAGE = "perframe_depth_sec"
+    LIGHT_STAGE = "perframe_light_sec"
     PLY_STAGE = "ply_write_sec"
 
     def __init__(self, device: torch.device | None):
@@ -415,15 +418,33 @@ class PathMetricRecorder:
                 avg_bytes = None
         total_measured = sum(
             self.stage_seconds.get(stage, 0.0)
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE)
+            for stage in (
+                self.VIDEO_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.LIGHT_STAGE,
+                self.PLY_STAGE,
+            )
         )
         stage_ratios = {}
         if total_measured > 0.0:
             for stage, seconds in self.stage_seconds.items():
-                if stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+                if stage in (
+                    self.VIDEO_STAGE,
+                    self.PNG_STAGE,
+                    self.DEPTH_STAGE,
+                    self.LIGHT_STAGE,
+                    self.PLY_STAGE,
+                ):
                     stage_ratios[stage] = seconds / total_measured
         else:
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+            for stage in (
+                self.VIDEO_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.LIGHT_STAGE,
+                self.PLY_STAGE,
+            ):
                 stage_ratios[stage] = 0.0
 
         return {
@@ -483,6 +504,72 @@ def _cuda_oom_trace(label: str, device: torch.device, verbose: bool = False):
         if verbose:
             print(f"[VERBOSE][VRAM] {diagnostics}", flush=True)
         raise RuntimeError(diagnostics) from exc
+
+
+def _apply_light_filter_if_enabled(
+    render: np.ndarray,
+    light_config: LightFilterConfig | None,
+    *,
+    frame_index: int,
+    seed_offset: int,
+    metrics: PathMetricRecorder | None,
+) -> np.ndarray:
+    if light_config is None or not light_config.enabled():
+        return render
+    timing_ctx = (
+        metrics.measure(PathMetricRecorder.LIGHT_STAGE)
+        if metrics is not None
+        else contextlib.nullcontext()
+    )
+    with timing_ctx:
+        return apply_light_filter(
+            render,
+            light_config,
+            frame_index=frame_index,
+            seed_offset=seed_offset,
+        )
+
+
+def _apply_camera_light_if_enabled(
+    render: np.ndarray,
+    img_pkg: dict,
+    camera,
+    cl_config: CameraLightConfig | None,
+    *,
+    shadow_depth_inv: np.ndarray | None,
+    shadow_intrinsics: tuple[float, float, float, float] | None,
+    metrics: PathMetricRecorder | None,
+) -> np.ndarray:
+    if cl_config is None or not cl_config.active():
+        return render
+    depth_tensor = img_pkg.get("depth")
+    if depth_tensor is None:
+        return render
+    depth_inv = depth_tensor.detach().cpu().numpy()
+    timing_ctx = (
+        metrics.measure(PathMetricRecorder.LIGHT_STAGE)
+        if metrics is not None
+        else contextlib.nullcontext()
+    )
+    with timing_ctx:
+        fx, fy, cx, cy = intrinsics_from_camera(camera)
+        shadow_fx = shadow_fy = shadow_cx = shadow_cy = None
+        if shadow_intrinsics is not None:
+            shadow_fx, shadow_fy, shadow_cx, shadow_cy = shadow_intrinsics
+        return apply_camera_light_shading(
+            render,
+            depth_inv,
+            config=cl_config,
+            camera_fx=fx,
+            camera_fy=fy,
+            camera_cx=cx,
+            camera_cy=cy,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_fx=shadow_fx,
+            shadow_fy=shadow_fy,
+            shadow_cx=shadow_cx,
+            shadow_cy=shadow_cy,
+        )
 
 
 @dataclass(frozen=True)
@@ -2577,6 +2664,9 @@ def render_actor_camera_only_sequence(
     stabilize: bool,
     verbose: bool,
     dump: ActorDumpOptions | None = None,
+    light_config: LightFilterConfig | None = None,
+    light_seed_offset: int = 0,
+    cl_config: CameraLightConfig | None = None,
     metrics: PathMetricRecorder | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Per-point camera walkthrough (base scene only) with actor pose preview."""
@@ -2686,6 +2776,48 @@ def render_actor_camera_only_sequence(
         ):
             img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
         render = img_pkg["render"].detach().cpu().numpy()
+        shadow_depth_inv = None
+        shadow_intrinsics = None
+        if cl_config is not None and cl_config.shadow_enabled:
+            offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+            if np.any(offset_cam):
+                cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                offset_world = cam_to_world[:3, :3] @ offset_cam
+            else:
+                offset_world = np.zeros(3, dtype=np.float32)
+            light_position = camera_position + offset_world
+            light_target = target + offset_world
+            light_cam = build_perspective_camera(
+                position=light_position,
+                target=light_target,
+                width=width,
+                height=height,
+                fov_deg=fov_deg,
+                znear=znear,
+                zfar=zfar,
+                device=device,
+            )
+            light_pkg = render_or(light_cam, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            shadow_depth_inv = light_pkg.get("depth")
+            if shadow_depth_inv is not None:
+                shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                shadow_intrinsics = intrinsics_from_camera(light_cam)
+        render = _apply_camera_light_if_enabled(
+            render,
+            img_pkg,
+            camera,
+            cl_config,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_intrinsics=shadow_intrinsics,
+            metrics=metrics,
+        )
+        render = _apply_light_filter_if_enabled(
+            render,
+            light_config,
+            frame_index=frame_counter,
+            seed_offset=light_seed_offset,
+            metrics=metrics,
+        )
         render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
         render_uint8 = np.rot90(render_uint8, k=2)
 
@@ -2806,6 +2938,9 @@ def render_actor_follow_sequence(
     npc_actor_runtime: ActorRuntime | None = None,
     npc_actor_pool: NPCActorPool | None = None,
     npc_frame_pool: NPCFramePool | None = None,
+    light_config: LightFilterConfig | None = None,
+    light_seed_offset: int = 0,
+    cl_config: CameraLightConfig | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Render combined scene+actor frames using either CPU or GPU composition."""
 
@@ -3222,6 +3357,48 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
             img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
             render = img_pkg['render'].detach().cpu().numpy()
+            shadow_depth_inv = None
+            shadow_intrinsics = None
+            if cl_config is not None and cl_config.shadow_enabled:
+                offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                if np.any(offset_cam):
+                    cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                    offset_world = cam_to_world[:3, :3] @ offset_cam
+                else:
+                    offset_world = np.zeros(3, dtype=np.float32)
+                light_position = camera_position + offset_world
+                light_target = target + offset_world
+                light_cam = build_perspective_camera(
+                    position=light_position,
+                    target=light_target,
+                    width=width,
+                    height=height,
+                    fov_deg=fov_deg,
+                    znear=znear,
+                    zfar=zfar,
+                    device=device,
+                )
+                light_pkg = render_or(light_cam, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+                shadow_depth_inv = light_pkg.get("depth")
+                if shadow_depth_inv is not None:
+                    shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                    shadow_intrinsics = intrinsics_from_camera(light_cam)
+            render = _apply_camera_light_if_enabled(
+                render,
+                img_pkg,
+                camera,
+                cl_config,
+                shadow_depth_inv=shadow_depth_inv,
+                shadow_intrinsics=shadow_intrinsics,
+                metrics=metrics,
+            )
+            render = _apply_light_filter_if_enabled(
+                render,
+                light_config,
+                frame_index=frame_counter,
+                seed_offset=light_seed_offset,
+                metrics=metrics,
+            )
             render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
             render_uint8 = np.rot90(render_uint8, k=2)
 
@@ -3540,6 +3717,48 @@ def render_actor_follow_sequence(
 
         img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
         render = img_pkg['render'].detach().cpu().numpy()
+        shadow_depth_inv = None
+        shadow_intrinsics = None
+        if cl_config is not None and cl_config.shadow_enabled:
+            offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+            if np.any(offset_cam):
+                cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                offset_world = cam_to_world[:3, :3] @ offset_cam
+            else:
+                offset_world = np.zeros(3, dtype=np.float32)
+            light_position = camera_position + offset_world
+            light_target = target + offset_world
+            light_cam = build_perspective_camera(
+                position=light_position,
+                target=light_target,
+                width=width,
+                height=height,
+                fov_deg=fov_deg,
+                znear=znear,
+                zfar=zfar,
+                device=device,
+            )
+            light_pkg = render_or(light_cam, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+            shadow_depth_inv = light_pkg.get("depth")
+            if shadow_depth_inv is not None:
+                shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                shadow_intrinsics = intrinsics_from_camera(light_cam)
+        render = _apply_camera_light_if_enabled(
+            render,
+            img_pkg,
+            camera,
+            cl_config,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_intrinsics=shadow_intrinsics,
+            metrics=metrics,
+        )
+        render = _apply_light_filter_if_enabled(
+            render,
+            light_config,
+            frame_index=frame_counter,
+            seed_offset=light_seed_offset,
+            metrics=metrics,
+        )
         render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
         render_uint8 = np.rot90(render_uint8, k=2)
 
@@ -3975,6 +4194,8 @@ def render_path_frames(
     prepared_path: PreparedPath | None = None,
     navdp_manager: NavdpPlyCoordinator | None = None,
     metrics_enabled: bool = False,
+    light_config: LightFilterConfig | None = None,
+    cl_config: CameraLightConfig | None = None,
     job_slot: int | None = None,
     job_actor_id: str | None = None,
     job_name: str | None = None,
@@ -4004,6 +4225,11 @@ def render_path_frames(
     metrics_recorder = PathMetricRecorder(device=device) if metrics_enabled else None
     if metrics_recorder:
         metrics_recorder.sample_vram()
+    light_seed_offset = (
+        stable_hash_seed(f"{scene_id}:{json_path.stem}")
+        if light_config is not None and light_config.enabled()
+        else 0
+    )
 
     path_data = prepared_path or prepare_path_data(
         json_path=json_path,
@@ -4226,6 +4452,9 @@ def render_path_frames(
                         stabilize=stabilize,
                         verbose=verbose,
                         dump=dump_options,
+                        light_config=light_config,
+                        light_seed_offset=light_seed_offset,
+                        cl_config=cl_config,
                         metrics=metrics_recorder,
                     )
                     frames_rendered = len(cam_seq)
@@ -4278,6 +4507,9 @@ def render_path_frames(
                         npc_actor_runtime=npc_actor_runtime,
                         npc_actor_pool=npc_actor_pool,
                         npc_frame_pool=npc_frame_pool,
+                        light_config=light_config,
+                        light_seed_offset=light_seed_offset,
+                        cl_config=cl_config,
                     )
                     frames_rendered = len(cam_seq)
                 if render_bev:
@@ -4631,6 +4863,49 @@ def render_path_frames(
                     ):
                         img_pkg = render_or(camera, render_gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
                     render = img_pkg["render"].detach().cpu().numpy()
+                    shadow_depth_inv = None
+                    shadow_intrinsics = None
+                    if not orthographic and cl_config is not None and cl_config.shadow_enabled:
+                        offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                        if np.any(offset_cam):
+                            cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                            offset_world = cam_to_world[:3, :3] @ offset_cam
+                        else:
+                            offset_world = np.zeros(3, dtype=np.float32)
+                        light_position = position + offset_world
+                        light_target = target + offset_world
+                        light_cam = build_perspective_camera(
+                            position=light_position,
+                            target=light_target,
+                            width=width,
+                            height=height,
+                            fov_deg=fov_deg,
+                            znear=znear,
+                            zfar=zfar,
+                            device=device,
+                        )
+                        light_pkg = render_or(light_cam, render_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+                        shadow_depth_inv = light_pkg.get("depth")
+                        if shadow_depth_inv is not None:
+                            shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                            shadow_intrinsics = intrinsics_from_camera(light_cam)
+                    if not orthographic:
+                        render = _apply_camera_light_if_enabled(
+                            render,
+                            img_pkg,
+                            camera,
+                            cl_config,
+                            shadow_depth_inv=shadow_depth_inv,
+                            shadow_intrinsics=shadow_intrinsics,
+                            metrics=metrics_recorder,
+                        )
+                    render = _apply_light_filter_if_enabled(
+                        render,
+                        light_config,
+                        frame_index=idx,
+                        seed_offset=light_seed_offset,
+                        metrics=metrics_recorder,
+                    )
                     render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
                     if orthographic:
                         render_uint8 = np.rot90(render_uint8, k=1)
@@ -4950,6 +5225,132 @@ def parse_args() -> ArgumentParser:
         action=BooleanOptionalAction,
         default=True,
         help="Write per-path follow metadata JSON (separate from per-frame camera metadata; default: on).",
+    )
+    parser.add_argument(
+        "--light-mode",
+        choices=("none", "disk", "cl", "global"),
+        default="none",
+        help="Apply a lighting filter to RGB frames: none, disk, cl (camera light), or global.",
+    )
+    parser.add_argument(
+        "--light-strength",
+        type=float,
+        default=0.0,
+        help="Lighting strength (positive brightens, negative darkens; default: 0.0).",
+    )
+    parser.add_argument(
+        "--light-radius",
+        type=float,
+        default=0.45,
+        help="Disk/CL radius as fraction of min(width,height) (default: 0.45).",
+    )
+    parser.add_argument(
+        "--light-center",
+        type=float,
+        nargs=2,
+        metavar=("X", "Y"),
+        default=(0.5, 0.5),
+        help="Light center as normalized coordinates (default: 0.5 0.5).",
+    )
+    parser.add_argument(
+        "--light-jitter",
+        type=float,
+        default=0.0,
+        help="Randomize light center by this fraction of min(width,height) per frame (default: 0).",
+    )
+    parser.add_argument(
+        "--light-temp-k",
+        type=float,
+        default=0.0,
+        help="Color temperature in Kelvin applied to the light (0 disables, default: 0).",
+    )
+    parser.add_argument(
+        "--light-vignette",
+        type=float,
+        default=0.0,
+        help="Vignette strength applied after lighting (default: 0).",
+    )
+    parser.add_argument(
+        "--light-seed",
+        type=int,
+        default=0,
+        help="Seed for per-frame light jitter (default: 0).",
+    )
+    parser.add_argument(
+        "--cl-enable",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable camera-light shading using depth-derived normals (default: off).",
+    )
+    parser.add_argument(
+        "--cl-strength",
+        type=float,
+        default=1.0,
+        help="Camera light strength multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-color",
+        type=float,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(1.0, 1.0, 1.0),
+        help="Camera light color as RGB in 0..1 (default: 1 1 1).",
+    )
+    parser.add_argument(
+        "--cl-ambient",
+        type=float,
+        default=0.2,
+        help="Ambient term applied before camera light (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-diffuse",
+        type=float,
+        default=1.0,
+        help="Diffuse term multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-specular",
+        type=float,
+        default=0.2,
+        help="Specular term multiplier (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shininess",
+        type=float,
+        default=16.0,
+        help="Specular shininess exponent (default: 16).",
+    )
+    parser.add_argument(
+        "--cl-range",
+        type=float,
+        default=0.0,
+        help="Light falloff range in meters (0 disables attenuation).",
+    )
+    parser.add_argument(
+        "--cl-offset",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Camera-light offset in camera coordinates (meters).",
+    )
+    parser.add_argument(
+        "--cl-shadow",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable shadow mapping from the camera light (default: off).",
+    )
+    parser.add_argument(
+        "--cl-shadow-bias",
+        type=float,
+        default=0.02,
+        help="Depth bias for shadow mapping (default: 0.02).",
+    )
+    parser.add_argument(
+        "--cl-shadow-strength",
+        type=float,
+        default=0.2,
+        help="Shadow strength multiplier (0=black, 1=no shadow; default: 0.2).",
     )
     parser.add_argument(
         "--no-mirror-translation",
@@ -5387,6 +5788,42 @@ def main() -> None:
     save_camera_metadata = bool(args.save_camera_metadata)
     depth_bit_depth = int(args.depth_bit_depth)
     save_follow_metadata = bool(args.save_follow_metadata)
+    light_config = None
+    if args.light_mode != "none":
+        center_x, center_y = (float(args.light_center[0]), float(args.light_center[1]))
+        light_config = LightFilterConfig(
+            mode=str(args.light_mode),
+            strength=float(args.light_strength),
+            radius_frac=float(args.light_radius),
+            center_xy=(center_x, center_y),
+            center_jitter=float(args.light_jitter),
+            temp_k=float(args.light_temp_k),
+            vignette=float(args.light_vignette),
+            seed=int(args.light_seed),
+        )
+    cl_config = None
+    if bool(args.cl_enable):
+        cl_range = float(args.cl_range)
+        cl_range = cl_range if cl_range > 0.0 else None
+        shadow_strength = max(0.0, min(float(args.cl_shadow_strength), 1.0))
+        cl_config = CameraLightConfig(
+            enabled=True,
+            strength=float(args.cl_strength),
+            color=(float(args.cl_color[0]), float(args.cl_color[1]), float(args.cl_color[2])),
+            ambient=float(args.cl_ambient),
+            diffuse=float(args.cl_diffuse),
+            specular=float(args.cl_specular),
+            shininess=float(args.cl_shininess),
+            range_m=cl_range,
+            offset_cam=(
+                float(args.cl_offset[0]),
+                float(args.cl_offset[1]),
+                float(args.cl_offset[2]),
+            ),
+            shadow_enabled=bool(args.cl_shadow),
+            shadow_bias=float(args.cl_shadow_bias),
+            shadow_strength=shadow_strength,
+        )
     npc_render_enabled = bool(args.npc_render)
     npc_bev_use_mask = bool(args.npc_bev_use_mask)
     npc_bloom_radius_px_override = (
@@ -6056,6 +6493,8 @@ def main() -> None:
                         prepared_path=prepared,
                         navdp_manager=navdp_manager,
                         metrics_enabled=metrics_enabled,
+                        light_config=light_config,
+                        cl_config=cl_config,
                         job_slot=args.job_slot,
                         job_actor_id=args.job_actor_id,
                         job_name=args.job_name,
