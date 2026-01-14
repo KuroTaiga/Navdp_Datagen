@@ -39,6 +39,11 @@ from scene.cameras import MiniCam
 from plyfile import PlyData, PlyElement, PlyElementParseError
 
 from utils import gaussian_ply_utils as ply_utils
+from utils.ply_transform_utils import (
+    apply_transform_to_frame,
+    build_transform_matrix,
+    rotation_matrix_z_np,
+)
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import inverse_sigmoid
 
@@ -793,30 +798,6 @@ def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
         raise ValueError(f"Unable to parse actor PLY: {path}") from exc
 
 
-def rotation_matrix_z_np(theta: float) -> np.ndarray:
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    return np.array(
-        [
-            [cos_t, -sin_t, 0.0],
-            [sin_t, cos_t, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def build_transform_matrix(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
-    if rotation.shape != (3, 3):
-        raise ValueError("rotation must be 3x3")
-    if translation.shape != (3,):
-        raise ValueError("translation must be length-3 vector")
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = translation
-    return transform
-
-
 ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
     [
         [1.0, 0.0, 0.0],
@@ -945,29 +926,6 @@ def load_actor_sequence(
         uniform_scale=len(scale_names) == 1,
         max_points=max(frame.base_data.shape[0] for frame in frames),
     )
-
-
-def apply_transform_to_frame(
-    base_frame: ActorSequenceFrame,
-    sequence: ActorSequence,
-    transform: np.ndarray,
-) -> np.ndarray:
-    """Apply a rigid transform to a stored actor frame and return the mutated vertex array."""
-
-    data = np.array(base_frame.base_data, copy=True)
-    ply = ply_utils.GaussianPly(
-        ply=None,
-        vertex=None,
-        data=data,
-        columns=sequence.columns,
-    )
-    ply_utils.apply_transform_inplace(
-        ply,
-        transform,
-        rotate_normals=True,
-        rotate_sh=True,
-    )
-    return ply.data
 
 
 def actor_data_to_tensors(

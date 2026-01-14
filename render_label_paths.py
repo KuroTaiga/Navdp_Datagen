@@ -56,9 +56,16 @@ from scene.cameras import MiniCam
 from plyfile import PlyData, PlyElement, PlyElementParseError
 
 from utils import gaussian_ply_utils as ply_utils
+from utils.ply_transform_utils import (
+    apply_transform_to_frame,
+    build_transform_matrix,
+    PlyTransformBackend,
+    rotation_matrix_z_np,
+)
 from utils.general_utils import inverse_sigmoid
 from lighting.lighting_utils import LightFilterConfig, apply_light_filter, stable_hash_seed
 from lighting.shading import CameraLightConfig, apply_camera_light_shading, intrinsics_from_camera
+from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 from utils.render_utils import (
     build_look_at,
     build_perspective_camera,
@@ -72,6 +79,7 @@ from utils.render_utils import (
 from utils.npc_density import (
     CameraWedge,
     NPCDensityConfig,
+    NPCPlacementBackend,
     compute_clearance_distance,
     estimate_npc_target_count,
     load_free_space_mask,
@@ -93,6 +101,12 @@ DEFAULT_ACTOR_PATTERN = "*.ply"
 DEFAULT_ACTOR_SPEED = 1.3
 ACTOR_REGION_MARGIN = 6.0
 STABILIZE_WINDOW = 5
+PLY_TRANSFORM_BACKEND = PlyTransformBackend.GPU
+VIDEO_WRITER_BACKEND = VideoWriterBackend.NVENC
+VIDEO_NVENC_PRESET: str | None = None
+VIDEO_NVENC_BITRATE: str | None = None
+NPC_PLACEMENT_BACKEND = NPCPlacementBackend.GPU
+NPC_VERBOSE_ENABLED = False
 DEBUG_PLY_DTYPE = np.dtype(
     [
         ("x", np.float32),
@@ -1563,6 +1577,7 @@ def generate_npc_bev_debug_for_path(
             exclude_discs=exclude_discs,
             center_mask=center_mask,
             center_mask_is_bloomed=bloom_mask is not None,
+            backend=NPC_PLACEMENT_BACKEND,
         )
 
         out_path = out_dir / f"npc_bev_{frame_idx:04d}.png"
@@ -2061,30 +2076,6 @@ def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
         raise ValueError(f"Unable to parse actor PLY: {path}") from exc
 
 
-def rotation_matrix_z_np(theta: float) -> np.ndarray:
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    return np.array(
-        [
-            [cos_t, -sin_t, 0.0],
-            [sin_t, cos_t, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def build_transform_matrix(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
-    if rotation.shape != (3, 3):
-        raise ValueError("rotation must be 3x3")
-    if translation.shape != (3,):
-        raise ValueError("translation must be length-3 vector")
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = translation
-    return transform
-
-
 ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
     [
         [1.0, 0.0, 0.0],
@@ -2330,29 +2321,6 @@ def load_actor_frame_sequence(
         uniform_scale=len(scale_names) == 1,
         max_points=frame.base_data.shape[0],
     )
-
-
-def apply_transform_to_frame(
-    base_frame: ActorSequenceFrame,
-    sequence: ActorSequence,
-    transform: np.ndarray,
-) -> np.ndarray:
-    """Apply a rigid transform to a stored actor frame and return the mutated vertex array."""
-
-    data = np.array(base_frame.base_data, copy=True)
-    ply = ply_utils.GaussianPly(
-        ply=None,
-        vertex=None,
-        data=data,
-        columns=sequence.columns,
-    )
-    ply_utils.apply_transform_inplace(
-        ply,
-        transform,
-        rotate_normals=True,
-        rotate_sh=True,
-    )
-    return ply.data
 
 
 def actor_data_to_tensors(
@@ -3105,7 +3073,12 @@ def render_actor_follow_sequence(
 
             # Transform actor for this frame
             base_frame = sequence.frames[plan.base_frame_index]
-            actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+            actor_data = apply_transform_to_frame(
+                base_frame,
+                sequence,
+                plan.transform,
+                backend=PLY_TRANSFORM_BACKEND,
+            )
 
             npc_actor_frames: list[ActorRenderFrame] = []
             npc_debug_vertices: list[np.ndarray] = []
@@ -3180,6 +3153,7 @@ def render_actor_follow_sequence(
                         radii_m=npc_radii,
                         center_mask=npc_center_mask,
                         center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                        backend=NPC_PLACEMENT_BACKEND,
                     )
                     placed_radii = [
                         npc_radii[idx]
@@ -3224,7 +3198,7 @@ def render_actor_follow_sequence(
                             out_path=out_path,
                         )
                     npc_shortfall_total += shortfall
-                    if verbose and shortfall > 0:
+                    if NPC_VERBOSE_ENABLED and shortfall > 0:
                         print(
                             f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                             flush=True,
@@ -3272,7 +3246,12 @@ def render_actor_follow_sequence(
                                     max(npc_num_frames - 1, 0),
                                 )
                             base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                        npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                        npc_data = apply_transform_to_frame(
+                            base_npc_frame,
+                            npc_sequence,
+                            transform,
+                            backend=PLY_TRANSFORM_BACKEND,
+                        )
                         if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                             npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
                         npc_actor_frames.append(
@@ -3472,7 +3451,7 @@ def render_actor_follow_sequence(
                 f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
                 flush=True,
             )
-        if npc_active and verbose and npc_shortfall_total > 0:
+        if npc_active and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
             print(
                 f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
                 flush=True,
@@ -3509,7 +3488,12 @@ def render_actor_follow_sequence(
         prev_forward = forward.copy()
 
         base_frame = sequence.frames[plan.base_frame_index]
-        actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+        actor_data = apply_transform_to_frame(
+            base_frame,
+            sequence,
+            plan.transform,
+            backend=PLY_TRANSFORM_BACKEND,
+        )
 
         npc_vertex_entries: list[np.ndarray] = []
         npc_debug_vertices: list[np.ndarray] = []
@@ -3584,6 +3568,7 @@ def render_actor_follow_sequence(
                     radii_m=npc_radii,
                     center_mask=npc_center_mask,
                     center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                    backend=NPC_PLACEMENT_BACKEND,
                 )
                 placed_radii = [
                     npc_radii[idx]
@@ -3671,7 +3656,12 @@ def render_actor_follow_sequence(
                                 max(npc_num_frames - 1, 0),
                             )
                         base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                    npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                    npc_data = apply_transform_to_frame(
+                        base_npc_frame,
+                        npc_sequence,
+                        transform,
+                        backend=PLY_TRANSFORM_BACKEND,
+                    )
                     npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
                     if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                         npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
@@ -3816,7 +3806,7 @@ def render_actor_follow_sequence(
             f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
             flush=True,
         )
-    if npc_active and verbose and npc_shortfall_total > 0:
+    if npc_active and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
         print(
             f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
             flush=True,
@@ -4283,7 +4273,7 @@ def render_path_frames(
         npc_bloom_radius_m = float(npc_config.clearance_radius)
     if npc_bloom_radius_px is None and npc_bloom_radius_m is not None and npc_meta is not None:
         npc_bloom_radius_px = max(1, _meters_to_px_ceil(npc_meta, npc_bloom_radius_m))
-    if npc_bev_render_debug and npc_bloom_mask is None and npc_free_mask is not None and verbose:
+    if npc_bev_render_debug and npc_bloom_mask is None and npc_free_mask is not None and NPC_VERBOSE_ENABLED:
         print("[WARN] npc_bev_render_debug missing bloom mask; overlay disabled.", flush=True)
     npc_use_actor_pool = npc_actor_pool is not None
     npc_use_frame_pool = npc_frame_pool is not None
@@ -4396,10 +4386,12 @@ def render_path_frames(
         cam_seq: list[np.ndarray] = []
         act_seq: list[np.ndarray] | None = None
         writer_ctx = (
-            imageio.get_writer(
+            make_video_writer(
                 video_path,
-                mode="I",
                 fps=DEFAULT_VIDEO_FPS,
+                backend=VIDEO_WRITER_BACKEND,
+                nvenc_preset=VIDEO_NVENC_PRESET,
+                nvenc_bitrate=VIDEO_NVENC_BITRATE,
             )
             if effective_video
             else contextlib.nullcontext()
@@ -4674,6 +4666,7 @@ def render_path_frames(
                                 radii_m=npc_radii,
                                 center_mask=npc_center_mask,
                                 center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                                backend=NPC_PLACEMENT_BACKEND,
                             )
                             placed_radii = [
                                 npc_radii[idx]
@@ -4718,7 +4711,7 @@ def render_path_frames(
                                     out_path=out_path,
                                 )
                             npc_shortfall_total += shortfall
-                            if verbose and shortfall > 0:
+                            if NPC_VERBOSE_ENABLED and shortfall > 0:
                                 print(
                                     f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                                     flush=True,
@@ -4766,7 +4759,12 @@ def render_path_frames(
                                             max(npc_num_frames - 1, 0),
                                         )
                                     base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                                npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                                npc_data = apply_transform_to_frame(
+                                    base_npc_frame,
+                                    npc_sequence,
+                                    transform,
+                                    backend=PLY_TRANSFORM_BACKEND,
+                                )
                                 if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                                     npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
                                 if gpu_only:
@@ -4975,7 +4973,7 @@ def render_path_frames(
                             flush=True,
                         )
                 frames_rendered = total_positions
-                if npc_enabled and verbose and npc_shortfall_total > 0:
+                if npc_enabled and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
                     print(
                         f"[VERBOSE] Scene {scene_id} / {json_path.stem}: NPC placement shortfall total {npc_shortfall_total}.",
                         flush=True,
@@ -5193,6 +5191,24 @@ def parse_args() -> ArgumentParser:
         help="Write composited MP4 video (default). Use --no-video to keep per-frame PNGs only.",
     )
     parser.add_argument(
+        "--video-backend",
+        choices=[backend.value for backend in VideoWriterBackend],
+        default=VideoWriterBackend.NVENC.value,
+        help="Video writer backend (default: nvenc).",
+    )
+    parser.add_argument(
+        "--video-nvenc-preset",
+        type=str,
+        default=None,
+        help="NVENC preset to use when --video-backend=nvenc (example: p4, slow).",
+    )
+    parser.add_argument(
+        "--video-nvenc-bitrate",
+        type=str,
+        default=None,
+        help="NVENC bitrate to use when --video-backend=nvenc (example: 10M).",
+    )
+    parser.add_argument(
         "--rgb-frames",
         action=BooleanOptionalAction,
         default=False,
@@ -5335,6 +5351,12 @@ def parse_args() -> ArgumentParser:
         help="Camera-light offset in camera coordinates (meters).",
     )
     parser.add_argument(
+        "--cl-normal-smooth",
+        type=int,
+        default=0,
+        help="Box blur radius (pixels) for depth before normal recovery (default: 0).",
+    )
+    parser.add_argument(
         "--cl-shadow",
         action=BooleanOptionalAction,
         default=False,
@@ -5351,6 +5373,12 @@ def parse_args() -> ArgumentParser:
         type=float,
         default=0.2,
         help="Shadow strength multiplier (0=black, 1=no shadow; default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shadow-pcf",
+        type=int,
+        default=0,
+        help="Shadow PCF radius in pixels for soft shadows (default: 0).",
     )
     parser.add_argument(
         "--no-mirror-translation",
@@ -5490,6 +5518,12 @@ def parse_args() -> ArgumentParser:
         help="Compose scene and actor entirely on GPU (no temporary PLYs, higher VRAM usage).",
     )
     parser.add_argument(
+        "--ply-transform-backend",
+        choices=[backend.value for backend in PlyTransformBackend],
+        default=PlyTransformBackend.GPU.value,
+        help="Backend for per-frame PLY transforms (default: gpu).",
+    )
+    parser.add_argument(
         "--animation-cycle-mod",
         type=int,
         default=3,
@@ -5556,6 +5590,12 @@ def parse_args() -> ArgumentParser:
         help="Write per-frame NPC BEV debug images using actual rendered placements.",
     )
     parser.add_argument(
+        "--npc-verbose",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable verbose NPC placement logs (default: off).",
+    )
+    parser.add_argument(
         "--npc-bev-use-mask",
         action=BooleanOptionalAction,
         default=False,
@@ -5566,6 +5606,12 @@ def parse_args() -> ArgumentParser:
         action="store_true",
         default=False,
         help="Render NPCs into RGB/depth using the density planner (not just BEV overlays).",
+    )
+    parser.add_argument(
+        "--npc-placement-backend",
+        choices=[backend.value for backend in NPCPlacementBackend],
+        default=NPCPlacementBackend.GPU.value,
+        help="Backend for NPC placement sampling (default: gpu).",
     )
     parser.add_argument(
         "--npc-actor-dir",
@@ -5758,9 +5804,15 @@ def main() -> None:
     parser = parse_args()
     args = parser.parse_args()
     # Allow overriding dataset roots via CLI to keep worker commands consistent with task planning.
-    global SCENES_DIR, TASK_OUTPUT_DIR  # noqa: PLW0603
+    global SCENES_DIR, TASK_OUTPUT_DIR, PLY_TRANSFORM_BACKEND, VIDEO_WRITER_BACKEND, VIDEO_NVENC_PRESET, VIDEO_NVENC_BITRATE, NPC_PLACEMENT_BACKEND, NPC_VERBOSE_ENABLED  # noqa: PLW0603
     SCENES_DIR = args.scenes_dir
     TASK_OUTPUT_DIR = args.tasks_dir
+    PLY_TRANSFORM_BACKEND = PlyTransformBackend(str(args.ply_transform_backend))
+    VIDEO_WRITER_BACKEND = VideoWriterBackend(str(args.video_backend))
+    VIDEO_NVENC_PRESET = args.video_nvenc_preset
+    VIDEO_NVENC_BITRATE = args.video_nvenc_bitrate
+    NPC_PLACEMENT_BACKEND = NPCPlacementBackend(str(args.npc_placement_backend))
+    NPC_VERBOSE_ENABLED = bool(args.npc_verbose)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device required for rendering but not available.")
@@ -5820,9 +5872,11 @@ def main() -> None:
                 float(args.cl_offset[1]),
                 float(args.cl_offset[2]),
             ),
+            normal_smooth=max(0, int(args.cl_normal_smooth)),
             shadow_enabled=bool(args.cl_shadow),
             shadow_bias=float(args.cl_shadow_bias),
             shadow_strength=shadow_strength,
+            shadow_pcf_radius=max(0, int(args.cl_shadow_pcf)),
         )
     npc_render_enabled = bool(args.npc_render)
     npc_bev_use_mask = bool(args.npc_bev_use_mask)
@@ -6002,7 +6056,7 @@ def main() -> None:
                     height=float(args.actor_height),
                     foot_offset=float(args.actor_foot_offset),
                     debug=debug_enabled,
-                    verbose=verbose_enabled,
+                    verbose=NPC_VERBOSE_ENABLED,
                 )
                 pool_seed = _npc_pool_seed(int(args.npc_seed), args.job_slot, args.job_name)
                 npc_frame_pool.populate(np.random.default_rng(pool_seed))
@@ -6012,7 +6066,7 @@ def main() -> None:
                         flush=True,
                     )
                     npc_render_enabled = False
-                elif verbose_enabled:
+                elif NPC_VERBOSE_ENABLED:
                     print(
                         f"[VERBOSE] NPC frame pool ready: {len(npc_frame_pool.entries)} "
                         f"frame(s) from {frame_root}.",
@@ -6056,9 +6110,9 @@ def main() -> None:
                         foot_offset=float(args.actor_foot_offset),
                         animation_cycle_mod=int(args.animation_cycle_mod),
                         debug=debug_enabled,
-                        verbose=verbose_enabled,
+                        verbose=NPC_VERBOSE_ENABLED,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC actor pool ready: {len(deduped_dirs)} actor(s).",
                             flush=True,
@@ -6074,7 +6128,7 @@ def main() -> None:
                     npc_render_enabled = False
                 elif actor_runtime is not None and npc_actor_dir.resolve() == actor_runtime.options.sequence_dir.resolve():
                     npc_actor_runtime = actor_runtime
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC rendering will reuse actor sequence: {npc_actor_dir}",
                             flush=True,
@@ -6101,7 +6155,7 @@ def main() -> None:
                         debug=debug_enabled,
                     )
                     npc_actor_runtime = ActorRuntime(options=npc_actor_options, sequence=npc_actor_sequence)
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC actor sequence ready: {len(npc_actor_sequence.frames)} frames from {npc_actor_dir}.",
                             flush=True,
@@ -6225,24 +6279,24 @@ def main() -> None:
                                 white_is_inside=bool(args.npc_wall_white),
                             )
                             if wall_mask.shape != npc_free_mask.shape:
-                                if verbose_enabled:
+                                if NPC_VERBOSE_ENABLED:
                                     print(
                                         f"  [NPC] wall_mask.png shape {wall_mask.shape} does not match occupancy {npc_free_mask.shape}; ignoring wall mask.",
                                         flush=True,
                                     )
                             else:
                                 npc_free_mask = npc_free_mask & wall_mask
-                                if verbose_enabled:
+                                if NPC_VERBOSE_ENABLED:
                                     print(
                                         f"  [NPC] Wall mask applied (threshold={args.npc_wall_threshold}).",
                                         flush=True,
                                     )
                         except FileNotFoundError:
-                            if verbose_enabled:
+                            if NPC_VERBOSE_ENABLED:
                                 print("  [NPC] wall_mask.png not found; skipping wall constraint.", flush=True)
                     if npc_free_mask is not None and bool(args.npc_rotate_mask_180):
                         npc_free_mask = np.rot90(npc_free_mask, 2)
-                        if verbose_enabled:
+                        if NPC_VERBOSE_ENABLED:
                             print("  [NPC] Free-space mask rotated 180 degrees.", flush=True)
                     print(f"  [NPC] Free-space mask ready (threshold={args.npc_free_threshold}).", flush=True)
                 except Exception as exc:  # pylint: disable=broad-except
@@ -6258,7 +6312,7 @@ def main() -> None:
                     npc_bloom_radius_px = max(1, _meters_to_px_ceil(meta, npc_bloom_radius_m))
                 clearance_px = compute_clearance_distance(npc_free_mask)
                 if clearance_px is None:
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             "  [WARN] NPC bloom mask needs scipy; using numpy dilation fallback.",
                             flush=True,
@@ -6272,7 +6326,7 @@ def main() -> None:
                     npc_bloom_free_mask = npc_free_mask & (clearance_px > npc_bloom_radius_px)
             if npc_free_mask is not None and npc_bloom_free_mask is None:
                 npc_bloom_free_mask = npc_free_mask
-            if verbose_enabled and npc_bloom_radius_m is not None and npc_bloom_radius_px is not None:
+            if NPC_VERBOSE_ENABLED and npc_bloom_radius_m is not None and npc_bloom_radius_px is not None:
                 print(
                     f"  [NPC] Bloom radius (max loaded): {npc_bloom_radius_m:.3f} m "
                     f"({npc_bloom_radius_px}px).",
@@ -6394,7 +6448,7 @@ def main() -> None:
                         bloom_radius_px=int(npc_bloom_radius_px),
                         out_path=bloom_path,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(f"[VERBOSE] NPC bloom debug -> {bloom_path}", flush=True)
                 if (npc_bev_enabled or npc_bev_render_debug) and npc_bloom_free_mask_debug is not None:
                     free_dir = npc_bev_output_root / scene_id / json_path.stem / "__npc_bev_bloom"
@@ -6405,7 +6459,7 @@ def main() -> None:
                         highlight_color=(255, 0, 0),
                         out_path=free_path,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(f"[VERBOSE] NPC bloom free mask -> {free_path}", flush=True)
                 if npc_bev_enabled and npc_free_mask is not None and npc_occ_image is not None:
                     npc_summary = generate_npc_bev_debug_for_path(
@@ -6430,7 +6484,7 @@ def main() -> None:
                         mirror_bev_x=args.bev_mirror_x,
                         mirror_bev_y=args.bev_mirror_y,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC BEV debug ({npc_summary['frames']} frames, shortfall {npc_summary['shortfall']}) -> {npc_summary['output_dir']}",
                             flush=True,

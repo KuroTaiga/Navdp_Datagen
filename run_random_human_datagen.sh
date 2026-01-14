@@ -16,6 +16,14 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+FFMPEG_BIN=${FFMPEG_BIN:-}
+if [ -z "$FFMPEG_BIN" ] && command -v ffmpeg >/dev/null 2>&1; then
+  FFMPEG_BIN=$(command -v ffmpeg)
+fi
+if [ -n "$FFMPEG_BIN" ]; then
+  export IMAGEIO_FFMPEG_EXE="$FFMPEG_BIN"
+fi
+
 # Tiny helper for consistent usage errors so RESUME mode is easy to discover.
 show_usage_and_exit() {
   echo "Usage: $(basename "$0") [RESUME]" >&2
@@ -127,6 +135,7 @@ NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}              # angular|area
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio (applied when count>=12)
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
 NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}             # preload this many NPC PLY frames per worker
+NPC_PLACEMENT_BACKEND=${NPC_PLACEMENT_BACKEND:-gpu}
 WORKERS=${WORKERS:-32}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 # Robot camera stats
@@ -146,9 +155,15 @@ ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
+PLY_TRANSFORM_BACKEND=${PLY_TRANSFORM_BACKEND:-gpu}
+VIDEO_BACKEND=${VIDEO_BACKEND:-nvenc}
+VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
+VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
 
 # Default render_label_paths.py snippets appended to every worker invocation.
 render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
+render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
+render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else
@@ -158,6 +173,12 @@ if storage_bool_true "$ENABLE_VIDEO_OUTPUT"; then
   render_extra_args+=' --video'
 else
   render_extra_args+=' --no-video'
+fi
+if [ -n "${VIDEO_NVENC_PRESET:-}" ]; then
+  render_extra_args+=" --video-nvenc-preset ${VIDEO_NVENC_PRESET}"
+fi
+if [ -n "${VIDEO_NVENC_BITRATE:-}" ]; then
+  render_extra_args+=" --video-nvenc-bitrate ${VIDEO_NVENC_BITRATE}"
 fi
 if storage_bool_true "$ENABLE_RGB_FRAMES"; then
   render_extra_args+=' --rgb-frames'
@@ -205,6 +226,9 @@ if storage_bool_true "$NPC_ENABLE"; then
   fi
   if [ -n "${NPC_FRAME_POOL_SIZE:-}" ]; then
     npc_args+=("--npc-frame-pool-size ${NPC_FRAME_POOL_SIZE}")
+  fi
+  if [ -n "${NPC_PLACEMENT_BACKEND:-}" ]; then
+    npc_args+=("--npc-placement-backend ${NPC_PLACEMENT_BACKEND}")
   fi
   # Auto-clearance from SHHQ sources; keep on by default when NPC_ENABLE is true.
   npc_args+=("--npc-auto-clearance" "--npc-actor-root ${ACTOR_ROOT}")

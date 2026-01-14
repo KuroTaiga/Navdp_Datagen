@@ -14,29 +14,60 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+
 show_usage_and_exit() {
-  echo "Usage: $(basename "$0") [RESUME]" >&2
+  echo "Usage: $(basename "$0") [RESUME [LOG_PATH]] [--pipeline gpu|legacy] [--legacy-pipeline]" >&2
   exit 1
 }
 
-RESUME_MODE=false
+PIPELINE_MODE=${PIPELINE_MODE:-legacy}
+RESUME_MODE=true
 RESUME_LOG_PATH="0500_fpv_npc.log"
-if [ $# -gt 0 ]; then
-  if [ "$1" = "RESUME" ]; then
-    RESUME_MODE=true
-    shift
-    if [ $# -gt 0 ]; then
-      RESUME_LOG_PATH="$1"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    RESUME)
+      RESUME_MODE=true
       shift
-    fi
-  else
-    echo "[ERROR] Unknown argument: $1" >&2
-    show_usage_and_exit
-  fi
-fi
-if [ $# -gt 0 ]; then
-  echo "[ERROR] Unexpected arguments: $*" >&2
+      if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        RESUME_LOG_PATH="$1"
+        shift
+      fi
+      ;;
+    --pipeline)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "[ERROR] --pipeline expects a value (gpu|legacy)." >&2
+        show_usage_and_exit
+      fi
+      PIPELINE_MODE="$1"
+      shift
+      ;;
+    --legacy-pipeline)
+      PIPELINE_MODE="legacy"
+      shift
+      ;;
+    --gpu-pipeline)
+      PIPELINE_MODE="gpu"
+      shift
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1" >&2
+      show_usage_and_exit
+      ;;
+  esac
+done
+PIPELINE_MODE=$(echo "$PIPELINE_MODE" | tr '[:upper:]' '[:lower:]')
+if [ "$PIPELINE_MODE" != "gpu" ] && [ "$PIPELINE_MODE" != "legacy" ]; then
+  echo "[ERROR] Invalid --pipeline value: ${PIPELINE_MODE} (expected gpu|legacy)." >&2
   show_usage_and_exit
+fi
+
+FFMPEG_BIN=${FFMPEG_BIN:-}
+if [ -n "$FFMPEG_BIN" ]; then
+  export IMAGEIO_FFMPEG_EXE="$FFMPEG_BIN"
+elif [ "$PIPELINE_MODE" = "gpu" ] && command -v ffmpeg >/dev/null 2>&1; then
+  export IMAGEIO_FFMPEG_EXE
+  IMAGEIO_FFMPEG_EXE=$(command -v ffmpeg)
 fi
 
 abspath() {
@@ -101,7 +132,7 @@ REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-36}
+WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -123,6 +154,7 @@ NPC_ROTATE_MASK_180=${NPC_ROTATE_MASK_180:-true} # rotate to aligne with actual 
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}
 NPC_AUTO_CLEARANCE=${NPC_AUTO_CLEARANCE:-true}
 NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}
+NPC_PLACEMENT_BACKEND=${NPC_PLACEMENT_BACKEND:-}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/SHHQ_gs/walking}
 
 RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
@@ -140,6 +172,20 @@ ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
 VERBOSE=${VERBOSE:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
+VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
+VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
+
+GPU_ONLY_FLAG="--gpu-only"
+if [ "$PIPELINE_MODE" = "legacy" ]; then
+  : "${PLY_TRANSFORM_BACKEND:=cpu}"
+  : "${VIDEO_BACKEND:=cpu}"
+  : "${NPC_PLACEMENT_BACKEND:=cpu}"
+  GPU_ONLY_FLAG=""
+else
+  : "${PLY_TRANSFORM_BACKEND:=gpu}"
+  : "${VIDEO_BACKEND:=nvenc}"
+  : "${NPC_PLACEMENT_BACKEND:=gpu}"
+fi
 LIGHT_MODE=${LIGHT_MODE:-none}
 LIGHT_STRENGTH=${LIGHT_STRENGTH:-0.0}
 LIGHT_RADIUS=${LIGHT_RADIUS:-0.45}
@@ -162,11 +208,15 @@ CL_RANGE=${CL_RANGE:-0.0}
 CL_OFFSET_X=${CL_OFFSET_X:-0.0}
 CL_OFFSET_Y=${CL_OFFSET_Y:-0.0}
 CL_OFFSET_Z=${CL_OFFSET_Z:-0.0}
+CL_NORMAL_SMOOTH=${CL_NORMAL_SMOOTH:-0}
 CL_SHADOW=${CL_SHADOW:-false}
 CL_SHADOW_BIAS=${CL_SHADOW_BIAS:-0.02}
 CL_SHADOW_STRENGTH=${CL_SHADOW_STRENGTH:-0.2}
+CL_SHADOW_PCF=${CL_SHADOW_PCF:-0}
 
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
+render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
+render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
+render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else
@@ -176,6 +226,12 @@ if storage_bool_true "$ENABLE_VIDEO_OUTPUT"; then
   render_extra_args+=' --video'
 else
   render_extra_args+=' --no-video'
+fi
+if [ -n "${VIDEO_NVENC_PRESET:-}" ]; then
+  render_extra_args+=" --video-nvenc-preset ${VIDEO_NVENC_PRESET}"
+fi
+if [ -n "${VIDEO_NVENC_BITRATE:-}" ]; then
+  render_extra_args+=" --video-nvenc-bitrate ${VIDEO_NVENC_BITRATE}"
 fi
 if storage_bool_true "$ENABLE_RGB_FRAMES"; then
   render_extra_args+=' --rgb-frames'
@@ -220,8 +276,10 @@ if storage_bool_true "$CL_ENABLE"; then
   render_extra_args+=" --cl-shininess ${CL_SHININESS}"
   render_extra_args+=" --cl-range ${CL_RANGE}"
   render_extra_args+=" --cl-offset ${CL_OFFSET_X} ${CL_OFFSET_Y} ${CL_OFFSET_Z}"
+  render_extra_args+=" --cl-normal-smooth ${CL_NORMAL_SMOOTH}"
   render_extra_args+=" --cl-shadow-bias ${CL_SHADOW_BIAS}"
   render_extra_args+=" --cl-shadow-strength ${CL_SHADOW_STRENGTH}"
+  render_extra_args+=" --cl-shadow-pcf ${CL_SHADOW_PCF}"
   if storage_bool_true "$CL_SHADOW"; then
     render_extra_args+=" --cl-shadow"
   fi
@@ -258,6 +316,9 @@ if storage_bool_true "$NPC_ENABLE"; then
   fi
   if [ -n "${NPC_FRAME_POOL_SIZE:-}" ]; then
     npc_args+=("--npc-frame-pool-size ${NPC_FRAME_POOL_SIZE}")
+  fi
+  if [ -n "${NPC_PLACEMENT_BACKEND:-}" ]; then
+    npc_args+=("--npc-placement-backend ${NPC_PLACEMENT_BACKEND}")
   fi
   if storage_bool_true "$NPC_AUTO_CLEARANCE"; then
     if [ -d "$ACTOR_ROOT" ]; then

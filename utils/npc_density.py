@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Literal, Sequence
 
@@ -16,6 +18,15 @@ except Exception:  # pragma: no cover - optional dependency
 from utils.render_utils import load_occupancy_metadata, world_to_pixel
 
 EPS = 1e-6
+
+
+class NPCPlacementBackend(str, Enum):
+    CPU = "cpu"
+    GPU = "gpu"
+
+
+_GPU_BACKEND_FAILED = False
+_GPU_FALLBACK_REPORTED = False
 
 
 @dataclass(frozen=True)
@@ -324,7 +335,7 @@ def _distribute_counts(total: int, weights: Sequence[float]) -> list[int]:
     return base.tolist()
 
 
-def plan_npc_positions(
+def _plan_npc_positions_cpu(
     *,
     wedge: CameraWedge,
     free_mask: np.ndarray,
@@ -501,6 +512,311 @@ def plan_npc_positions(
         shortfall=shortfall,
         accepted_indices=[idx for _, _, idx in placements],
     )
+
+
+def _plan_npc_positions_gpu(
+    *,
+    wedge: CameraWedge,
+    free_mask: np.ndarray,
+    meta: dict,
+    rng: np.random.Generator,
+    config: NPCDensityConfig,
+    goal_xy: np.ndarray | None = None,
+    exclude_discs: Sequence[tuple[np.ndarray, float]] | None = None,
+    radii_m: Sequence[float] | None = None,
+    center_mask: np.ndarray | None = None,
+    center_mask_is_bloomed: bool = False,
+) -> NPCPlacementResult:
+    try:
+        import torch
+    except Exception as exc:  # pylint: disable=broad-except
+        raise RuntimeError("GPU NPC placement requires torch.") from exc
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("GPU NPC placement requires a CUDA device.")
+
+    forward_xy = _normalize(wedge.forward_xy)
+    fov_rad = math.radians(wedge.fov_deg)
+    base_min = max(config.min_center_distance, wedge.min_range)
+    r_max = (
+        wedge.max_range
+        if config.max_distance_from_camera is None
+        else min(wedge.max_range, config.max_distance_from_camera)
+    )
+    if r_max <= base_min:
+        return NPCPlacementResult(
+            positions_xy=[],
+            requested_count=0,
+            achieved_coverage=0.0,
+            target_coverage=config.target_coverage,
+            attempts=0,
+            rejected_blocking=0,
+            rejected_clearance=0,
+            rejected_oob=0,
+            shortfall=0,
+            accepted_indices=[],
+        )
+
+    base_radius = max(float(config.clearance_radius), EPS)
+    target_count, _coverage_cap = estimate_npc_target_count(
+        wedge=wedge,
+        config=config,
+        radius_m=base_radius,
+    )
+    if radii_m is not None:
+        radii = [max(float(r), EPS) for r in radii_m]
+        if config.max_npcs is not None and config.max_npcs > 0:
+            radii = radii[: config.max_npcs]
+        target_count = len(radii)
+    else:
+        radii = [base_radius] * target_count
+
+    if target_count <= 0 or not radii:
+        return NPCPlacementResult(
+            positions_xy=[],
+            requested_count=0,
+            achieved_coverage=0.0,
+            target_coverage=config.target_coverage,
+            attempts=0,
+            rejected_blocking=0,
+            rejected_clearance=0,
+            rejected_oob=0,
+            shortfall=0,
+            accepted_indices=[],
+        )
+
+    zones = _zone_bounds(base_min, r_max)
+    effective_weights = config.zone_weights if target_count >= 12 else (1.0, 1.0, 1.0)
+    zone_counts = _distribute_counts(target_count, effective_weights)
+
+    placements: list[tuple[np.ndarray, float, int]] = []
+    rejected_blocking = rejected_clearance = rejected_oob = 0
+    attempts = 0
+    max_attempts = max(config.max_resamples * max(target_count, 1), config.max_resamples)
+    radius_idx = 0
+
+    device = torch.device("cuda")
+    free_mask_c = np.ascontiguousarray(free_mask)
+    free_mask_t = torch.as_tensor(free_mask_c, device=device)
+    center_mask_c = np.ascontiguousarray(center_mask) if center_mask is not None else None
+    center_mask_t = torch.as_tensor(center_mask_c, device=device) if center_mask_c is not None else None
+    circle_cache: dict[int, torch.Tensor] = {}
+
+    def _inside_center_mask_torch(xy: np.ndarray) -> bool:
+        u, v = world_to_pixel(meta, xy)
+        h, w = center_mask_t.shape[:2]
+        if u < 0 or v < 0 or u >= w or v >= h:
+            return False
+        value = center_mask_t[v, u]
+        if center_mask_t.dtype == torch.bool:
+            return bool(value.item())
+        return bool((value >= config.free_pixel_min).item())
+
+    def _inside_mask_torch(xy: np.ndarray, radius_m: float) -> bool:
+        u, v = world_to_pixel(meta, xy)
+        radius_px = int(math.ceil(radius_m / float(meta["scale"])))
+        h, w = free_mask_t.shape[:2]
+        if u < radius_px or v < radius_px or u >= w - radius_px or v >= h - radius_px:
+            return False
+        circle = circle_cache.get(radius_px)
+        if circle is None:
+            offsets = torch.arange(-radius_px, radius_px + 1, device=device)
+            du = offsets.unsqueeze(0)
+            dv = offsets.unsqueeze(1)
+            circle = (du * du + dv * dv) <= (radius_px * radius_px)
+            circle_cache[radius_px] = circle
+        region = free_mask_t[v - radius_px : v + radius_px + 1, u - radius_px : u + radius_px + 1]
+        if region.shape != circle.shape:
+            return False
+        if region.dtype != torch.bool:
+            region = region >= config.free_pixel_min
+        return bool(torch.all(region[circle]).item())
+
+    for zone_idx, need in enumerate(zone_counts):
+        z_min, z_max = zones[zone_idx]
+        while need > 0 and attempts < max_attempts and radius_idx < len(radii):
+            radius = radii[radius_idx]
+            min_center = base_min + radius
+            if min_center > r_max:
+                rejected_oob += 1
+                radius_idx += 1
+                need -= 1
+                continue
+            z_min_eff = max(z_min, min_center)
+            z_max_eff = max(z_min_eff, z_max)
+            attempts += 1
+            angle = rng.uniform(-0.5 * fov_rad, 0.5 * fov_rad)
+            r = (
+                math.sqrt(rng.uniform(z_min_eff * z_min_eff, z_max_eff * z_max_eff))
+                if z_max_eff > z_min_eff
+                else z_min_eff
+            )
+            direction = _rotate(forward_xy, angle)
+            candidate = wedge.origin_xy + direction * r
+
+            if center_mask_t is not None:
+                if not _inside_center_mask_torch(candidate):
+                    rejected_oob += 1
+                    continue
+            if not center_mask_is_bloomed:
+                if not _inside_mask_torch(candidate, radius):
+                    rejected_oob += 1
+                    continue
+
+            too_close = any(
+                float(np.linalg.norm(candidate - placed)) < (radius + placed_radius - EPS)
+                for placed, placed_radius, _ in placements
+            )
+            if not too_close and exclude_discs:
+                for center, exclude_radius in exclude_discs:
+                    if float(np.linalg.norm(candidate - center)) < (exclude_radius + radius - EPS):
+                        too_close = True
+                        break
+            if too_close:
+                rejected_clearance += 1
+                continue
+
+            if (
+                not config.allow_blocking
+                and goal_xy is not None
+                and _blocks_goal(wedge.origin_xy, goal_xy, candidate, radius)
+            ):
+                rejected_blocking += 1
+                continue
+
+            placements.append((candidate.astype(np.float32), radius, radius_idx))
+            radius_idx += 1
+            need -= 1
+
+    achieved_coverage = 0.0
+    if placements:
+        if config.coverage_mode == "area":
+            wedge_area = _wedge_area(fov_rad, base_min, r_max)
+            if wedge_area > 0.0:
+                covered_area = sum(_disc_area(r) for _, r, _ in placements)
+                achieved_coverage = min(1.0, covered_area / wedge_area)
+        else:
+            total_angle = 0.0
+            fov_half = 0.5 * fov_rad
+            for pos, radius, _ in placements:
+                offset = pos - wedge.origin_xy
+                dist = float(np.linalg.norm(offset))
+                center_angle = _angle_between(forward_xy, offset)
+                span = _effective_disc_span(
+                    radius,
+                    max(dist, radius + EPS),
+                    fov_half,
+                    center_angle,
+                )
+                total_angle += span
+            if fov_rad > 0.0:
+                achieved_coverage = min(1.0, total_angle / fov_rad)
+    shortfall = max(0, target_count - len(placements))
+
+    return NPCPlacementResult(
+        positions_xy=[pos for pos, _, _ in placements],
+        requested_count=target_count,
+        achieved_coverage=achieved_coverage,
+        target_coverage=config.target_coverage,
+        attempts=attempts,
+        rejected_blocking=rejected_blocking,
+        rejected_clearance=rejected_clearance,
+        rejected_oob=rejected_oob,
+        shortfall=shortfall,
+        accepted_indices=[idx for _, _, idx in placements],
+    )
+
+
+def plan_npc_positions(
+    *,
+    wedge: CameraWedge,
+    free_mask: np.ndarray,
+    meta: dict,
+    rng: np.random.Generator,
+    config: NPCDensityConfig,
+    goal_xy: np.ndarray | None = None,
+    exclude_discs: Sequence[tuple[np.ndarray, float]] | None = None,
+    radii_m: Sequence[float] | None = None,
+    center_mask: np.ndarray | None = None,
+    center_mask_is_bloomed: bool = False,
+    backend: NPCPlacementBackend | str = NPCPlacementBackend.CPU,
+) -> NPCPlacementResult:
+    """
+    Sample NPC positions inside the camera wedge with disc clearance.
+
+    The sampler targets a coverage fraction (if provided) and falls back to max_npcs as a cap.
+    It rejects candidates that collide with obstacles/other NPCs, fall outside the mask, or
+    block the camera->goal segment when blocking is disabled. Optional exclude_discs are treated
+    as occupied (collide but do not contribute to coverage).
+    If center_mask is provided, it is treated as a pre-cleared mask of allowed centers.
+    When center_mask_is_bloomed is True, the clearance check against free_mask is skipped.
+    """
+    global _GPU_BACKEND_FAILED, _GPU_FALLBACK_REPORTED
+    backend_value = (
+        backend.value if isinstance(backend, NPCPlacementBackend) else str(backend).lower()
+    )
+    if backend_value == NPCPlacementBackend.CPU.value:
+        return _plan_npc_positions_cpu(
+            wedge=wedge,
+            free_mask=free_mask,
+            meta=meta,
+            rng=rng,
+            config=config,
+            goal_xy=goal_xy,
+            exclude_discs=exclude_discs,
+            radii_m=radii_m,
+            center_mask=center_mask,
+            center_mask_is_bloomed=center_mask_is_bloomed,
+        )
+    if backend_value == NPCPlacementBackend.GPU.value:
+        if _GPU_BACKEND_FAILED:
+            return _plan_npc_positions_cpu(
+                wedge=wedge,
+                free_mask=free_mask,
+                meta=meta,
+                rng=rng,
+                config=config,
+                goal_xy=goal_xy,
+                exclude_discs=exclude_discs,
+                radii_m=radii_m,
+                center_mask=center_mask,
+                center_mask_is_bloomed=center_mask_is_bloomed,
+            )
+        try:
+            return _plan_npc_positions_gpu(
+                wedge=wedge,
+                free_mask=free_mask,
+                meta=meta,
+                rng=rng,
+                config=config,
+                goal_xy=goal_xy,
+                exclude_discs=exclude_discs,
+                radii_m=radii_m,
+                center_mask=center_mask,
+                center_mask_is_bloomed=center_mask_is_bloomed,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            _GPU_BACKEND_FAILED = True
+            if not _GPU_FALLBACK_REPORTED:
+                print(
+                    f"[WARN] GPU NPC placement failed ({exc}); falling back to CPU.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _GPU_FALLBACK_REPORTED = True
+            return _plan_npc_positions_cpu(
+                wedge=wedge,
+                free_mask=free_mask,
+                meta=meta,
+                rng=rng,
+                config=config,
+                goal_xy=goal_xy,
+                exclude_discs=exclude_discs,
+                radii_m=radii_m,
+                center_mask=center_mask,
+                center_mask_is_bloomed=center_mask_is_bloomed,
+            )
+    raise ValueError(f"Unknown NPC placement backend: {backend}")
 
 
 def estimate_coverage_for_positions(

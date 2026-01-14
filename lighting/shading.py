@@ -18,9 +18,11 @@ class CameraLightConfig:
     shininess: float
     range_m: float | None
     offset_cam: Tuple[float, float, float]
+    normal_smooth: int
     shadow_enabled: bool
     shadow_bias: float
     shadow_strength: float
+    shadow_pcf_radius: int
 
     def active(self) -> bool:
         return self.enabled
@@ -55,6 +57,28 @@ def _compute_camera_points(
     return np.stack((x, y, z), axis=-1)
 
 
+def _box_blur_sum(img: np.ndarray, radius: int) -> np.ndarray:
+    if radius <= 0:
+        return img
+    pad = np.pad(img, ((radius, radius), (radius, radius)), mode="edge")
+    csum = np.cumsum(np.cumsum(pad, axis=0), axis=1)
+    csum = np.pad(csum, ((1, 0), (1, 0)), mode="constant")
+    k = 2 * radius + 1
+    return csum[k:, k:] - csum[:-k, k:] - csum[k:, :-k] + csum[:-k, :-k]
+
+
+def _box_blur(img: np.ndarray, radius: int, *, weights: np.ndarray | None = None) -> np.ndarray:
+    if radius <= 0:
+        return img
+    if weights is None:
+        norm = float((2 * radius + 1) ** 2)
+        return _box_blur_sum(img, radius) / max(norm, 1.0)
+    weights = weights.astype(np.float32, copy=False)
+    num = _box_blur_sum(img * weights, radius)
+    den = _box_blur_sum(weights, radius)
+    return np.divide(num, den, out=img.copy(), where=den > 1e-6)
+
+
 def _normalize_vectors(vectors: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     norm = np.linalg.norm(vectors, axis=-1, keepdims=True)
     norm = np.maximum(norm, eps)
@@ -78,7 +102,7 @@ def _compute_normals(points_cam: np.ndarray) -> np.ndarray:
     return normals
 
 
-def _compute_shadow_mask(
+def _compute_shadow_factor(
     points_cam: np.ndarray,
     shadow_depth_m: np.ndarray,
     *,
@@ -88,6 +112,8 @@ def _compute_shadow_mask(
     cy: float,
     offset_cam: Tuple[float, float, float],
     bias: float,
+    strength: float,
+    pcf_radius: int,
 ) -> np.ndarray:
     h, w = shadow_depth_m.shape
     offset = np.array(offset_cam, dtype=np.float32)
@@ -100,11 +126,31 @@ def _compute_shadow_mask(
     v_i = np.rint(v).astype(np.int32)
     in_bounds = (u_i >= 0) & (u_i < w) & (v_i >= 0) & (v_i < h)
     mask = valid & in_bounds
-    shadow = np.zeros_like(z, dtype=bool)
-    if np.any(mask):
+    if not np.any(mask):
+        return np.ones_like(z, dtype=np.float32)
+
+    if pcf_radius <= 0:
+        shadow = np.zeros_like(z, dtype=bool)
         depth_ref = shadow_depth_m[v_i[mask], u_i[mask]]
         shadow[mask] = (depth_ref > 0.0) & (z[mask] > depth_ref + bias)
-    return shadow
+        return np.where(shadow, strength, 1.0).astype(np.float32)
+
+    shadow_hits = np.zeros_like(z, dtype=np.float32)
+    sample_counts = np.zeros_like(z, dtype=np.float32)
+    for dy in range(-pcf_radius, pcf_radius + 1):
+        for dx in range(-pcf_radius, pcf_radius + 1):
+            u_s = u_i + dx
+            v_s = v_i + dy
+            in_bounds = (u_s >= 0) & (u_s < w) & (v_s >= 0) & (v_s < h)
+            mask_s = mask & in_bounds
+            if not np.any(mask_s):
+                continue
+            depth_ref = shadow_depth_m[v_s[mask_s], u_s[mask_s]]
+            hit = (depth_ref > 0.0) & (z[mask_s] > depth_ref + bias)
+            shadow_hits[mask_s] += hit.astype(np.float32)
+            sample_counts[mask_s] += 1.0
+    ratio = np.divide(shadow_hits, sample_counts, out=np.zeros_like(shadow_hits), where=sample_counts > 0.0)
+    return 1.0 - ratio * (1.0 - strength)
 
 
 def apply_camera_light_shading(
@@ -130,7 +176,13 @@ def apply_camera_light_shading(
         depth_m = np.squeeze(depth_m)
     if depth_m.ndim != 2:
         return render
-    valid = depth_m > 0.0
+    valid = np.isfinite(depth_m) & (depth_m > 0.0)
+
+    normal_smooth = max(0, int(config.normal_smooth))
+    if normal_smooth > 0:
+        weights = valid.astype(np.float32)
+        depth_m = _box_blur(depth_m, normal_smooth, weights=weights)
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
 
     if render.ndim == 3 and render.shape[0] in (3, 4):
         base = np.transpose(render[:3, :, :], (1, 2, 0)).astype(np.float32, copy=False)
@@ -167,7 +219,7 @@ def apply_camera_light_shading(
         and shadow_cy is not None
     ):
         shadow_depth_m = _inverse_depth_to_meters(shadow_depth_inv)
-        shadow = _compute_shadow_mask(
+        shadow_factor = _compute_shadow_factor(
             points_cam,
             shadow_depth_m,
             fx=shadow_fx,
@@ -176,17 +228,22 @@ def apply_camera_light_shading(
             cy=shadow_cy,
             offset_cam=config.offset_cam,
             bias=float(config.shadow_bias),
+            strength=float(config.shadow_strength),
+            pcf_radius=max(0, int(config.shadow_pcf_radius)),
         )
-        shadow_factor = np.where(shadow, float(config.shadow_strength), 1.0)
+        shadow_factor = np.where(valid, shadow_factor, 1.0)
 
     light_rgb = np.array(config.color, dtype=np.float32)
+    ambient = max(float(config.ambient), 0.0)
     diffuse_term = config.diffuse * diff * att * shadow_factor
     spec_term = config.specular * spec * att * shadow_factor
+    diffuse_term = np.where(valid, diffuse_term, 0.0)
     spec_term = np.where(valid, spec_term, 0.0)
-    shade = config.ambient + config.strength * diffuse_term
-    shade = np.where(valid, shade, 1.0)
-    lit = base * shade[..., None]
-    lit += config.strength * spec_term[..., None] * light_rgb[None, None, :]
+
+    lit = base * ambient
+    lit += base * (config.strength * diffuse_term)[..., None] * light_rgb[None, None, :]
+    lit += (config.strength * spec_term)[..., None] * light_rgb[None, None, :]
+    lit = np.where(valid[..., None], lit, base)
     lit = np.clip(lit, 0.0, 1.0)
 
     if layout == "chw":
