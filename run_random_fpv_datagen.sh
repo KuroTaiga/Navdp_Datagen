@@ -14,6 +14,8 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+# Keep Python stdout unbuffered so progress lines show up in logs.
+export PYTHONUNBUFFERED=1
 
 show_usage_and_exit() {
   echo "Usage: $(basename "$0") [RESUME [LOG_PATH]] [--pipeline gpu|legacy] [--legacy-pipeline]" >&2

@@ -14,6 +14,14 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
+FFMPEG_BIN=${FFMPEG_BIN:-}
+if [ -n "$FFMPEG_BIN" ]; then
+  export IMAGEIO_FFMPEG_EXE="$FFMPEG_BIN"
+elif command -v ffmpeg >/dev/null 2>&1; then
+  export IMAGEIO_FFMPEG_EXE
+  IMAGEIO_FFMPEG_EXE=$(command -v ffmpeg)
+fi
+
 if [ -n "${CONDA_ENV:-}" ] && command -v conda >/dev/null 2>&1; then
   PYTHON_CMD=(conda run --no-capture-output -n "$CONDA_ENV" "$PYTHON_BIN")
 else
@@ -34,6 +42,9 @@ COUNT=${COUNT:-30}
 SEED=${SEED:-12345}
 REUSE_SAMPLE=${REUSE_SAMPLE:-true}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
+VIDEO_BACKEND=${VIDEO_BACKEND:-cpu}
+VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
+VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
 
 FRAME_STEP=${FRAME_STEP:-1}
 PIXEL_STEP=${PIXEL_STEP:-4}
@@ -50,7 +61,15 @@ GOLDEN_TEMP_K=${GOLDEN_TEMP_K:-3200}
 BLUE_STRENGTH=${BLUE_STRENGTH:--0.35}
 BLUE_TEMP_K=${BLUE_TEMP_K:-9000}
 
-COMMON_RENDER_ARGS=${COMMON_RENDER_ARGS:-"--view-mode forward --gpu-only --height-offset ${HEIGHT_OFFSET} --no-rgb-frames --no-save-depth-maps --no-save-camera-metadata --no-show-BEV"}
+VIDEO_ARGS="--video-backend ${VIDEO_BACKEND}"
+if [ -n "${VIDEO_NVENC_PRESET}" ]; then
+  VIDEO_ARGS="${VIDEO_ARGS} --video-nvenc-preset ${VIDEO_NVENC_PRESET}"
+fi
+if [ -n "${VIDEO_NVENC_BITRATE}" ]; then
+  VIDEO_ARGS="${VIDEO_ARGS} --video-nvenc-bitrate ${VIDEO_NVENC_BITRATE}"
+fi
+
+COMMON_RENDER_ARGS=${COMMON_RENDER_ARGS:-"--view-mode forward --gpu-only --height-offset ${HEIGHT_OFFSET} --no-rgb-frames --no-save-depth-maps --no-save-camera-metadata --no-show-BEV ${VIDEO_ARGS}"}
 
 SAMPLE_JSON="${OUT_ROOT}/sample_${COUNT}.json"
 SAMPLE_TXT="${OUT_ROOT}/sample_${COUNT}.txt"
