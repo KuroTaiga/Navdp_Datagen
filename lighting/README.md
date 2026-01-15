@@ -116,11 +116,38 @@ python lighting/build_lighting_dataset.py ./data2/0500_fpv \
   --base-luma 0.46
 ```
 
+## Time-of-Day Lighting Tones
+
+Generate multiple datasets with different color temperatures and brightness levels to simulate
+daylight hours:
+
+```bash
+python lighting/build_time_of_day_dataset.py ./data2/0500_fpv \
+  --presets dawn noon dusk \
+  --output-root ./data2 \
+  --workers 8
+```
+
+Outputs are written to folders named like `./data2/0500_fpv_dawn`. Use `--preset-json` to supply
+custom tone settings.
+Built-in presets: `dawn`, `morning`, `noon`, `afternoon`, `golden_hour`, `dusk`, `blue_hour`, `night`.
+
+## Time-of-Day Method Comparison (Render vs MP4)
+
+Compare golden/blue hour lighting between render-time filtering and MP4 post-processing:
+
+```bash
+bash lighting/run_time_of_day_compare.sh
+```
+
+Override tone strengths and temperatures via env vars (`GOLDEN_STRENGTH`, `GOLDEN_TEMP_K`,
+`BLUE_STRENGTH`, `BLUE_TEMP_K`) or set `TONES="golden_hour blue_hour"`.
+
 Defaults:
-- Computes base luma from the input dataset.
+- Skips base luma unless `--suffix-mode luma`, `--compute-base-luma`, or `--base-only` is set.
 - Generates three outputs: 1.5x brighter, 0.5x darker, 0.2x darker.
 - Output folders are suffixed by scale (e.g., `./data2/0500_fpv_1.5L`).
-- Non-MP4 files are symlinked by default (`--other-mode link`).
+- Non-MP4 files are skipped by default; use `--other-mode copy` to copy after MP4 processing.
 
 Alternate suffix modes:
 - `--suffix-mode luma` -> `_0.300`

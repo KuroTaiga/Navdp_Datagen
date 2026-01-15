@@ -16,40 +16,61 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   fi
 fi
 
-FFMPEG_BIN=${FFMPEG_BIN:-}
-if [ -z "$FFMPEG_BIN" ] && command -v ffmpeg >/dev/null 2>&1; then
-  FFMPEG_BIN=$(command -v ffmpeg)
-fi
-if [ -n "$FFMPEG_BIN" ]; then
-  export IMAGEIO_FFMPEG_EXE="$FFMPEG_BIN"
-fi
-
 # Tiny helper for consistent usage errors so RESUME mode is easy to discover.
 show_usage_and_exit() {
-  echo "Usage: $(basename "$0") [RESUME]" >&2
+  echo "Usage: $(basename "$0") [RESUME [LOG_PATH]] [--pipeline gpu|legacy] [--legacy-pipeline]" >&2
   exit 1
 }
 
-# CLI parsing: optional leading RESUME enables resume mode; optional log path is
-# accepted for compatibility but not required.
+# CLI parsing: optional RESUME enables resume mode; optional log path accepted.
+PIPELINE_MODE=${PIPELINE_MODE:-gpu}
 RESUME_MODE=true
 RESUME_LOG_PATH="0500_follow_1.log"
-if [ $# -gt 0 ]; then
-  if [ "$1" = "RESUME" ]; then
-    RESUME_MODE=true
-    shift
-    if [ $# -gt 0 ]; then
-      RESUME_LOG_PATH="$1"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    RESUME)
+      RESUME_MODE=true
       shift
-    fi
-  else
-    echo "[ERROR] Unknown argument: $1" >&2
-    show_usage_and_exit
-  fi
-fi
-if [ $# -gt 0 ]; then
-  echo "[ERROR] Unexpected arguments: $*" >&2
+      if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+        RESUME_LOG_PATH="$1"
+        shift
+      fi
+      ;;
+    --pipeline)
+      shift
+      if [ $# -eq 0 ]; then
+        echo "[ERROR] --pipeline expects a value (gpu|legacy)." >&2
+        show_usage_and_exit
+      fi
+      PIPELINE_MODE="$1"
+      shift
+      ;;
+    --legacy-pipeline)
+      PIPELINE_MODE="legacy"
+      shift
+      ;;
+    --gpu-pipeline)
+      PIPELINE_MODE="gpu"
+      shift
+      ;;
+    *)
+      echo "[ERROR] Unknown argument: $1" >&2
+      show_usage_and_exit
+      ;;
+  esac
+done
+PIPELINE_MODE=$(echo "$PIPELINE_MODE" | tr '[:upper:]' '[:lower:]')
+if [ "$PIPELINE_MODE" != "gpu" ] && [ "$PIPELINE_MODE" != "legacy" ]; then
+  echo "[ERROR] Invalid --pipeline value: ${PIPELINE_MODE} (expected gpu|legacy)." >&2
   show_usage_and_exit
+fi
+
+FFMPEG_BIN=${FFMPEG_BIN:-}
+if [ -n "$FFMPEG_BIN" ]; then
+  export IMAGEIO_FFMPEG_EXE="$FFMPEG_BIN"
+elif [ "$PIPELINE_MODE" = "gpu" ] && command -v ffmpeg >/dev/null 2>&1; then
+  export IMAGEIO_FFMPEG_EXE
+  IMAGEIO_FFMPEG_EXE=$(command -v ffmpeg)
 fi
 
 # Convenience wrapper so we can expand relative paths and keep the script POSIX-ish.
@@ -135,7 +156,7 @@ NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}              # angular|area
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}                    # near:mid:far ratio (applied when count>=12)
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}                       # any extra passthrough (e.g., --npc-bev-debug)
 NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-50}             # preload this many NPC PLY frames per worker
-NPC_PLACEMENT_BACKEND=${NPC_PLACEMENT_BACKEND:-gpu}
+NPC_PLACEMENT_BACKEND=${NPC_PLACEMENT_BACKEND:-}
 WORKERS=${WORKERS:-32}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 # Robot camera stats
@@ -155,13 +176,22 @@ ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
-PLY_TRANSFORM_BACKEND=${PLY_TRANSFORM_BACKEND:-gpu}
-VIDEO_BACKEND=${VIDEO_BACKEND:-nvenc}
 VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
 VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
 
+GPU_ONLY_FLAG="--gpu-only"
+if [ "$PIPELINE_MODE" = "legacy" ]; then
+  : "${PLY_TRANSFORM_BACKEND:=cpu}"
+  : "${VIDEO_BACKEND:=cpu}"
+  : "${NPC_PLACEMENT_BACKEND:=cpu}"
+else
+  : "${PLY_TRANSFORM_BACKEND:=gpu}"
+  : "${VIDEO_BACKEND:=nvenc}"
+  : "${NPC_PLACEMENT_BACKEND:=gpu}"
+fi
+
 # Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_args="--overwrite --stabilize --gpu-only --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
+render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
 render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
 render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
