@@ -105,6 +105,7 @@ PLY_TRANSFORM_BACKEND = PlyTransformBackend.GPU
 VIDEO_WRITER_BACKEND = VideoWriterBackend.NVENC
 VIDEO_NVENC_PRESET: str | None = None
 VIDEO_NVENC_BITRATE: str | None = None
+GPU_VIDEO_FORMAT = "ABGR"
 NPC_PLACEMENT_BACKEND = NPCPlacementBackend.GPU
 NPC_VERBOSE_ENABLED = False
 DEBUG_PLY_DTYPE = np.dtype(
@@ -379,6 +380,8 @@ class PathMetricRecorder:
     """Track per-path runtime metrics for downstream progress reporting."""
 
     VIDEO_STAGE = "mp4_write_sec"
+    VIDEO_ENCODE_STAGE = "h264_encode_sec"
+    VIDEO_MUX_STAGE = "h264_mux_sec"
     PNG_STAGE = "perframe_png_sec"
     DEPTH_STAGE = "perframe_depth_sec"
     LIGHT_STAGE = "perframe_light_sec"
@@ -434,6 +437,8 @@ class PathMetricRecorder:
             self.stage_seconds.get(stage, 0.0)
             for stage in (
                 self.VIDEO_STAGE,
+                self.VIDEO_ENCODE_STAGE,
+                self.VIDEO_MUX_STAGE,
                 self.PNG_STAGE,
                 self.DEPTH_STAGE,
                 self.LIGHT_STAGE,
@@ -445,6 +450,8 @@ class PathMetricRecorder:
             for stage, seconds in self.stage_seconds.items():
                 if stage in (
                     self.VIDEO_STAGE,
+                    self.VIDEO_ENCODE_STAGE,
+                    self.VIDEO_MUX_STAGE,
                     self.PNG_STAGE,
                     self.DEPTH_STAGE,
                     self.LIGHT_STAGE,
@@ -454,6 +461,8 @@ class PathMetricRecorder:
         else:
             for stage in (
                 self.VIDEO_STAGE,
+                self.VIDEO_ENCODE_STAGE,
+                self.VIDEO_MUX_STAGE,
                 self.PNG_STAGE,
                 self.DEPTH_STAGE,
                 self.LIGHT_STAGE,
@@ -584,6 +593,83 @@ def _apply_camera_light_if_enabled(
             shadow_cx=shadow_cx,
             shadow_cy=shadow_cy,
         )
+
+
+def _render_tensor_to_gpu_format(render_tensor: torch.Tensor, *, gpu_format: str) -> torch.Tensor:
+    render_uint8_gpu = (render_tensor.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    render_uint8_gpu = render_uint8_gpu.permute(1, 2, 0)
+    alpha = torch.full(
+        (render_uint8_gpu.shape[0], render_uint8_gpu.shape[1], 1),
+        255,
+        device=render_uint8_gpu.device,
+        dtype=torch.uint8,
+    )
+    fmt = gpu_format.upper()
+    if fmt == "ABGR":
+        # PyNvVideoCodec expects little-endian ABGR; RGBA byte order matches that.
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    if fmt == "ARGB":
+        # PyNvVideoCodec expects little-endian ARGB; BGRA byte order matches that.
+        render_uint8_gpu = render_uint8_gpu[..., [2, 1, 0]]
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    raise ValueError(f"Unsupported GPU video format: {gpu_format}")
+
+
+def _gpu_format_to_rgb_cpu(render_uint8_gpu: torch.Tensor, *, gpu_format: str) -> np.ndarray:
+    fmt = gpu_format.upper()
+    if fmt == "ABGR":
+        return render_uint8_gpu[..., :3].detach().cpu().numpy()
+    if fmt == "ARGB":
+        return render_uint8_gpu[..., [2, 1, 0]].detach().cpu().numpy()
+    raise ValueError(f"Unsupported GPU video format: {gpu_format}")
+
+
+def _prepare_render_uint8(
+    *,
+    img_pkg: dict,
+    camera,
+    cl_config: CameraLightConfig | None,
+    shadow_depth_inv: np.ndarray | None,
+    shadow_intrinsics: tuple[float, float, float, float] | None,
+    light_config: LightFilterConfig | None,
+    frame_index: int,
+    light_seed_offset: int,
+    metrics: PathMetricRecorder | None,
+    use_gpu_video: bool,
+) -> tuple[np.ndarray | None, torch.Tensor | None]:
+    render_tensor = img_pkg["render"]
+    if use_gpu_video:
+        if (cl_config is not None and cl_config.active()) or (
+            light_config is not None and light_config.enabled()
+        ):
+            raise RuntimeError(
+                "GPU video backend does not support CPU light filters; disable "
+                "--cl-enable/--light-mode for video-backend=gpu."
+            )
+        render_uint8_gpu = _render_tensor_to_gpu_format(render_tensor, gpu_format=GPU_VIDEO_FORMAT)
+        render_uint8_gpu = render_uint8_gpu.flip((0, 1)).contiguous()
+        return None, render_uint8_gpu
+
+    render = render_tensor.detach().cpu().numpy()
+    render = _apply_camera_light_if_enabled(
+        render,
+        img_pkg,
+        camera,
+        cl_config,
+        shadow_depth_inv=shadow_depth_inv,
+        shadow_intrinsics=shadow_intrinsics,
+        metrics=metrics,
+    )
+    render = _apply_light_filter_if_enabled(
+        render,
+        light_config,
+        frame_index=frame_index,
+        seed_offset=light_seed_offset,
+        metrics=metrics,
+    )
+    render_uint8_cpu = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+    render_uint8_cpu = np.rot90(render_uint8_cpu, k=2)
+    return render_uint8_cpu, None
 
 
 @dataclass(frozen=True)
@@ -980,6 +1066,33 @@ class PathSampler:
         if norm < EPS:
             return np.array([0.0, 1.0], dtype=np.float32)
         return vec / norm
+
+
+def resample_path_by_distance(
+    points: Sequence[np.ndarray], step: float, eps: float = 1e-4
+) -> list[np.ndarray]:
+    """Resample a path at a fixed spatial step to reduce motion jitter."""
+
+    if step <= 0.0 or len(points) < 2:
+        return list(points)
+    sampler = PathSampler(points)
+    total = sampler.total_length
+    if total <= step:
+        return list(points)
+
+    distances: list[float] = []
+    dist = 0.0
+    while dist < total:
+        distances.append(dist)
+        dist += step
+    distances.append(total)
+
+    resampled = [sampler.position_at(float(d)) for d in distances]
+    deduped = [resampled[0]]
+    for point in resampled[1:]:
+        if np.linalg.norm(point - deduped[-1]) > eps:
+            deduped.append(point)
+    return [np.array([pt[0], pt[1]], dtype=np.float32) for pt in deduped]
 
 
 _DIGIT_PATTERN = re.compile(r"(\d+)")
@@ -2642,6 +2755,12 @@ def render_actor_camera_only_sequence(
     options = actor_runtime.options
     sequence = actor_runtime.sequence
     follow_distance_m = max(float(options.follow_distance), 0.0)
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     sampler = PathSampler(path_xy)
     distances = list(sampler.cumulative)
@@ -2743,7 +2862,6 @@ def render_actor_camera_only_sequence(
             verbose,
         ):
             img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
-        render = img_pkg["render"].detach().cpu().numpy()
         shadow_depth_inv = None
         shadow_intrinsics = None
         if cl_config is not None and cl_config.shadow_enabled:
@@ -2770,24 +2888,18 @@ def render_actor_camera_only_sequence(
             if shadow_depth_inv is not None:
                 shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
                 shadow_intrinsics = intrinsics_from_camera(light_cam)
-        render = _apply_camera_light_if_enabled(
-            render,
-            img_pkg,
-            camera,
-            cl_config,
+        render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+            img_pkg=img_pkg,
+            camera=camera,
+            cl_config=cl_config,
             shadow_depth_inv=shadow_depth_inv,
             shadow_intrinsics=shadow_intrinsics,
-            metrics=metrics,
-        )
-        render = _apply_light_filter_if_enabled(
-            render,
-            light_config,
+            light_config=light_config,
             frame_index=frame_counter,
-            seed_offset=light_seed_offset,
+            light_seed_offset=light_seed_offset,
             metrics=metrics,
+            use_gpu_video=use_gpu_video,
         )
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-        render_uint8 = np.rot90(render_uint8, k=2)
 
         # Save requested artifacts.
         if save_rgb_frames:
@@ -2799,7 +2911,11 @@ def render_actor_camera_only_sequence(
                     else contextlib.nullcontext()
                 )
                 with timing_ctx:
-                    imageio.imwrite(frame_path, render_uint8)
+                    if render_uint8_cpu is None:
+                        render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                            render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                    imageio.imwrite(frame_path, render_uint8_cpu)
             except Exception as e:
                 print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
         if save_depth_maps:
@@ -2831,12 +2947,15 @@ def render_actor_camera_only_sequence(
         if video:
             try:
                 timing_ctx = (
-                    metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                    metrics.measure(video_stage)
                     if metrics is not None
                     else contextlib.nullcontext()
                 )
                 with timing_ctx:
-                    writer.append_data(render_uint8)
+                    if use_gpu_video:
+                        writer.append_data(render_uint8_gpu)
+                    else:
+                        writer.append_data(render_uint8_cpu)
             except Exception as e:
                 print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                 raise
@@ -2916,6 +3035,12 @@ def render_actor_follow_sequence(
     sequence = actor_runtime.sequence
     if not sequence.frames:
         raise ValueError("Actor sequence is empty; cannot render.")
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     sampler = PathSampler(path_xy)  
     distances = list(sampler.cumulative)
@@ -3335,7 +3460,6 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}")
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
             img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
-            render = img_pkg['render'].detach().cpu().numpy()
             shadow_depth_inv = None
             shadow_intrinsics = None
             if cl_config is not None and cl_config.shadow_enabled:
@@ -3362,24 +3486,18 @@ def render_actor_follow_sequence(
                 if shadow_depth_inv is not None:
                     shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
                     shadow_intrinsics = intrinsics_from_camera(light_cam)
-            render = _apply_camera_light_if_enabled(
-                render,
-                img_pkg,
-                camera,
-                cl_config,
+            render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+                img_pkg=img_pkg,
+                camera=camera,
+                cl_config=cl_config,
                 shadow_depth_inv=shadow_depth_inv,
                 shadow_intrinsics=shadow_intrinsics,
-                metrics=metrics,
-            )
-            render = _apply_light_filter_if_enabled(
-                render,
-                light_config,
+                light_config=light_config,
                 frame_index=frame_counter,
-                seed_offset=light_seed_offset,
+                light_seed_offset=light_seed_offset,
                 metrics=metrics,
+                use_gpu_video=use_gpu_video,
             )
-            render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-            render_uint8 = np.rot90(render_uint8, k=2)
 
             # Save requested artifacts without blocking rendering.
             if save_rgb_frames:
@@ -3391,7 +3509,11 @@ def render_actor_follow_sequence(
                         else contextlib.nullcontext()
                     )
                     with timing_ctx:
-                        imageio.imwrite(frame_path, render_uint8)
+                        if render_uint8_cpu is None:
+                            render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                                render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                            )
+                        imageio.imwrite(frame_path, render_uint8_cpu)
                 except Exception as e:
                     print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
             if save_depth_maps:
@@ -3423,12 +3545,15 @@ def render_actor_follow_sequence(
             if video:
                 try:
                     timing_ctx = (
-                        metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                        metrics.measure(video_stage)
                         if metrics is not None
                         else contextlib.nullcontext()
                     )
                     with timing_ctx:
-                        writer.append_data(render_uint8)
+                        if use_gpu_video:
+                            writer.append_data(render_uint8_gpu)
+                        else:
+                            writer.append_data(render_uint8_cpu)
                 except Exception as e:
                     print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                     raise  # Re-raise video errors as they're critical
@@ -3706,7 +3831,6 @@ def render_actor_follow_sequence(
         )
 
         img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
-        render = img_pkg['render'].detach().cpu().numpy()
         shadow_depth_inv = None
         shadow_intrinsics = None
         if cl_config is not None and cl_config.shadow_enabled:
@@ -3733,32 +3857,29 @@ def render_actor_follow_sequence(
             if shadow_depth_inv is not None:
                 shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
                 shadow_intrinsics = intrinsics_from_camera(light_cam)
-        render = _apply_camera_light_if_enabled(
-            render,
-            img_pkg,
-            camera,
-            cl_config,
+        render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+            img_pkg=img_pkg,
+            camera=camera,
+            cl_config=cl_config,
             shadow_depth_inv=shadow_depth_inv,
             shadow_intrinsics=shadow_intrinsics,
-            metrics=metrics,
-        )
-        render = _apply_light_filter_if_enabled(
-            render,
-            light_config,
+            light_config=light_config,
             frame_index=frame_counter,
-            seed_offset=light_seed_offset,
+            light_seed_offset=light_seed_offset,
             metrics=metrics,
+            use_gpu_video=use_gpu_video,
         )
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-        render_uint8 = np.rot90(render_uint8, k=2)
 
         if video:
             with (
-                metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                metrics.measure(video_stage)
                 if metrics is not None
                 else contextlib.nullcontext()
             ):
-                writer.append_data(render_uint8)
+                if use_gpu_video:
+                    writer.append_data(render_uint8_gpu)
+                else:
+                    writer.append_data(render_uint8_cpu)
         elif save_rgb_frames:
             frame_path = frames_dir / f"{frame_prefix}_{frame_counter:04d}.png"
             with (
@@ -3766,7 +3887,11 @@ def render_actor_follow_sequence(
                 if metrics is not None
                 else contextlib.nullcontext()
             ):
-                imageio.imwrite(frame_path, render_uint8)
+                if render_uint8_cpu is None:
+                    render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                        render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                    )
+                imageio.imwrite(frame_path, render_uint8_cpu)
         if save_depth_maps:
             try:
                 _save_depth_map(
@@ -3885,6 +4010,7 @@ def prepare_path_data(
     stride: int,
     mirror_translation: bool,
     swap_xy: bool,
+    resample_step: float,
 ) -> PreparedPath:
     raw_points, raster_pixels = load_raster_world_points(json_path, swap_xy=swap_xy)
     a_x, b_x, a_y, b_y = derive_affine_transform(raw_points, raster_pixels, meta)
@@ -3907,6 +4033,12 @@ def prepare_path_data(
         ]
     else:
         path_xy = [np.array([pt[0], pt[1]], dtype=np.float32) for pt in sampled_xy]
+
+    if resample_step > 0.0:
+        resampled = resample_path_by_distance(path_xy, resample_step)
+        if len(resampled) >= 2:
+            path_xy = resampled
+            sampled_xy = resampled
 
     return PreparedPath(
         path_xy=path_xy,
@@ -4148,6 +4280,7 @@ def render_path_frames(
     meta: dict,
     output_dir: Path,
     stride: int,
+    resample_step: float,
     height_offset: float,
     look_ahead: float,
     look_down: float,
@@ -4227,10 +4360,17 @@ def render_path_frames(
         stride=stride,
         mirror_translation=mirror_translation,
         swap_xy=swap_xy,
+        resample_step=resample_step,
     )
     path_xy = path_data.path_xy
     if len(path_xy) < 2:
         raise ValueError(f"Need at least two distinct points in {json_path}")
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     floor_z = path_data.floor_z
     ceiling = path_data.ceiling
@@ -4392,6 +4532,19 @@ def render_path_frames(
                 backend=VIDEO_WRITER_BACKEND,
                 nvenc_preset=VIDEO_NVENC_PRESET,
                 nvenc_bitrate=VIDEO_NVENC_BITRATE,
+                width=width,
+                height=height,
+                gpu_format=GPU_VIDEO_FORMAT,
+                encode_timer=(
+                    (lambda: metrics_recorder.measure(PathMetricRecorder.VIDEO_ENCODE_STAGE))
+                    if metrics_recorder is not None and use_gpu_video
+                    else None
+                ),
+                mux_timer=(
+                    (lambda: metrics_recorder.measure(PathMetricRecorder.VIDEO_MUX_STAGE))
+                    if metrics_recorder is not None and use_gpu_video
+                    else None
+                ),
             )
             if effective_video
             else contextlib.nullcontext()
@@ -4860,7 +5013,6 @@ def render_path_frames(
                         verbose,
                     ):
                         img_pkg = render_or(camera, render_gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
-                    render = img_pkg["render"].detach().cpu().numpy()
                     shadow_depth_inv = None
                     shadow_intrinsics = None
                     if not orthographic and cl_config is not None and cl_config.shadow_enabled:
@@ -4887,28 +5039,53 @@ def render_path_frames(
                         if shadow_depth_inv is not None:
                             shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
                             shadow_intrinsics = intrinsics_from_camera(light_cam)
-                    if not orthographic:
-                        render = _apply_camera_light_if_enabled(
+                    render_uint8_cpu: np.ndarray | None = None
+                    render_uint8_gpu: torch.Tensor | None = None
+                    if use_gpu_video:
+                        if (cl_config is not None and cl_config.active()) or (
+                            light_config is not None and light_config.enabled()
+                        ):
+                            raise RuntimeError(
+                                "GPU video backend does not support CPU light filters; disable "
+                                "--cl-enable/--light-mode for video-backend=gpu."
+                            )
+                        render_tensor = img_pkg["render"]
+                        render_uint8_gpu = _render_tensor_to_gpu_format(
+                            render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                        if orthographic:
+                            render_uint8_gpu = torch.rot90(render_uint8_gpu, k=1, dims=(0, 1))
+                        else:
+                            render_uint8_gpu = render_uint8_gpu.flip((0, 1))
+                        render_uint8_gpu = render_uint8_gpu.contiguous()
+                    else:
+                        render = img_pkg["render"].detach().cpu().numpy()
+                        if not orthographic:
+                            render = _apply_camera_light_if_enabled(
+                                render,
+                                img_pkg,
+                                camera,
+                                cl_config,
+                                shadow_depth_inv=shadow_depth_inv,
+                                shadow_intrinsics=shadow_intrinsics,
+                                metrics=metrics_recorder,
+                            )
+                        render = _apply_light_filter_if_enabled(
                             render,
-                            img_pkg,
-                            camera,
-                            cl_config,
-                            shadow_depth_inv=shadow_depth_inv,
-                            shadow_intrinsics=shadow_intrinsics,
+                            light_config,
+                            frame_index=idx,
+                            seed_offset=light_seed_offset,
                             metrics=metrics_recorder,
                         )
-                    render = _apply_light_filter_if_enabled(
-                        render,
-                        light_config,
-                        frame_index=idx,
-                        seed_offset=light_seed_offset,
-                        metrics=metrics_recorder,
-                    )
-                    render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-                    if orthographic:
-                        render_uint8 = np.rot90(render_uint8, k=1)
-                    else:
-                        render_uint8 = np.rot90(render_uint8, k=2)
+                        render_uint8_cpu = (
+                            (np.clip(render, 0.0, 1.0) * 255.0)
+                            .astype(np.uint8)
+                            .transpose(1, 2, 0)
+                        )
+                        if orthographic:
+                            render_uint8_cpu = np.rot90(render_uint8_cpu, k=1)
+                        else:
+                            render_uint8_cpu = np.rot90(render_uint8_cpu, k=2)
 
                     if save_rgb_frames:
                         try:
@@ -4919,7 +5096,11 @@ def render_path_frames(
                                 else contextlib.nullcontext()
                             )
                             with timing_ctx:
-                                imageio.imwrite(frame_path, render_uint8)
+                                if render_uint8_cpu is None:
+                                    render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                                        render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                                    )
+                                imageio.imwrite(frame_path, render_uint8_cpu)
                         except Exception as e:
                             print(f"[WARN] Failed to save RGB frame {idx}: {e}", flush=True)
                     if save_depth_maps:
@@ -4951,12 +5132,15 @@ def render_path_frames(
                     if video:
                         try:
                             timing_ctx = (
-                                metrics_recorder.measure(PathMetricRecorder.VIDEO_STAGE)
+                                metrics_recorder.measure(video_stage)
                                 if metrics_recorder is not None
                                 else contextlib.nullcontext()
                             )
                             with timing_ctx:
-                                writer.append_data(render_uint8)
+                                if use_gpu_video:
+                                    writer.append_data(render_uint8_gpu)
+                                else:
+                                    writer.append_data(render_uint8_cpu)
                         except Exception as e:
                             print(f"[ERROR] Failed to append frame {idx} to video: {e}", flush=True)
                             raise
@@ -5094,6 +5278,12 @@ def parse_args() -> ArgumentParser:
         type=int,
         default=1,
         help="Render every Nth point along the raster_world polyline (default: 1).",
+    )
+    parser.add_argument(
+        "--path-resample-step",
+        type=float,
+        default=0.0,
+        help="Resample path points at a fixed step (meters) after stride/mirror to reduce jitter (default: 0).",
     )
     parser.add_argument(
         "--height-offset",
@@ -6382,6 +6572,7 @@ def main() -> None:
                     stride=max(1, args.stride),
                     mirror_translation=mirror_translation_flag,
                     swap_xy=swap_xy_enabled,
+                    resample_step=float(args.path_resample_step),
                 )
 
                 est_frames = len(prepared.path_xy)
@@ -6511,6 +6702,7 @@ def main() -> None:
                         meta=meta,
                         output_dir=args.output_dir,
                         stride=max(1, args.stride),
+                        resample_step=float(args.path_resample_step),
                         height_offset=args.height_offset,
                         look_ahead=args.look_ahead,
                         look_down=args.look_down,

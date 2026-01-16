@@ -18,6 +18,7 @@ import re
 import shlex
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -58,6 +59,12 @@ STATUS_MEANINGS = {
     "2": "retry_or_started",
     "3": "skip_fatal",
 }
+WORKER_PROGRESS_PATTERNS = (
+    re.compile(r"^\s*\[\d+/\d+/\d+\]\s*->\s*\S+"),
+    re.compile(r"^\s*\[skip\]\s+\S+"),
+    re.compile(r"^\[VERBOSE\]\s+Scene\s+\S+\s+/\s+\S+:\s+render finished\."),
+)
+WORKER_PROGRESS_LOCK = threading.Lock()
 
 
 @dataclass
@@ -370,6 +377,18 @@ def _status_should_run(status_val: int | None) -> bool:
     return int(status_val) % 2 == 0
 
 
+def _should_forward_worker_line(line: str) -> bool:
+    stripped = line.rstrip("\n")
+    return any(pattern.search(stripped) for pattern in WORKER_PROGRESS_PATTERNS)
+
+
+def _emit_worker_progress(line: str, *, plan: JobPlan, worker_slot: int | None) -> None:
+    prefix = f"[WORKER {worker_slot}]" if worker_slot is not None else "[WORKER]"
+    message = line.strip()
+    with WORKER_PROGRESS_LOCK:
+        print(f"{prefix} scene={plan.scene} actor={plan.actor_id} {message}", flush=True)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Shard render_label_paths.py invocations per actor/scene pairing."
@@ -462,6 +481,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("parallel_render_logs"),
         help="Directory where per-job stdout/stderr logs will be written.",
+    )
+    parser.add_argument(
+        "--worker-progress",
+        action="store_true",
+        help="Echo per-path worker progress lines from job logs to stdout.",
     )
     parser.add_argument(
         "--report-out",
@@ -634,6 +658,7 @@ def gather_label_tasks(
                 stride=max(1, stride),
                 mirror_translation=mirror_translation,
                 swap_xy=swap_xy,
+                resample_step=0.0,
             )
             path_length = float(PathSampler(prepared.path_xy).total_length) if len(prepared.path_xy) >= 2 else 0.0
             estimated_frames = estimate_actor_frame_count(
@@ -718,6 +743,7 @@ def gather_fpv_tasks(
                     stride=max(1, stride),
                     mirror_translation=mirror_translation,
                     swap_xy=swap_xy,
+                    resample_step=0.0,
                 )
                 path_length = float(PathSampler(prepared.path_xy).total_length) if len(prepared.path_xy) >= 2 else 0.0
                 estimated_frames = estimate_actor_frame_count(
@@ -940,6 +966,8 @@ def run_job(
     dry_run: bool,
     job_name: str | None = None,
     metrics_path: Path | None = None,
+    worker_slot: int | None = None,
+    worker_progress: bool = False,
 ) -> dict:
     log_dir.mkdir(parents=True, exist_ok=True)
     base_name = job_name or f"{idx:04d}_{plan.scene}_{plan.actor_id}"
@@ -963,15 +991,36 @@ def run_job(
             "metrics_path": str(metrics_path) if metrics_path else None,
         }
 
-    with temp_log_path.open("w", encoding="utf-8") as log_file:
+    with temp_log_path.open("w", encoding="utf-8", buffering=1) as log_file:
         log_file.write(" ".join(shlex.quote(part) for part in cmd) + "\n\n")
         log_file.flush()
-        proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
-        pid = proc.pid
-        log_file.write(f"[INFO] PID={pid}\n")
-        log_file.flush()
-        proc.wait()
-        returncode = proc.returncode
+        if worker_progress:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+            )
+            pid = proc.pid
+            log_file.write(f"[INFO] PID={pid}\n")
+            log_file.flush()
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    log_file.write(line)
+                    if _should_forward_worker_line(line):
+                        _emit_worker_progress(line, plan=plan, worker_slot=worker_slot)
+            proc.wait()
+            returncode = proc.returncode
+        else:
+            proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+            pid = proc.pid
+            log_file.write(f"[INFO] PID={pid}\n")
+            log_file.flush()
+            proc.wait()
+            returncode = proc.returncode
     duration = time.time() - start
     if pid is not None:
         candidate = log_dir / f"{base_name}_pid{pid}.log"
@@ -1216,6 +1265,8 @@ def main() -> None:
                     log_dir=args.log_dir,
                     dry_run=True,
                     job_name=job_name,
+                    worker_slot=job_slot,
+                    worker_progress=args.worker_progress,
                 )
                 results.append(result)
                 progress_tracker.record_job(result, None)
@@ -1255,6 +1306,8 @@ def main() -> None:
                     dry_run=False,
                     job_name=job_name,
                     metrics_path=metrics_path,
+                    worker_slot=job_slot,
+                    worker_progress=args.worker_progress,
                 )
                 future_to_plan[future] = plan
             for future in as_completed(future_to_plan):

@@ -24,7 +24,7 @@ show_usage_and_exit() {
 
 PIPELINE_MODE=${PIPELINE_MODE:-gpu}
 RESUME_MODE=true
-RESUME_LOG_PATH="0500_fpv_npc_dense.log"
+RESUME_LOG_PATH="0500_fpv_npc.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     RESUME)
@@ -121,20 +121,20 @@ fi
 CONDA_ENV=${CONDA_ENV:-cuda121}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
 TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc_dense}
+OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/npc_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_npc_dense_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_dense_status.json}
-PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_npc_dense_metrics}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc_dense.json}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_npc_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_status.json}
+PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_npc_metrics}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc.json}
 ERROR_LOG=${ERROR_LOG:-./0500_npc.log}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_npc}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-12}
+WORKERS=${WORKERS:-36}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -144,15 +144,16 @@ HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3} #1.3m
 # Optional NPC placement/debug. Leave values empty to skip.
 NPC_ENABLE=${NPC_ENABLE:-true}
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.75}
-NPC_COUNT=${NPC_COUNT:-30}
-NPC_MAX_COUNT=${NPC_MAX_COUNT:-50}
+NPC_COUNT=${NPC_COUNT:-10}
+NPC_MAX_COUNT=${NPC_MAX_COUNT:-10}
 NPC_PRIORITY=${NPC_PRIORITY:-coverage}
-NPC_MAX_RANGE=${NPC_MAX_RANGE:-25}
+NPC_MAX_RANGE=${NPC_MAX_RANGE:-15}
 NPC_FREE_THRESHOLD=${NPC_FREE_THRESHOLD:-250}
 NPC_FREE_WHITE=${NPC_FREE_WHITE:-true}
 NPC_DENSITY_MODE=${NPC_DENSITY_MODE:-angular}
 NPC_ZONE_RATIO=${NPC_ZONE_RATIO:-1:2:1}
 NPC_ROTATE_MASK_180=${NPC_ROTATE_MASK_180:-true} # rotate to aligne with actual locaiton of world coordinates. 
+NPC_MIN_DISTANCE=${NPC_MIN_DISTANCE:-2.5}
 NPC_EXTRA_FLAGS=${NPC_EXTRA_FLAGS:-}
 NPC_AUTO_CLEARANCE=${NPC_AUTO_CLEARANCE:-true}
 NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-30} # pool size 30 is a good middle ground
@@ -186,6 +187,12 @@ else
   : "${PLY_TRANSFORM_BACKEND:=gpu}"
   : "${VIDEO_BACKEND:=nvenc}"
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
+fi
+
+# Force legacy video backends (cpu/nvenc) until camera jumpiness is resolved.
+if [ "${VIDEO_BACKEND}" = "gpu" ]; then
+  echo "[VIDEO] WARN: video-backend=gpu is disabled in this script; using nvenc instead." >&2
+  VIDEO_BACKEND="nvenc"
 fi
 
 #for changing lighting levels. We can also use the script under ./lighting folder to directly modify based on the mp4 results
@@ -316,6 +323,9 @@ if storage_bool_true "$NPC_ENABLE"; then
   fi
   if [ -n "${NPC_MAX_RANGE:-}" ]; then
     npc_args+=("--npc-max-range ${NPC_MAX_RANGE}")
+  fi
+  if [ -n "${NPC_MIN_DISTANCE:-}" ]; then
+    npc_args+=("--npc-min-distance ${NPC_MIN_DISTANCE}")
   fi
   if [ -n "${NPC_FRAME_POOL_SIZE:-}" ]; then
     npc_args+=("--npc-frame-pool-size ${NPC_FRAME_POOL_SIZE}")
@@ -740,6 +750,7 @@ parallel_cmd=(
   --output-dir "${OUTPUT_DIR}"
   --error-log "${ERROR_LOG}"
   --progress-json "${PROGRESS_JSON}"
+  --worker-progress
   --status-json "${STATUS_JSON}"
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"

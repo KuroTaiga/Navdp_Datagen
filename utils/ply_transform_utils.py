@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -22,6 +23,12 @@ class PlyTransformBackend(str, Enum):
 
 _GPU_BACKEND_FAILED = False
 _GPU_FALLBACK_REPORTED = False
+_STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def rotation_matrix_z_np(theta: float) -> np.ndarray:
@@ -264,11 +271,17 @@ def apply_transform_to_frame(
         return _apply_transform_to_frame_cpu(base_frame, sequence, transform)
     if backend_value == PlyTransformBackend.GPU.value:
         if _GPU_BACKEND_FAILED:
+            if _STRICT_GPU_BACKENDS:
+                raise RuntimeError("GPU PLY transform backend unavailable in strict mode.")
             return _apply_transform_to_frame_cpu(base_frame, sequence, transform)
         try:
             return _apply_transform_to_frame_gpu(base_frame, sequence, transform)
         except Exception as exc:  # pylint: disable=broad-except
             _GPU_BACKEND_FAILED = True
+            if _STRICT_GPU_BACKENDS:
+                raise RuntimeError(
+                    f"GPU PLY transform failed in strict mode: {exc}"
+                ) from exc
             if not _GPU_FALLBACK_REPORTED:
                 print(
                     f"[WARN] GPU PLY transform failed ({exc}); falling back to CPU.",

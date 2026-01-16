@@ -184,11 +184,14 @@ if [ "$PIPELINE_MODE" = "legacy" ]; then
   : "${PLY_TRANSFORM_BACKEND:=cpu}"
   : "${VIDEO_BACKEND:=cpu}"
   : "${NPC_PLACEMENT_BACKEND:=cpu}"
+  : "${STRICT_GPU_BACKENDS:=false}"
 else
   : "${PLY_TRANSFORM_BACKEND:=gpu}"
   : "${VIDEO_BACKEND:=nvenc}"
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
+  : "${STRICT_GPU_BACKENDS:=true}"
 fi
+export STRICT_GPU_BACKENDS
 
 # Default render_label_paths.py snippets appended to every worker invocation.
 render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"

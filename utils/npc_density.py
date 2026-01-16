@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -27,6 +28,12 @@ class NPCPlacementBackend(str, Enum):
 
 _GPU_BACKEND_FAILED = False
 _GPU_FALLBACK_REPORTED = False
+_STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 @dataclass(frozen=True)
@@ -770,6 +777,8 @@ def plan_npc_positions(
         )
     if backend_value == NPCPlacementBackend.GPU.value:
         if _GPU_BACKEND_FAILED:
+            if _STRICT_GPU_BACKENDS:
+                raise RuntimeError("GPU NPC placement backend unavailable in strict mode.")
             return _plan_npc_positions_cpu(
                 wedge=wedge,
                 free_mask=free_mask,
@@ -797,6 +806,10 @@ def plan_npc_positions(
             )
         except Exception as exc:  # pylint: disable=broad-except
             _GPU_BACKEND_FAILED = True
+            if _STRICT_GPU_BACKENDS:
+                raise RuntimeError(
+                    f"GPU NPC placement failed in strict mode: {exc}"
+                ) from exc
             if not _GPU_FALLBACK_REPORTED:
                 print(
                     f"[WARN] GPU NPC placement failed ({exc}); falling back to CPU.",
