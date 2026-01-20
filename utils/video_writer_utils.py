@@ -27,6 +27,22 @@ _STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
     "yes",
     "on",
 )
+_GPU_VIDEO_SYNC_MODE = os.getenv("GPU_VIDEO_SYNC", "").lower()
+_GPU_VIDEO_SYNC_BEFORE = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "before", "both")
+_GPU_VIDEO_SYNC_AFTER = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "after", "both")
+_GPU_VIDEO_RETAIN_FRAMES = int(os.getenv("GPU_VIDEO_RETAIN_FRAMES", "0") or 0)
+_GPU_VIDEO_DISABLE_BFRAMES = os.getenv("GPU_VIDEO_DISABLE_BFRAMES", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_GPU_VIDEO_CLONE = os.getenv("GPU_VIDEO_CLONE", "").lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 
 def _resolve_ffmpeg_bin() -> str | None:
@@ -72,18 +88,54 @@ class GpuVideoWriter:
         self._bitstream_handle = self._bitstream_path.open("wb")
         self._encode_timer = encode_timer
         self._mux_timer = mux_timer
-        encoder_params: dict[str, str] = {"codec": "h264", "fps": str(int(round(fps)))}
+        self._retain_frames = _GPU_VIDEO_RETAIN_FRAMES
+        self._recent_frames: list = []
+        base_params: dict[str, str] = {"codec": "h264", "fps": str(int(round(fps)))}
         if nvenc_preset:
-            encoder_params["preset"] = nvenc_preset
+            base_params["preset"] = nvenc_preset
         if nvenc_bitrate:
-            encoder_params["bitrate"] = nvenc_bitrate
-        self._encoder = nvc.CreateEncoder(
-            int(width),
-            int(height),
-            self._pixel_format,
-            False,
-            **encoder_params,
-        )
+            base_params["bitrate"] = nvenc_bitrate
+        encoder_params = dict(base_params)
+        if _GPU_VIDEO_DISABLE_BFRAMES:
+            encoder_params["bf"] = "0"
+        try:
+            self._encoder = nvc.CreateEncoder(
+                int(width),
+                int(height),
+                self._pixel_format,
+                False,
+                **encoder_params,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            if _GPU_VIDEO_DISABLE_BFRAMES:
+                encoder_params = dict(base_params)
+                encoder_params["bframes"] = "0"
+                try:
+                    self._encoder = nvc.CreateEncoder(
+                        int(width),
+                        int(height),
+                        self._pixel_format,
+                        False,
+                        **encoder_params,
+                    )
+                except Exception as exc_alt:  # pylint: disable=broad-except
+                    if _STRICT_GPU_BACKENDS:
+                        raise
+                    print(
+                        f"[WARN] GPU encoder b-frame disable failed ({exc_alt}); "
+                        "falling back to default encoder params.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._encoder = nvc.CreateEncoder(
+                        int(width),
+                        int(height),
+                        self._pixel_format,
+                        False,
+                        **base_params,
+                    )
+            else:
+                raise exc
         self._closed = False
 
     def __enter__(self):
@@ -98,9 +150,26 @@ class GpuVideoWriter:
             raise RuntimeError("GPU video writer is closed.")
         if not hasattr(frame, "__cuda_array_interface__"):
             raise TypeError("GPU video writer expects a CUDA tensor frame.")
+        if _GPU_VIDEO_SYNC_BEFORE:
+            import torch
+            torch.cuda.synchronize()
+        if _GPU_VIDEO_CLONE:
+            import torch
+            if isinstance(frame, torch.Tensor):
+                frame = frame.clone()
+                if not frame.is_contiguous():
+                    frame = frame.contiguous()
+        if self._retain_frames > 0:
+            # Retain recent frames to avoid reuse while encoder is busy.
+            self._recent_frames.append(frame)
+            if len(self._recent_frames) > self._retain_frames:
+                self._recent_frames.pop(0)
         bitstream = self._encoder.Encode(frame)
         if bitstream:
             self._bitstream_handle.write(bitstream)
+        if _GPU_VIDEO_SYNC_AFTER:
+            import torch
+            torch.cuda.synchronize()
 
     def close(self) -> None:
         if self._closed:

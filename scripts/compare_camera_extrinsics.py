@@ -53,12 +53,44 @@ def _rotation_from_camera_to_world(camera_to_world: np.ndarray | None) -> np.nda
     return np.array(camera_to_world[:3, :3], dtype=np.float64)
 
 
+def _extract_pose_from_payload(payload: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    cam = _matrix_from_payload(payload)
+    center = _center_from_payload(payload, cam)
+    rot = _rotation_from_camera_to_world(cam)
+    if center is None or rot is None:
+        return None
+    return center, rot
+
+
+def _extract_pose(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    payload = _load_camera_payload(path)
+    return _extract_pose_from_payload(payload)
+
+
+def _extract_extrinsics(payload: dict) -> dict:
+    return {
+        "camera_center_world": payload.get("camera_center_world"),
+        "camera_to_world": payload.get("camera_to_world"),
+        "world_to_camera": payload.get("world_to_camera"),
+    }
+
+
 def _rotation_angle_deg(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
     rel = rot_a.T @ rot_b
     trace = float(np.trace(rel))
     cos_theta = (trace - 1.0) * 0.5
     cos_theta = max(-1.0, min(1.0, cos_theta))
     return math.degrees(math.acos(cos_theta))
+
+
+def _position_error(cand_center: np.ndarray, gold_center: np.ndarray) -> float:
+    # Ignore Z because camera heights differ between datasets (e.g., 1.0m vs 1.3m),
+    # so we only care about XY drift when validating frame ordering.
+    delta = cand_center - gold_center
+    if delta.shape[0] >= 3:
+        delta = delta.copy()
+        delta[2] = 0.0
+    return float(np.linalg.norm(delta))
 
 
 def _gather_frame_map(path_dir: Path) -> dict[int, Path]:
@@ -95,6 +127,9 @@ def compare_roots(
     candidate_root: Path,
     scenes: set[str] | None,
     top_k: int,
+    search_window: int,
+    window_rot_weight: float,
+    include_frames: bool,
 ) -> dict:
     results: dict[str, dict] = {}
     totals = {
@@ -106,6 +141,16 @@ def compare_roots(
         "paths_compared": 0,
         "paths_missing_golden": 0,
         "paths_missing_candidate": 0,
+    }
+    window_totals = {
+        "frames_compared": 0,
+        "frames_missing": 0,
+        "pos_err_sum": 0.0,
+        "pos_err_max": 0.0,
+        "rot_err_sum": 0.0,
+        "rot_err_max": 0.0,
+        "offset_histogram": {},
+        "nonzero_offsets": 0,
     }
 
     for scene_dir in _iter_scene_dirs(candidate_root, scenes):
@@ -140,27 +185,71 @@ def compare_roots(
             pos_errors: list[float] = []
             rot_errors: list[float] = []
             worst_entries: list[tuple[float, int, float, float]] = []
+            frames_detail: list[dict] = []
+            cand_payloads: dict[int, dict] = {}
+            gold_payloads: dict[int, dict] = {}
+            if include_frames:
+                cand_payloads = {idx: _load_camera_payload(path) for idx, path in cand_map.items()}
+                gold_payloads = {idx: _load_camera_payload(path) for idx, path in gold_map.items()}
+                cand_pose = {
+                    idx: _extract_pose_from_payload(payload)
+                    for idx, payload in cand_payloads.items()
+                }
+                gold_pose = {
+                    idx: _extract_pose_from_payload(payload)
+                    for idx, payload in gold_payloads.items()
+                }
+            else:
+                cand_pose = {idx: _extract_pose(path) for idx, path in cand_map.items()}
+                gold_pose = {idx: _extract_pose(path) for idx, path in gold_map.items()}
 
             for frame_idx in shared_frames:
-                cand_payload = _load_camera_payload(cand_map[frame_idx])
-                gold_payload = _load_camera_payload(gold_map[frame_idx])
-                cand_cam = _matrix_from_payload(cand_payload)
-                gold_cam = _matrix_from_payload(gold_payload)
-                cand_center = _center_from_payload(cand_payload, cand_cam)
-                gold_center = _center_from_payload(gold_payload, gold_cam)
-                cand_rot = _rotation_from_camera_to_world(cand_cam)
-                gold_rot = _rotation_from_camera_to_world(gold_cam)
-                if cand_center is None or gold_center is None or cand_rot is None or gold_rot is None:
+                cand_data = cand_pose.get(frame_idx)
+                gold_data = gold_pose.get(frame_idx)
+                if cand_data is None or gold_data is None:
                     continue
-                pos_err = float(np.linalg.norm(cand_center - gold_center))
+                cand_center, cand_rot = cand_data
+                gold_center, gold_rot = gold_data
+                pos_err = _position_error(cand_center, gold_center)
                 rot_err = _rotation_angle_deg(gold_rot, cand_rot)
                 pos_errors.append(pos_err)
                 rot_errors.append(rot_err)
                 worst_entries.append((pos_err, frame_idx, pos_err, rot_err))
+                if include_frames:
+                    frames_detail.append(
+                        {
+                            "frame": frame_idx,
+                            "status": "compared",
+                            "pos_err_m": float(pos_err),
+                            "rot_err_deg": float(rot_err),
+                            "candidate": _extract_extrinsics(cand_payloads.get(frame_idx, {})),
+                            "golden": _extract_extrinsics(gold_payloads.get(frame_idx, {})),
+                        }
+                    )
 
             frames_compared = len(pos_errors)
             if frames_compared == 0:
-                scene_entry[path_id] = {"frames_compared": 0}
+                empty_entry = {"frames_compared": 0}
+                if include_frames:
+                    all_frames = sorted(set(cand_map) | set(gold_map))
+                    for frame_idx in all_frames:
+                        status = "compared"
+                        cand_payload = cand_payloads.get(frame_idx, {})
+                        gold_payload = gold_payloads.get(frame_idx, {})
+                        if frame_idx not in cand_map:
+                            status = "candidate_missing"
+                        elif frame_idx not in gold_map:
+                            status = "golden_missing"
+                        frames_detail.append(
+                            {
+                                "frame": frame_idx,
+                                "status": status,
+                                "candidate": _extract_extrinsics(cand_payload),
+                                "golden": _extract_extrinsics(gold_payload),
+                            }
+                        )
+                    empty_entry["frames"] = frames_detail
+                scene_entry[path_id] = empty_entry
                 continue
 
             pos_err_sum = float(np.sum(pos_errors))
@@ -176,7 +265,7 @@ def compare_roots(
                 }
                 for _, idx, pos_err, rot_err in worst_entries[: max(top_k, 0)]
             ]
-            scene_entry[path_id] = {
+            path_entry = {
                 "frames_compared": frames_compared,
                 "frames_missing_in_candidate": len(set(gold_map) - set(cand_map)),
                 "frames_missing_in_golden": len(set(cand_map) - set(gold_map)),
@@ -186,6 +275,104 @@ def compare_roots(
                 "rot_err_max_deg": rot_err_max,
                 "worst_frames": top,
             }
+            if include_frames:
+                if frames_detail:
+                    compared_frames = {entry["frame"] for entry in frames_detail}
+                else:
+                    compared_frames = set()
+                all_frames = sorted(set(cand_map) | set(gold_map))
+                for frame_idx in all_frames:
+                    if frame_idx in compared_frames:
+                        continue
+                    status = "compared"
+                    cand_payload = cand_payloads.get(frame_idx, {})
+                    gold_payload = gold_payloads.get(frame_idx, {})
+                    if frame_idx not in cand_map:
+                        status = "candidate_missing"
+                    elif frame_idx not in gold_map:
+                        status = "golden_missing"
+                    frames_detail.append(
+                        {
+                            "frame": frame_idx,
+                            "status": status,
+                            "candidate": _extract_extrinsics(cand_payload),
+                            "golden": _extract_extrinsics(gold_payload),
+                        }
+                    )
+                path_entry["frames"] = sorted(frames_detail, key=lambda item: item["frame"])
+            scene_entry[path_id] = path_entry
+            if search_window > 0:
+                window_matches = []
+                max_offset = max(0, int(search_window))
+                for cand_idx in sorted(cand_map.keys()):
+                    cand_data = cand_pose.get(cand_idx)
+                    if cand_data is None:
+                        window_matches.append(
+                            {
+                                "frame": cand_idx,
+                                "status": "candidate_missing",
+                            }
+                        )
+                        window_totals["frames_missing"] += 1
+                        continue
+                    cand_center, cand_rot = cand_data
+                    best = None
+                    best_score = None
+                    best_pos = None
+                    best_rot = None
+                    best_offset = None
+                    for offset in range(-max_offset, max_offset + 1):
+                        gold_idx = cand_idx + offset
+                        gold_data = gold_pose.get(gold_idx)
+                        if gold_data is None:
+                            continue
+                        gold_center, gold_rot = gold_data
+                        pos_err = _position_error(cand_center, gold_center)
+                        rot_err = _rotation_angle_deg(gold_rot, cand_rot)
+                        score = pos_err + (window_rot_weight * rot_err)
+                        if best_score is None or score < best_score:
+                            best_score = score
+                            best = gold_idx
+                            best_pos = pos_err
+                            best_rot = rot_err
+                            best_offset = offset
+                    if best is None:
+                        window_matches.append(
+                            {
+                                "frame": cand_idx,
+                                "status": "golden_missing",
+                            }
+                        )
+                        window_totals["frames_missing"] += 1
+                        continue
+                    window_matches.append(
+                        {
+                            "frame": cand_idx,
+                            "best_match": best,
+                            "offset": int(best_offset),
+                            "pos_err_m": float(best_pos),
+                            "rot_err_deg": float(best_rot),
+                        }
+                    )
+                    window_totals["frames_compared"] += 1
+                    window_totals["pos_err_sum"] += float(best_pos)
+                    window_totals["rot_err_sum"] += float(best_rot)
+                    window_totals["pos_err_max"] = max(window_totals["pos_err_max"], float(best_pos))
+                    window_totals["rot_err_max"] = max(window_totals["rot_err_max"], float(best_rot))
+                    if best_offset != 0:
+                        window_totals["nonzero_offsets"] += 1
+                    hist = window_totals["offset_histogram"]
+                    key = str(int(best_offset))
+                    hist[key] = int(hist.get(key, 0)) + 1
+
+                scene_entry[path_id]["window_search"] = {
+                    "window": max_offset,
+                    "rot_weight": window_rot_weight,
+                    "frames_compared": sum(1 for m in window_matches if m.get("best_match") is not None),
+                    "frames_missing": sum(1 for m in window_matches if m.get("best_match") is None),
+                    "offset_histogram": window_totals["offset_histogram"],
+                    "matches": window_matches,
+                }
 
             totals["frames_compared"] += frames_compared
             totals["pos_err_sum"] += pos_err_sum
@@ -210,7 +397,22 @@ def compare_roots(
         "rot_err_mean_deg": (totals["rot_err_sum"] / frames_compared) if frames_compared else None,
         "rot_err_max_deg": totals["rot_err_max"] if frames_compared else None,
     }
-    return {"summary": summary, "scenes": results}
+    report = {"summary": summary, "scenes": results}
+    if search_window > 0:
+        window_frames = window_totals["frames_compared"]
+        report["window_summary"] = {
+            "window": int(search_window),
+            "rot_weight": float(window_rot_weight),
+            "frames_compared": window_frames,
+            "frames_missing": window_totals["frames_missing"],
+            "pos_err_mean_m": (window_totals["pos_err_sum"] / window_frames) if window_frames else None,
+            "pos_err_max_m": window_totals["pos_err_max"] if window_frames else None,
+            "rot_err_mean_deg": (window_totals["rot_err_sum"] / window_frames) if window_frames else None,
+            "rot_err_max_deg": window_totals["rot_err_max"] if window_frames else None,
+            "offset_histogram": window_totals["offset_histogram"],
+            "nonzero_offsets": window_totals["nonzero_offsets"],
+        }
+    return report
 
 
 def main() -> int:
@@ -232,6 +434,24 @@ def main() -> int:
         default=5,
         help="How many worst frames to report per path (default: 5).",
     )
+    parser.add_argument(
+        "--search-window",
+        type=int,
+        default=0,
+        help="Search +/- N frames around each candidate frame for best match (default: 0).",
+    )
+    parser.add_argument(
+        "--window-rot-weight",
+        type=float,
+        default=0.0,
+        help="Rotation error weight when selecting best match in search window (default: 0).",
+    )
+    parser.add_argument(
+        "--per-frame",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Include per-frame comparison entries in the output JSON (default: off).",
+    )
     parser.add_argument("--out-json", type=Path, default=None)
     args = parser.parse_args()
 
@@ -241,6 +461,9 @@ def main() -> int:
         candidate_root=args.candidate_root,
         scenes=scenes,
         top_k=args.top_k,
+        search_window=int(args.search_window),
+        window_rot_weight=float(args.window_rot_weight),
+        include_frames=bool(args.per_frame),
     )
 
     if args.out_json:

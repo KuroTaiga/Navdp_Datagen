@@ -28,6 +28,7 @@ class NPCPlacementBackend(str, Enum):
 
 _GPU_BACKEND_FAILED = False
 _GPU_FALLBACK_REPORTED = False
+_GPU_FALLBACK_REUSE_REPORTED = False
 _STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
     "1",
     "true",
@@ -779,6 +780,14 @@ def plan_npc_positions(
         if _GPU_BACKEND_FAILED:
             if _STRICT_GPU_BACKENDS:
                 raise RuntimeError("GPU NPC placement backend unavailable in strict mode.")
+            global _GPU_FALLBACK_REUSE_REPORTED
+            if not _GPU_FALLBACK_REUSE_REPORTED:
+                print(
+                    "[WARN] GPU NPC placement previously failed; using CPU fallback.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _GPU_FALLBACK_REUSE_REPORTED = True
             return _plan_npc_positions_cpu(
                 wedge=wedge,
                 free_mask=free_mask,

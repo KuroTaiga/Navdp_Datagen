@@ -213,6 +213,16 @@ fi
 if [ -n "${VIDEO_NVENC_BITRATE:-}" ]; then
   render_extra_args+=" --video-nvenc-bitrate ${VIDEO_NVENC_BITRATE}"
 fi
+
+# GPU video backend tuning for PyNvVideoCodec (avoid frame reordering/jitter).
+if [ "${VIDEO_BACKEND}" = "gpu" ]; then
+  : "${GPU_VIDEO_DISABLE_BFRAMES:=1}"
+  : "${GPU_VIDEO_CLONE:=1}"
+  : "${GPU_VIDEO_SYNC:=both}"
+  : "${GPU_VIDEO_RETAIN_FRAMES:=4}"
+  export GPU_VIDEO_DISABLE_BFRAMES GPU_VIDEO_CLONE GPU_VIDEO_SYNC GPU_VIDEO_RETAIN_FRAMES
+  echo "[VIDEO] GPU backend: bframes=${GPU_VIDEO_DISABLE_BFRAMES} clone=${GPU_VIDEO_CLONE} sync=${GPU_VIDEO_SYNC} retain=${GPU_VIDEO_RETAIN_FRAMES}" >&2
+fi
 if storage_bool_true "$ENABLE_RGB_FRAMES"; then
   render_extra_args+=' --rgb-frames'
 else

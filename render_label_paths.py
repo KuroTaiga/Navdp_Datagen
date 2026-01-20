@@ -2436,6 +2436,98 @@ def load_actor_frame_sequence(
     )
 
 
+def select_random_actor_ply(ply_dir: Path, *, seed: int | None = None) -> Path:
+    ply_paths = sorted(p for p in ply_dir.rglob("*.ply") if p.is_file())
+    if not ply_paths:
+        raise FileNotFoundError(f"No .ply files found under {ply_dir}")
+    if seed is None:
+        return ply_paths[0]
+    rng = np.random.default_rng(seed)
+    return ply_paths[int(rng.integers(0, len(ply_paths)))]
+
+
+def dump_camera_human_plys(
+    *,
+    camera_positions: Sequence[np.ndarray],
+    scene_template: ply_utils.GaussianPly,
+    sequence: ActorSequence,
+    frames_dir: Path,
+    frame_prefix: str,
+    stride: int = 1,
+    max_frames: int | None = None,
+) -> None:
+    if not camera_positions:
+        return
+    base_frame = sequence.frames[0]
+    stride = max(1, int(stride))
+    max_frames = max_frames if max_frames is None or max_frames > 0 else None
+    written = 0
+    scene_dtype = scene_template.data.dtype
+
+    for idx, cam_pos in enumerate(camera_positions):
+        if idx % stride != 0:
+            continue
+        if max_frames is not None and written >= max_frames:
+            break
+        translation = np.array([cam_pos[0], cam_pos[1], cam_pos[2]], dtype=np.float64)
+        transform = build_transform_matrix(np.eye(3, dtype=np.float64), translation)
+        actor_data = apply_transform_to_frame(
+            base_frame,
+            sequence,
+            transform,
+            backend=PLY_TRANSFORM_BACKEND,
+        )
+        actor_aligned = ply_utils.align_dtype(actor_data, scene_dtype)
+        combined = ply_utils.concat_vertices(scene_template.data, actor_aligned)
+        out_path = frames_dir / f"{frame_prefix}_{idx:04d}_cam_human.ply"
+        scene_template.write(combined, out_path)
+        written += 1
+
+
+def validate_path_bounds(
+    *,
+    json_path: Path,
+    meta: dict,
+    path_xy: Sequence[np.ndarray],
+    raw_points: Sequence[np.ndarray],
+) -> None:
+    if not path_xy:
+        return
+    eps = 1e-3
+    left = float(meta["left"])
+    right = float(meta["right"])
+    top = float(meta["top"])
+    bottom = float(meta["bottom"])
+    lower_z = float(meta["lower_z"])
+    upper_z = float(meta["upper_z"])
+
+    xs = [float(pt[0]) for pt in path_xy]
+    ys = [float(pt[1]) for pt in path_xy]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    z_vals = [float(pt[2]) for pt in raw_points if getattr(pt, "shape", (0,))[0] >= 3]
+    min_z = min(z_vals) if z_vals else None
+    max_z = max(z_vals) if z_vals else None
+
+    out_x = min_x < left - eps or max_x > right + eps
+    out_y = min_y < bottom - eps or max_y > top + eps
+    out_z = (
+        min_z is not None
+        and max_z is not None
+        and (min_z < lower_z - eps or max_z > upper_z + eps)
+    )
+    if out_x or out_y or out_z:
+        msg = (
+            f"Path {json_path} outside occupancy bounds: "
+            f"x=[{min_x:.3f},{max_x:.3f}] vs [{left:.3f},{right:.3f}], "
+            f"y=[{min_y:.3f},{max_y:.3f}] vs [{bottom:.3f},{top:.3f}]"
+        )
+        if min_z is not None and max_z is not None:
+            msg += f", z=[{min_z:.3f},{max_z:.3f}] vs [{lower_z:.3f},{upper_z:.3f}]"
+        raise ValueError(msg)
+
+
 def actor_data_to_tensors(
     data: np.ndarray,
     sequence: ActorSequence,
@@ -2724,6 +2816,7 @@ def render_actor_camera_only_sequence(
     camera_z: float,
     look_ahead: float,
     look_down: float,
+    reverse_forward: bool,
     gaussians: GaussianModel,
     pipeline: PipelineParams,
     device: torch.device,
@@ -2838,6 +2931,8 @@ def render_actor_camera_only_sequence(
             blended_norm = float(np.linalg.norm(blended))
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
+        if reverse_forward:
+            forward = -forward
         prev_forward = forward.copy()
 
         target_xy = camera_position[:2] + forward[:2] * look_ahead
@@ -2986,6 +3081,7 @@ def render_actor_follow_sequence(
     camera_z: float,
     look_ahead: float,
     look_down: float,
+    reverse_forward: bool,
     gaussians: GaussianModel,
     pipeline: PipelineParams,
     device: torch.device,
@@ -3194,6 +3290,8 @@ def render_actor_follow_sequence(
                 if blended_norm > EPS:
                     forward = (blended / blended_norm).astype(np.float32)
                     forward[2] = 0.0
+            if reverse_forward:
+                forward = -forward
             prev_forward = forward.copy()
 
             # Transform actor for this frame
@@ -3610,6 +3708,8 @@ def render_actor_follow_sequence(
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
                 forward[2] = 0.0
+        if reverse_forward:
+            forward = -forward
         prev_forward = forward.copy()
 
         base_frame = sequence.frames[plan.base_frame_index]
@@ -4011,8 +4111,15 @@ def prepare_path_data(
     mirror_translation: bool,
     swap_xy: bool,
     resample_step: float,
+    handedness: str = "left",
+    negate_xy: bool = False,
 ) -> PreparedPath:
-    raw_points, raster_pixels = load_raster_world_points(json_path, swap_xy=swap_xy)
+    raw_points, raster_pixels = load_raster_world_points(
+        json_path,
+        swap_xy=swap_xy,
+        handedness=handedness,
+        negate_xy=negate_xy,
+    )
     a_x, b_x, a_y, b_y = derive_affine_transform(raw_points, raster_pixels, meta)
     transformed = [
         np.array([a_x * pt[0] + b_x, a_y * pt[1] + b_y], dtype=np.float32)
@@ -4292,6 +4399,9 @@ def render_path_frames(
     overwrite: bool,
     view_mode: str,
     swap_xy: bool,
+    path_handedness: str,
+    negate_raster_world_xy: bool,
+    reverse_forward: bool,
     stabilize: bool,
     video: bool,
     debug: bool,
@@ -4340,6 +4450,9 @@ def render_path_frames(
     npc_bloom_mask: np.ndarray | None = None,
     npc_bloom_radius_m: float | None = None,
     npc_bloom_radius_px: int | None = None,
+    camera_human_sequence: ActorSequence | None = None,
+    camera_human_stride: int = 1,
+    camera_human_max_frames: int | None = None,
 ) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
@@ -4360,7 +4473,15 @@ def render_path_frames(
         stride=stride,
         mirror_translation=mirror_translation,
         swap_xy=swap_xy,
+        handedness=path_handedness,
+        negate_xy=negate_raster_world_xy,
         resample_step=resample_step,
+    )
+    validate_path_bounds(
+        json_path=json_path,
+        meta=meta,
+        path_xy=path_data.path_xy,
+        raw_points=path_data.raw_points,
     )
     path_xy = path_data.path_xy
     if len(path_xy) < 2:
@@ -4476,6 +4597,7 @@ def render_path_frames(
             f"y' = {a_y:.6f} * y + {b_y:.6f} (swap_xy={swap_xy})",
             flush=True,
         )
+        print(f"[DEBUG] Path handedness: {path_handedness}", flush=True)
         raw_preview = [tuple(map(float, pt)) for pt in path_data.raw_points[:5]]
         preview = [tuple(map(float, pts)) for pts in path_data.sampled_xy[:5]]
         print(
@@ -4576,6 +4698,7 @@ def render_path_frames(
                         camera_z=camera_z,
                         look_ahead=look_ahead,
                         look_down=look_down,
+                        reverse_forward=reverse_forward,
                         gaussians=gaussians,
                         pipeline=pipeline,
                         device=device,
@@ -4613,6 +4736,7 @@ def render_path_frames(
                         camera_z=camera_z,
                         look_ahead=look_ahead,
                         look_down=look_down,
+                        reverse_forward=reverse_forward,
                         gaussians=gaussians,
                         pipeline=pipeline,
                         device=device,
@@ -4743,6 +4867,8 @@ def render_path_frames(
                             if blended_norm > EPS:
                                 forward = (blended / blended_norm).astype(np.float32)
                                 forward[2] = 0.0
+                        if reverse_forward:
+                            forward = -forward
                         prev_forward = forward.copy()
 
                     npc_actor_frames: list[ActorRenderFrame] = []
@@ -5162,12 +5288,54 @@ def render_path_frames(
                         f"[VERBOSE] Scene {scene_id} / {json_path.stem}: NPC placement shortfall total {npc_shortfall_total}.",
                         flush=True,
                     )
+                if render_bev:
+                    if verbose:
+                        print(
+                            f"[VERBOSE] Scene {scene_id} / {json_path.stem}: saving BEV debug image.",
+                            flush=True,
+                        )
+                    bev_dir = output_dir / scene_id
+                    bev_dir.mkdir(parents=True, exist_ok=True)
+                    bev_path = bev_dir / f"{json_path.stem}_BEV.png"
+                    sampler_for_len = PathSampler(path_xy)
+                    save_bev_debug_image(
+                        scene_id=scene_id,
+                        label_id=json_path.stem,
+                        meta=meta,
+                        camera_xy_seq=cam_seq,
+                        actor_xy_seq=None,
+                        out_path=bev_path,
+                        look_ahead=look_ahead,
+                        follow_points=None,
+                        total_length_m=sampler_for_len.total_length,
+                        fps=DEFAULT_VIDEO_FPS,
+                        actor_path_dotted=False,
+                        mirror_bev_x=mirror_bev_x,
+                        mirror_bev_y=mirror_bev_y,
+                    )
 
             if verbose:
                 print(
                     f"[VERBOSE] Scene {scene_id} / {json_path.stem}: render finished.",
                     flush=True,
                 )
+
+    if camera_human_sequence is not None:
+        if actor_runtime is not None:
+            camera_positions = [
+                np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in cam_seq
+            ]
+        else:
+            camera_positions = positions
+        dump_camera_human_plys(
+            camera_positions=camera_positions,
+            scene_template=scene_template,
+            sequence=camera_human_sequence,
+            frames_dir=frames_dir,
+            frame_prefix="frame",
+            stride=camera_human_stride,
+            max_frames=camera_human_max_frames,
+        )
 
     duration = time.perf_counter() - start_time
     if frames_rendered > 0:
@@ -5359,6 +5527,41 @@ def parse_args() -> ArgumentParser:
         help="Limit the number of label-path JSON files processed per scene.",
     )
     parser.add_argument(
+        "--skip-summary",
+        action="store_true",
+        help="Skip summary.json files when collecting label paths.",
+    )
+    parser.add_argument(
+        "--camera-human-ply-dir",
+        type=Path,
+        default=None,
+        help="Directory of human PLYs to place at camera positions for debug dumps.",
+    )
+    parser.add_argument(
+        "--camera-human-height",
+        type=float,
+        default=1.7,
+        help="Height (meters) to normalize the camera human PLY (default: 1.7).",
+    )
+    parser.add_argument(
+        "--camera-human-seed",
+        type=int,
+        default=0,
+        help="Random seed for selecting the camera human PLY (default: 0).",
+    )
+    parser.add_argument(
+        "--camera-human-stride",
+        type=int,
+        default=1,
+        help="Stride for dumping camera human PLYs (default: 1).",
+    )
+    parser.add_argument(
+        "--camera-human-max-frames",
+        type=int,
+        default=None,
+        help="Maximum camera human PLY dumps per path (default: no limit).",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print debug info such as currently loaded PLY file paths.",
@@ -5367,6 +5570,22 @@ def parse_args() -> ArgumentParser:
         "--swap-xy",
         action="store_true",
         help="Swap x/y when reading raster_world coordinates.",
+    )
+    parser.add_argument(
+        "--path-handedness",
+        choices=("left", "right"),
+        default="left",
+        help="Interpret raster_world coordinates as left/right-handed (right flips Y).",
+    )
+    parser.add_argument(
+        "--negate-raster-world-xy",
+        action="store_true",
+        help="Negate raster_world x/y before swap/handedness.",
+    )
+    parser.add_argument(
+        "--reverse-forward",
+        action="store_true",
+        help="Flip the forward direction to render the camera facing backward.",
     )
     parser.add_argument(
         "--stabilize",
@@ -6022,6 +6241,19 @@ def main() -> None:
     debug_enabled = bool(args.debug)
     verbose_enabled = bool(args.verbose)
     swap_xy_enabled = bool(args.swap_xy)
+    camera_human_sequence = None
+    if args.camera_human_ply_dir is not None:
+        ply_path = select_random_actor_ply(
+            Path(args.camera_human_ply_dir),
+            seed=int(args.camera_human_seed),
+        )
+        if debug_enabled:
+            print(f"[DEBUG] Camera human PLY: {ply_path}", flush=True)
+        camera_human_sequence = load_actor_frame_sequence(
+            ply_path,
+            height=float(args.camera_human_height),
+            debug=debug_enabled,
+        )
     stabilize_enabled = bool(args.stabilize)
     hide_actor_enabled = bool(args.hide_actor)
     video_enabled = bool(args.video)
@@ -6551,6 +6783,8 @@ def main() -> None:
                 )
 
             json_files = sorted(p for p in label_dir.glob("*.json") if not p.name.endswith("_detailed.json"))
+            if args.skip_summary:
+                json_files = [p for p in json_files if p.name != "summary.json"]
             if label_filter:
                 json_files = [path for path in json_files if path.stem in label_filter]
             if not json_files:
@@ -6572,6 +6806,8 @@ def main() -> None:
                     stride=max(1, args.stride),
                     mirror_translation=mirror_translation_flag,
                     swap_xy=swap_xy_enabled,
+                    handedness=args.path_handedness,
+                    negate_xy=bool(args.negate_raster_world_xy),
                     resample_step=float(args.path_resample_step),
                 )
 
@@ -6714,6 +6950,9 @@ def main() -> None:
                         overwrite=args.overwrite,
                         view_mode=args.view_mode,
                         swap_xy=swap_xy_enabled,
+                        path_handedness=args.path_handedness,
+                        negate_raster_world_xy=bool(args.negate_raster_world_xy),
+                        reverse_forward=bool(args.reverse_forward),
                         stabilize=stabilize_enabled,
                         video=video_enabled,
                         save_rgb_frames=save_rgb_frames,
@@ -6762,6 +7001,9 @@ def main() -> None:
                         npc_bloom_mask=npc_bloom_mask_debug,
                         npc_bloom_radius_m=npc_bloom_radius_m,
                         npc_bloom_radius_px=npc_bloom_radius_px,
+                        camera_human_sequence=camera_human_sequence,
+                        camera_human_stride=int(args.camera_human_stride),
+                        camera_human_max_frames=args.camera_human_max_frames,
                     )
                     record_path_status(scene_id, json_path.stem, STATUS_DONE, error=None)
                     if summary is not None:

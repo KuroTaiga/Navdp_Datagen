@@ -33,16 +33,4 @@ done
 
 conda run --no-capture-output -n "$CONDA_ENV" python "${SCRIPT_DIR}/scripts/quick_gpu_pipeline_test.py" "$@"
 
-if [ -d "$GOLDEN_ROOT" ]; then
-  compare_args=(
-    "--golden-root" "$GOLDEN_ROOT"
-    "--candidate-root" "$OUTPUT_ROOT"
-    "--out-json" "$COMPARE_OUT_JSON"
-  )
-if [ -n "$SCENE_ID" ]; then
-  compare_args+=("--scene" "$SCENE_ID")
-fi
-  conda run --no-capture-output -n "$CONDA_ENV" python "${SCRIPT_DIR}/scripts/compare_camera_extrinsics.py" "${compare_args[@]}"
-else
-  echo "[WARN] Golden root not found at ${GOLDEN_ROOT}; skipping camera comparison." >&2
-fi
+# Camera comparison runs inside quick_gpu_pipeline_test.py by default.

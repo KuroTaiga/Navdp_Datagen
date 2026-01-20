@@ -23,6 +23,7 @@ class PlyTransformBackend(str, Enum):
 
 _GPU_BACKEND_FAILED = False
 _GPU_FALLBACK_REPORTED = False
+_GPU_FALLBACK_REUSE_REPORTED = False
 _STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
     "1",
     "true",
@@ -273,6 +274,14 @@ def apply_transform_to_frame(
         if _GPU_BACKEND_FAILED:
             if _STRICT_GPU_BACKENDS:
                 raise RuntimeError("GPU PLY transform backend unavailable in strict mode.")
+            global _GPU_FALLBACK_REUSE_REPORTED
+            if not _GPU_FALLBACK_REUSE_REPORTED:
+                print(
+                    "[WARN] GPU PLY transform previously failed; using CPU fallback.",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _GPU_FALLBACK_REUSE_REPORTED = True
             return _apply_transform_to_frame_cpu(base_frame, sequence, transform)
         try:
             return _apply_transform_to_frame_gpu(base_frame, sequence, transform)

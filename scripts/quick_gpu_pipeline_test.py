@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -11,15 +12,29 @@ import subprocess
 import sys
 import time
 
+import imageio.v2 as imageio
 import psutil
 
 
-NPC_SWEEP = (
-    (5, 0.25),
-    (10, 0.5),
-    (20, 0.75),
-    (30, 0.8),
+NPC_BASE = (5, 0.25)
+# Other NPC sweeps (kept for reference):
+# NPC_SWEEP = (
+#     (5, 0.25),
+#     (10, 0.5),
+#     (20, 0.75),
+#     (30, 0.8),
+# )
+
+SYNC_SWEEP = (
+    {"name": "sync_both", "gpu_video_sync": "both", "retain_frames": 4},
 )
+# Previous sync sweep (kept for reference):
+# SYNC_SWEEP = (
+#     {"name": "sync_off", "gpu_video_sync": "", "retain_frames": 0},
+#     {"name": "sync_before", "gpu_video_sync": "before", "retain_frames": 0},
+#     {"name": "sync_after", "gpu_video_sync": "after", "retain_frames": 0},
+#     {"name": "sync_both", "gpu_video_sync": "both", "retain_frames": 0},
+# )
 
 
 def _format_bytes(value: float | int | None) -> str:
@@ -56,6 +71,190 @@ def _discover_scene(tasks_dir: Path) -> str | None:
         return None
     candidates = [p.name for p in sorted(tasks_dir.iterdir()) if p.is_dir()]
     return candidates[0] if candidates else None
+
+
+def _pick_label_ids(tasks_dir: Path, scene_id: str, max_labels: int | None) -> list[str]:
+    label_dir = tasks_dir / scene_id
+    if not label_dir.is_dir():
+        return []
+    labels = sorted(
+        p.stem
+        for p in label_dir.iterdir()
+        if p.is_file()
+        and p.suffix == ".json"
+        and not p.name.endswith("_detailed.json")
+    )
+    if max_labels is not None and max_labels > 0:
+        labels = labels[:max_labels]
+    return labels
+
+
+def _hash_frame(frame) -> str:
+    hasher = hashlib.blake2b(digest_size=16)
+    hasher.update(frame.tobytes())
+    return hasher.hexdigest()
+
+
+def _compute_video_hashes(video_path: Path) -> tuple[list[str] | None, str | None]:
+    hashes: list[str] = []
+    try:
+        with imageio.get_reader(str(video_path), "ffmpeg") as reader:
+            for frame in reader:
+                hashes.append(_hash_frame(frame))
+    except Exception as exc:  # pylint: disable=broad-except
+        return None, str(exc)
+    return hashes, None
+
+
+def _write_video_hashes(
+    *,
+    run_name: str,
+    run_dir: Path,
+    scene_id: str,
+    analysis_dir: Path,
+) -> dict[str, list[str] | None]:
+    video_dir = run_dir / scene_id
+    hashes_by_label: dict[str, list[str] | None] = {}
+    if not video_dir.is_dir():
+        return hashes_by_label
+
+    out_dir = analysis_dir / "quick_gpu_frame_hashes" / run_name / scene_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for video_path in sorted(video_dir.glob("*.mp4")):
+        label_id = video_path.stem
+        frame_hashes, error = _compute_video_hashes(video_path)
+        payload = {
+            "video": str(video_path),
+            "hash_algo": "blake2b-16",
+            "frame_count": len(frame_hashes) if frame_hashes is not None else 0,
+            "frame_hashes": frame_hashes,
+        }
+        if error:
+            payload["error"] = error
+        hashes_by_label[label_id] = frame_hashes
+        out_path = out_dir / f"{label_id}.json"
+        out_path.write_text(json.dumps(payload))
+    return hashes_by_label
+
+
+def _write_golden_hashes(
+    *,
+    golden_root: Path,
+    scene_id: str,
+    analysis_dir: Path,
+    label_ids: list[str],
+) -> dict[str, list[str] | None]:
+    video_dir = golden_root / scene_id
+    hashes_by_label: dict[str, list[str] | None] = {}
+    if not video_dir.is_dir():
+        return hashes_by_label
+
+    out_dir = analysis_dir / "quick_gpu_frame_hashes" / "golden" / scene_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for label_id in label_ids:
+        video_path = video_dir / f"{label_id}.mp4"
+        if not video_path.is_file():
+            hashes_by_label[label_id] = None
+            continue
+        frame_hashes, error = _compute_video_hashes(video_path)
+        payload = {
+            "video": str(video_path),
+            "hash_algo": "blake2b-16",
+            "frame_count": len(frame_hashes) if frame_hashes is not None else 0,
+            "frame_hashes": frame_hashes,
+        }
+        if error:
+            payload["error"] = error
+        hashes_by_label[label_id] = frame_hashes
+        out_path = out_dir / f"{label_id}.json"
+        out_path.write_text(json.dumps(payload))
+    return hashes_by_label
+
+
+def _compare_hash_runs(
+    *,
+    hash_runs: dict[str, dict[str, list[str] | None]],
+    baseline_name: str,
+) -> dict:
+    report: dict[str, dict] = {"baseline": baseline_name, "runs": {}}
+    baseline = hash_runs.get(baseline_name, {})
+    for run_name, run_hashes in hash_runs.items():
+        if run_name == baseline_name:
+            continue
+        run_report = {
+            "labels_compared": 0,
+            "frames_compared": 0,
+            "frames_mismatched": 0,
+            "labels": {},
+        }
+        all_labels = sorted(set(baseline.keys()) | set(run_hashes.keys()))
+        for label_id in all_labels:
+            base_hashes = baseline.get(label_id)
+            cand_hashes = run_hashes.get(label_id)
+            if base_hashes is None or cand_hashes is None:
+                run_report["labels"][label_id] = {
+                    "status": "missing_hashes",
+                    "base_frames": len(base_hashes or []),
+                    "cand_frames": len(cand_hashes or []),
+                }
+                continue
+            count = min(len(base_hashes), len(cand_hashes))
+            mismatches: list[int] = []
+            for idx in range(count):
+                if base_hashes[idx] != cand_hashes[idx]:
+                    mismatches.append(idx)
+            run_report["labels"][label_id] = {
+                "status": "ok" if not mismatches and len(base_hashes) == len(cand_hashes) else "mismatch",
+                "base_frames": len(base_hashes),
+                "cand_frames": len(cand_hashes),
+                "mismatch_count": len(mismatches),
+                "first_mismatch": mismatches[0] if mismatches else None,
+            }
+            run_report["labels_compared"] += 1
+            run_report["frames_compared"] += count
+            run_report["frames_mismatched"] += len(mismatches)
+        report["runs"][run_name] = run_report
+    return report
+
+
+def _run_side_by_side_compare(
+    *,
+    left_root: Path,
+    right_root: Path,
+    scene_id: str,
+    label_ids: list[str],
+    out_root: Path,
+    report_json: Path,
+    png_only: bool = False,
+) -> dict:
+    script_path = Path(__file__).resolve().parent / "side_by_side_video_compare.py"
+    if not script_path.is_file():
+        return {"error": f"missing_script:{script_path}"}
+    if not label_ids:
+        return {"error": "no_labels"}
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--golden-root",
+        str(left_root),
+        "--candidate-root",
+        str(right_root),
+        "--scene",
+        scene_id,
+        "--out-root",
+        str(out_root),
+        "--report-json",
+        str(report_json),
+    ]
+    if png_only:
+        cmd.append("--png-only")
+    for label_id in label_ids:
+        cmd.extend(["--label-id", label_id])
+    try:
+        subprocess.run(cmd, check=True)
+        return {"report_path": str(report_json)}
+    except Exception as exc:  # pylint: disable=broad-except
+        return {"error": str(exc), "report_path": str(report_json)}
 
 
 def _sum_process_metrics(root: psutil.Process) -> tuple[int, int, int]:
@@ -286,11 +485,14 @@ def build_render_command(args: argparse.Namespace, *, output_dir: Path, metrics_
         "--verbose",
         "--no-show-BEV",
         "--no-save-depth-maps",
-        "--no-save-camera-metadata",
+        "--save-camera-metadata",
         "--no-save-follow-metadata",
         "--no-rgb-frames",
     ]
-    if args.max_labels:
+    if getattr(args, "label_ids", None):
+        for label_id in args.label_ids:
+            cmd.extend(["--label-id", str(label_id)])
+    elif args.max_labels:
         cmd.extend(["--max-labels", str(args.max_labels)])
     if args.minimal_frames is not None:
         cmd.extend(["--minimal-frames", str(args.minimal_frames)])
@@ -325,6 +527,11 @@ def build_render_command(args: argparse.Namespace, *, output_dir: Path, metrics_
             str(args.npc_free_threshold),
         ]
     )
+    cmd.extend(["--npc-seed", str(args.npc_seed)])
+    if args.job_slot is not None:
+        cmd.extend(["--job-slot", str(args.job_slot)])
+    if args.job_name:
+        cmd.extend(["--job-name", str(args.job_name)])
     if args.npc_free_white:
         cmd.append("--npc-free-white")
     else:
@@ -373,7 +580,7 @@ def main() -> int:
         default=os.getenv("CLEAN_OUTPUT", "true").lower() in ("1", "true", "yes", "on"),
         help="Remove output-root before running (default: on).",
     )
-    parser.add_argument("--max-labels", type=int, default=int(os.getenv("MAX_LABELS", "10")))
+    parser.add_argument("--max-labels", type=int, default=int(os.getenv("MAX_LABELS", "3")))
     parser.add_argument(
         "--minimal-frames",
         type=int,
@@ -414,15 +621,54 @@ def main() -> int:
         action=argparse.BooleanOptionalAction,
         default=os.getenv("NPC_ROTATE_MASK_180", "true").lower() in ("1", "true", "yes", "on"),
     )
+    parser.add_argument("--npc-seed", type=int, default=int(os.getenv("NPC_SEED", "12345")))
     parser.add_argument("--sample-interval", type=float, default=float(os.getenv("SAMPLE_INTERVAL", "1.0")))
     parser.add_argument("--total-paths", type=int, default=int(os.getenv("TOTAL_PATHS", "178628")))
     parser.add_argument("--frames-per-path", type=int, default=int(os.getenv("FRAMES_PER_PATH", "150")))
     parser.add_argument("--gpu-vram-gb", type=float, default=float(os.getenv("GPU_VRAM_GB", "45")))
+    parser.add_argument("--job-slot", type=int, default=int(os.getenv("JOB_SLOT", "0")))
+    parser.add_argument("--job-name", default=os.getenv("JOB_NAME", "quick_gpu_sync_test"))
     parser.add_argument(
         "--report-length",
         action=argparse.BooleanOptionalAction,
         default=os.getenv("REPORT_LENGTH", "true").lower() in ("1", "true", "yes", "on"),
         help="Compute total path length in meters from label JSONs (default: on).",
+    )
+    parser.add_argument(
+        "--compare-camera",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("COMPARE_CAMERA", "true").lower() in ("1", "true", "yes", "on"),
+        help="Compare camera extrinsics against a golden dataset (default: on).",
+    )
+    parser.add_argument(
+        "--compare-golden-root",
+        type=Path,
+        default=Path(os.getenv("GOLDEN_ROOT", "./data2/0500_fpv")),
+        help="Golden dataset root for camera comparison.",
+    )
+    parser.add_argument(
+        "--compare-out-json",
+        type=Path,
+        default=Path(os.getenv("COMPARE_OUT_JSON", "./analysis/quick_gpu_camera_compare.json")),
+        help="Base path for camera comparison JSON output.",
+    )
+    parser.add_argument(
+        "--compare-top-k",
+        type=int,
+        default=int(os.getenv("COMPARE_TOP_K", "5")),
+        help="Number of worst frames to store per path in the camera comparison report.",
+    )
+    parser.add_argument(
+        "--compare-window",
+        type=int,
+        default=int(os.getenv("COMPARE_WINDOW", "20")),
+        help="Search window for camera comparisons (default: 20).",
+    )
+    parser.add_argument(
+        "--compare-window-rot-weight",
+        type=float,
+        default=float(os.getenv("COMPARE_WINDOW_ROT_WEIGHT", "0.0")),
+        help="Rotation weight for windowed camera comparisons (default: 0).",
     )
     args = parser.parse_args()
 
@@ -443,6 +689,11 @@ def main() -> int:
         print("[ERROR] Could not determine a scene to run.", file=sys.stderr)
         return 1
 
+    label_ids = _pick_label_ids(args.tasks_dir, args.scene_id, args.max_labels)
+    if not label_ids:
+        print(f"[WARN] No label JSONs found under {args.tasks_dir}/{args.scene_id}.", flush=True)
+    args.label_ids = label_ids
+
     output_root = args.output_root.resolve()
     if args.clean_output and output_root.exists():
         print(f"[CLEAN] Removing previous outputs under {output_root}", flush=True)
@@ -459,16 +710,27 @@ def main() -> int:
         "total_paths": args.total_paths,
         "frames_per_path": args.frames_per_path,
         "gpu_vram_gb": args.gpu_vram_gb,
+        "npc_count": NPC_BASE[0],
+        "npc_coverage": NPC_BASE[1],
+        "sync_sweep": list(SYNC_SWEEP),
+        "label_ids": list(label_ids),
         "runs": [],
     }
 
-    for npc_count, npc_cov in NPC_SWEEP:
-        args.npc_count = npc_count
-        args.npc_coverage = npc_cov
-        run_name = f"npc{npc_count}_cov{npc_cov:.2f}".replace(".", "p")
+    compare_script = root_dir / "scripts" / "compare_camera_extrinsics.py"
+    hash_runs: dict[str, dict[str, list[str] | None]] = {}
+    golden_hashes: dict[str, list[str] | None] = {}
+    run_dirs: dict[str, Path] = {}
+    run_reports_by_name: dict[str, dict] = {}
+    args.npc_count, args.npc_coverage = NPC_BASE
+    for sync_entry in SYNC_SWEEP:
+        run_name = sync_entry["name"]
         run_dir = output_root / run_name
+        run_dirs[run_name] = run_dir
         metrics_path = analysis_dir / f"quick_gpu_metrics_{run_name}.json"
         log_path = analysis_dir / f"quick_gpu_run_{run_name}.log"
+        sync_value = sync_entry.get("gpu_video_sync") or ""
+        retain_frames = int(sync_entry.get("retain_frames") or 0)
 
         cmd = build_render_command(args, output_dir=run_dir, metrics_path=metrics_path)
         print(f"[RUN] {run_name} -> {' '.join(cmd)}", flush=True)
@@ -477,6 +739,25 @@ def main() -> int:
             log_file.flush()
             env = os.environ.copy()
             env["PYTHONUNBUFFERED"] = "1"
+            disable_bframes = env.get("GPU_VIDEO_DISABLE_BFRAMES", "1")
+            clone_frames = env.get("GPU_VIDEO_CLONE", "1")
+            if sync_value:
+                env["GPU_VIDEO_SYNC"] = sync_value
+            else:
+                env.pop("GPU_VIDEO_SYNC", None)
+            if retain_frames > 0:
+                env["GPU_VIDEO_RETAIN_FRAMES"] = str(retain_frames)
+            else:
+                env.pop("GPU_VIDEO_RETAIN_FRAMES", None)
+            env["GPU_VIDEO_DISABLE_BFRAMES"] = str(disable_bframes)
+            env["GPU_VIDEO_CLONE"] = str(clone_frames)
+            log_file.write(
+                f"GPU_VIDEO_SYNC={env.get('GPU_VIDEO_SYNC', '')} "
+                f"GPU_VIDEO_RETAIN_FRAMES={env.get('GPU_VIDEO_RETAIN_FRAMES', '')} "
+                f"GPU_VIDEO_DISABLE_BFRAMES={env.get('GPU_VIDEO_DISABLE_BFRAMES', '')} "
+                f"GPU_VIDEO_CLONE={env.get('GPU_VIDEO_CLONE', '')}\n\n"
+            )
+            log_file.flush()
             start_wall = time.monotonic()
             proc = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT, env=env)
             monitor = _monitor_process(proc, args.sample_interval)
@@ -510,8 +791,12 @@ def main() -> int:
         )
         run_report = {
             "name": run_name,
-            "npc_count": npc_count,
-            "npc_coverage": npc_cov,
+            "npc_count": args.npc_count,
+            "npc_coverage": args.npc_coverage,
+            "gpu_video_sync": sync_value or None,
+            "gpu_video_retain_frames": retain_frames,
+            "gpu_video_disable_bframes": str(disable_bframes),
+            "gpu_video_clone": str(clone_frames),
             "output_dir": str(run_dir),
             "metrics_json": str(metrics_path),
             "log_path": str(log_path),
@@ -523,7 +808,68 @@ def main() -> int:
             "max_workers_estimate": max_workers,
             "eta_seconds": eta_seconds,
         }
+        frame_hashes = _write_video_hashes(
+            run_name=run_name,
+            run_dir=run_dir,
+            scene_id=args.scene_id,
+            analysis_dir=analysis_dir,
+        )
+        hash_runs[run_name] = frame_hashes
+        run_report["frame_hash_dir"] = str(
+            (analysis_dir / "quick_gpu_frame_hashes" / run_name).resolve()
+        )
+        run_report["frame_hash_videos"] = len(frame_hashes)
+        if args.compare_camera:
+            compare_root = args.compare_golden_root
+            if not compare_script.is_file():
+                run_report["camera_compare"] = {
+                    "error": f"compare_script_missing:{compare_script}",
+                }
+            elif compare_root.is_dir():
+                compare_base = args.compare_out_json
+                compare_path = (
+                    compare_base.parent
+                    / f"{compare_base.stem}_{run_name}{compare_base.suffix}"
+                )
+                compare_path.parent.mkdir(parents=True, exist_ok=True)
+                compare_args = [
+                    sys.executable,
+                    str(compare_script),
+                    "--golden-root",
+                    str(compare_root),
+                    "--candidate-root",
+                    str(run_dir),
+                    "--scene",
+                    args.scene_id,
+                    "--top-k",
+                    str(args.compare_top_k),
+                    "--search-window",
+                    str(args.compare_window),
+                    "--window-rot-weight",
+                    str(args.compare_window_rot_weight),
+                    "--per-frame",
+                    "--out-json",
+                    str(compare_path),
+                ]
+                try:
+                    subprocess.run(compare_args, check=True)
+                    if compare_path.is_file():
+                        compare_payload = json.loads(compare_path.read_text())
+                        run_report["camera_compare"] = {
+                            "report_path": str(compare_path),
+                            "summary": compare_payload.get("summary"),
+                        }
+                except Exception as exc:  # pylint: disable=broad-except
+                    run_report["camera_compare"] = {
+                        "error": str(exc),
+                        "report_path": str(compare_path),
+                    }
+            else:
+                run_report["camera_compare"] = {
+                    "error": f"golden_root_missing:{compare_root}",
+                }
         report["runs"].append(run_report)
+        run_reports_by_name[run_name] = run_report
 
         length_str = _format_bytes(None)
         if total_length_m is not None:
@@ -532,13 +878,22 @@ def main() -> int:
         mux_per_path = metrics.get("h264_mux_sec_per_path")
         encode_str = f"{encode_fps:.2f}fps" if encode_fps else "-"
         mux_str = f"{mux_per_path:.2f}s/path" if mux_per_path else "-"
+        compare_summary = run_report.get("camera_compare", {}).get("summary")
+        compare_str = "-"
+        if compare_summary:
+            pos_mean = compare_summary.get("pos_err_mean_m")
+            rot_mean = compare_summary.get("rot_err_mean_deg")
+            frames_cmp = compare_summary.get("frames_compared") or 0
+            if frames_cmp > 0:
+                compare_str = f"cam(pos={pos_mean:.3f}m rot={rot_mean:.3f}deg)"
         print(
             "[REPORT] "
-            f"{run_name} | paths={metrics.get('paths_total')} "
+            f"{run_name} (sync={sync_value or 'off'}) | paths={metrics.get('paths_total')} "
             f"frames={metrics.get('frames_total')} "
             f"len={length_str} | "
             f"wall={wall_time:.2f}s t/frame={metrics.get('time_per_frame_sec')}s | "
             f"h264={encode_str} mux={mux_str} | "
+            f"{compare_str} | "
             f"vram(avg/max worker)={_format_bytes(vram_worker_bytes)} | "
             f"cpu_rss(max)={_format_bytes(monitor.get('max_rss_bytes'))} | "
             f"io(read/write)={_format_bytes(monitor.get('read_bytes'))}/"
@@ -546,6 +901,96 @@ def main() -> int:
             f"eta={_format_eta(eta_seconds)} | workers~{max_workers}",
             flush=True,
         )
+
+    baseline_name = SYNC_SWEEP[0]["name"] if SYNC_SWEEP else ""
+    if baseline_name:
+        compare_hash_report = _compare_hash_runs(
+            hash_runs=hash_runs,
+            baseline_name=baseline_name,
+        )
+        compare_hash_path = analysis_dir / "quick_gpu_frame_compare.json"
+        compare_hash_path.write_text(json.dumps(compare_hash_report, indent=2))
+        report["frame_hash_compare"] = str(compare_hash_path)
+        side_by_side_reports: dict[str, dict] = {"golden": {}}
+        if compare_script.is_file():
+            baseline_dir = run_dirs.get(baseline_name)
+            camera_sync_summary: dict[str, dict] = {}
+            if baseline_dir and baseline_dir.is_dir():
+                for run_name, run_dir in run_dirs.items():
+                    if run_name == baseline_name:
+                        continue
+                    compare_path = analysis_dir / f"quick_gpu_camera_compare_sync_{run_name}.json"
+                    compare_args = [
+                        sys.executable,
+                        str(compare_script),
+                        "--golden-root",
+                        str(baseline_dir),
+                        "--candidate-root",
+                        str(run_dir),
+                        "--scene",
+                        args.scene_id,
+                        "--top-k",
+                        str(args.compare_top_k),
+                        "--search-window",
+                        str(args.compare_window),
+                        "--window-rot-weight",
+                        str(args.compare_window_rot_weight),
+                        "--per-frame",
+                        "--out-json",
+                        str(compare_path),
+                    ]
+                    try:
+                        subprocess.run(compare_args, check=True)
+                        if compare_path.is_file():
+                            payload = json.loads(compare_path.read_text())
+                            camera_sync_summary[run_name] = {
+                                "report_path": str(compare_path),
+                                "summary": payload.get("summary"),
+                            }
+                    except Exception as exc:  # pylint: disable=broad-except
+                        camera_sync_summary[run_name] = {
+                            "error": str(exc),
+                            "report_path": str(compare_path),
+                        }
+                    if run_name in run_reports_by_name:
+                        run_reports_by_name[run_name]["camera_compare_sync"] = camera_sync_summary.get(run_name)
+            report["camera_compare_sync"] = camera_sync_summary
+
+        if args.compare_golden_root and args.compare_golden_root.is_dir():
+            golden_hashes = _write_golden_hashes(
+                golden_root=args.compare_golden_root,
+                scene_id=args.scene_id,
+                analysis_dir=analysis_dir,
+                label_ids=label_ids,
+            )
+            if golden_hashes:
+                hash_runs_with_golden = {"golden": golden_hashes, **hash_runs}
+                golden_compare_report = _compare_hash_runs(
+                    hash_runs=hash_runs_with_golden,
+                    baseline_name="golden",
+                )
+                golden_compare_path = analysis_dir / "quick_gpu_frame_compare_golden.json"
+                golden_compare_path.write_text(json.dumps(golden_compare_report, indent=2))
+                report["frame_hash_compare_golden"] = str(golden_compare_path)
+                for run_name, run_report in run_reports_by_name.items():
+                    run_report["frame_hash_compare_golden"] = str(golden_compare_path)
+            for run_name, run_dir in run_dirs.items():
+                out_root = analysis_dir / "quick_gpu_side_by_side" / "golden" / run_name
+                report_json = out_root / args.scene_id / "side_by_side_report.json"
+                result = _run_side_by_side_compare(
+                    left_root=args.compare_golden_root,
+                    right_root=run_dir,
+                    scene_id=args.scene_id,
+                    label_ids=label_ids,
+                    out_root=out_root,
+                    report_json=report_json,
+                    png_only=True,
+                )
+                if run_name in run_reports_by_name:
+                    run_reports_by_name[run_name]["side_by_side_golden"] = result
+                side_by_side_reports["golden"][run_name] = result
+
+        report["side_by_side"] = side_by_side_reports
 
     report_path = analysis_dir / "quick_gpu_pipeline_report.json"
     report_path.write_text(json.dumps(report, indent=2))

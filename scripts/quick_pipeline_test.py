@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import shlex
 import subprocess
 import sys
@@ -18,22 +19,47 @@ import shutil
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Quick test run for render_label_paths.py")
-    parser.add_argument("--scenes-dir", type=Path, default=Path("data/scenes"))
-    parser.add_argument("--tasks-dir", type=Path, default=Path("data/interiorGS_0500_42"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data1/quick_pipeline_test"))
+    parser.add_argument("--scenes-dir", type=Path, default=Path("/home/zhangxt/workspace/drivestudio/scenes"))
+    parser.add_argument("--tasks-dir", type=Path, default=Path("waymo_tasks"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data1/waymo_demo"))
     parser.add_argument("--scene", type=str, default=None, help="Scene id to render.")
     parser.add_argument("--label-count", type=int, default=30, help="Number of label paths to render.")
     parser.add_argument("--label-id", action="append", dest="label_ids", default=None)
+    parser.add_argument(
+        "--random",
+        type=int,
+        default=None,
+        help="Randomly sample this many (scene, path) pairs instead of the first scene.",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for --random.")
+    parser.add_argument(
+        "--path-handedness",
+        choices=("left", "right", "auto"),
+        default="auto",
+        help="Handedness for raster_world path data (default: auto).",
+    )
+    parser.add_argument(
+        "--negate-raster-world-xy",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Negate raster_world x/y before swaps/handedness (default: auto for Waymo).",
+    )
     parser.add_argument("--interval", type=float, default=1.0, help="Monitoring interval in seconds.")
     parser.add_argument("--ply-transform-backend", type=str, default="gpu")
-    parser.add_argument("--video-backend", type=str, default="nvenc")
+    parser.add_argument("--video-backend", type=str, default="cpu")
     parser.add_argument("--video-nvenc-preset", type=str, default=None)
     parser.add_argument("--video-nvenc-bitrate", type=str, default=None)
+    parser.add_argument(
+        "--show-bev",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save BEV debug image with path/scene overlay (default: on).",
+    )
     parser.add_argument("--enable-depth", action="store_true", help="Keep depth outputs.")
     parser.add_argument(
         "--npc",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="Enable NPC placement/rendering (default: enabled).",
     )
     parser.add_argument("--npc-actor-root", type=Path, default=Path("data/SHHQ_gs/walking"))
@@ -71,6 +97,15 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _resolve_label_directory(scene_task_dir: Path) -> Path | None:
+    label_paths_dir = scene_task_dir / "label_paths"
+    if label_paths_dir.is_dir() and any(label_paths_dir.glob("*.json")):
+        return label_paths_dir
+    if scene_task_dir.is_dir() and any(scene_task_dir.glob("*.json")):
+        return scene_task_dir
+    return None
+
+
 def _find_scene_and_labels(tasks_dir: Path, scene: str | None, label_ids: list[str] | None, limit: int) -> tuple[str, list[str]]:
     if label_ids:
         if scene is None:
@@ -78,9 +113,11 @@ def _find_scene_and_labels(tasks_dir: Path, scene: str | None, label_ids: list[s
         return scene, label_ids
 
     if scene is None:
-        candidates = sorted([p for p in tasks_dir.iterdir() if p.is_dir()])
+        candidates = sorted(
+            [p for p in tasks_dir.iterdir() if p.is_dir() and _resolve_label_directory(p) is not None]
+        )
         if not candidates:
-            raise SystemExit(f"No scene folders under {tasks_dir}")
+            raise SystemExit(f"No scene folders with labels under {tasks_dir}")
         scene_dir = candidates[0]
         scene = scene_dir.name
     else:
@@ -88,13 +125,97 @@ def _find_scene_and_labels(tasks_dir: Path, scene: str | None, label_ids: list[s
         if not scene_dir.is_dir():
             raise SystemExit(f"Scene directory not found: {scene_dir}")
 
+    label_dir = _resolve_label_directory(scene_dir)
+    if label_dir is None:
+        raise SystemExit(f"No label JSONs found under {scene_dir}")
+
     json_paths = sorted(
-        [p for p in scene_dir.glob("*.json") if not p.name.endswith("_detailed.json")]
+        [
+            p
+            for p in label_dir.glob("*.json")
+            if not p.name.endswith("_detailed.json") and p.name != "summary.json"
+        ]
     )
     if not json_paths:
-        raise SystemExit(f"No label JSONs found under {scene_dir}")
+        raise SystemExit(f"No label JSONs found under {label_dir}")
     label_ids = [p.stem for p in json_paths[: max(1, limit)]]
     return scene, label_ids
+
+
+def _collect_scene_label_pairs(tasks_dir: Path, scene: str | None) -> list[tuple[str, str]]:
+    if scene is not None:
+        scene_dir = tasks_dir / scene
+        if not scene_dir.is_dir():
+            raise SystemExit(f"Scene directory not found: {scene_dir}")
+        if _resolve_label_directory(scene_dir) is None:
+            raise SystemExit(f"No label JSONs found under {scene_dir}")
+        candidates = [scene_dir]
+    else:
+        if not tasks_dir.is_dir():
+            raise SystemExit(f"Task output directory not found: {tasks_dir}")
+        candidates = sorted(
+            [p for p in tasks_dir.iterdir() if p.is_dir() and _resolve_label_directory(p) is not None]
+        )
+        if not candidates:
+            raise SystemExit(f"No scene folders with labels under {tasks_dir}")
+
+    pairs: list[tuple[str, str]] = []
+    for scene_dir in candidates:
+        label_dir = _resolve_label_directory(scene_dir)
+        if label_dir is None:
+            continue
+        json_paths = sorted(
+            [
+                p
+                for p in label_dir.glob("*.json")
+                if not p.name.endswith("_detailed.json") and p.name != "summary.json"
+            ]
+        )
+        for json_path in json_paths:
+            pairs.append((scene_dir.name, json_path.stem))
+    return pairs
+
+
+def _sample_random_scene_labels(
+    tasks_dir: Path,
+    scene: str | None,
+    sample_count: int,
+    seed: int,
+) -> dict[str, list[str]]:
+    if sample_count <= 0:
+        raise SystemExit("--random must be a positive integer.")
+    pairs = _collect_scene_label_pairs(tasks_dir, scene)
+    if not pairs:
+        raise SystemExit(f"No label JSONs found under {tasks_dir}")
+    rng = random.Random(seed)
+    sample_size = min(sample_count, len(pairs))
+    sampled_pairs = rng.sample(pairs, sample_size)
+    runs: dict[str, list[str]] = {}
+    for scene_id, label_id in sampled_pairs:
+        runs.setdefault(scene_id, []).append(label_id)
+    return runs
+
+
+def _resolve_path_handedness(handedness: str, scenes_dir: Path, tasks_dir: Path) -> str:
+    if handedness != "auto":
+        return handedness
+    for candidate in (scenes_dir, tasks_dir):
+        if "waymo" in candidate.name.lower():
+            return "right"
+    return "left"
+
+
+def _resolve_negate_raster_world_xy(
+    value: bool | None,
+    scenes_dir: Path,
+    tasks_dir: Path,
+) -> bool:
+    if value is not None:
+        return value
+    for candidate in (scenes_dir, tasks_dir):
+        if "waymo" in candidate.name.lower():
+            return True
+    return False
 
 
 def _read_meminfo() -> tuple[int | None, int | None]:
@@ -174,16 +295,10 @@ def _summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
         vals = [s[key] for s in samples if s.get(key) is not None]
         return sum(vals) / len(vals) if vals else None
 
-    total_read = None
-    total_write = None
-    first_read = samples[0].get("read_bytes")
-    last_read = samples[-1].get("read_bytes")
-    if first_read is not None and last_read is not None:
-        total_read = last_read - first_read
-    first_write = samples[0].get("write_bytes")
-    last_write = samples[-1].get("write_bytes")
-    if first_write is not None and last_write is not None:
-        total_write = last_write - first_write
+    read_deltas = [s["read_bytes_delta"] for s in samples if s.get("read_bytes_delta") is not None]
+    write_deltas = [s["write_bytes_delta"] for s in samples if s.get("write_bytes_delta") is not None]
+    total_read = sum(read_deltas) if read_deltas else None
+    total_write = sum(write_deltas) if write_deltas else None
     return {
         "avg_cpu_percent": avg("cpu_percent"),
         "avg_mem_percent": avg("mem_percent"),
@@ -197,87 +312,7 @@ def _summarize_samples(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def main() -> None:
-    args = _parse_args()
-    scene_id, label_ids = _find_scene_and_labels(
-        args.tasks_dir, args.scene, args.label_ids, args.label_count
-    )
-
-    repo_root = Path(__file__).resolve().parents[1]
-    render_script = repo_root / "render_label_paths.py"
-    metrics_path = args.output_dir / "quick_metrics.json"
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd = [
-        sys.executable,
-        str(render_script),
-        "--scenes-dir",
-        str(args.scenes_dir),
-        "--tasks-dir",
-        str(args.tasks_dir),
-        "--scene",
-        scene_id,
-        "--output-dir",
-        str(args.output_dir),
-        "--overwrite",
-        "--video",
-        "--save-camera-metadata",
-        "--ply-transform-backend",
-        args.ply_transform_backend,
-        "--video-backend",
-        args.video_backend,
-        "--metrics-json",
-        str(metrics_path),
-    ]
-    if args.video_nvenc_preset:
-        cmd.extend(["--video-nvenc-preset", args.video_nvenc_preset])
-    if args.video_nvenc_bitrate:
-        cmd.extend(["--video-nvenc-bitrate", args.video_nvenc_bitrate])
-    if not args.enable_depth:
-        cmd.append("--no-save-depth-maps")
-    for label_id in label_ids:
-        cmd.extend(["--label-id", label_id])
-    if args.npc:
-        cmd.extend(
-            [
-                "--npc-render",
-                "--npc-actor-root",
-                str(args.npc_actor_root),
-                "--npc-frame-pool-size",
-                str(args.npc_frame_pool_size),
-                "--npc-density-coverage",
-                str(args.npc_density_coverage),
-                "--npc-count",
-                str(args.npc_count),
-                "--npc-max-count",
-                str(args.npc_max_count),
-                "--npc-priority",
-                str(args.npc_priority),
-                "--npc-density-mode",
-                str(args.npc_density_mode),
-                "--npc-zone-ratio",
-                str(args.npc_zone_ratio),
-                "--npc-max-range",
-                str(args.npc_max_range),
-                "--npc-free-threshold",
-                str(args.npc_free_threshold),
-                "--npc-placement-backend",
-                str(args.npc_placement_backend),
-            ]
-        )
-        if args.npc_free_white:
-            cmd.append("--npc-free-white")
-        else:
-            cmd.append("--no-npc-free-white")
-        if args.npc_rotate_mask_180:
-            cmd.append("--npc-rotate-mask-180")
-        if args.npc_auto_clearance:
-            cmd.append("--npc-auto-clearance")
-    if args.extra_args:
-        cmd.extend(shlex.split(args.extra_args))
-
-    print("[TEST] Running:", " ".join(shlex.quote(part) for part in cmd), flush=True)
-
+def _run_render_command(cmd: list[str], interval: float) -> tuple[int, float, list[dict[str, Any]]]:
     process = subprocess.Popen(cmd)
     start_time = time.time()
 
@@ -316,26 +351,162 @@ def main() -> None:
         read_bytes_prev = read_bytes
         write_bytes_prev = write_bytes
 
-        time.sleep(max(0.1, args.interval))
+        time.sleep(max(0.1, interval))
 
     return_code = process.wait()
     elapsed = time.time() - start_time
+    return return_code, elapsed, samples
+
+
+def main() -> None:
+    args = _parse_args()
+    if args.random is not None and args.label_ids:
+        raise SystemExit("--random is incompatible with --label-id.")
+    if args.random is None:
+        scene_id, label_ids = _find_scene_and_labels(
+            args.tasks_dir, args.scene, args.label_ids, args.label_count
+        )
+        runs: dict[str, list[str]] = {scene_id: label_ids}
+    else:
+        runs = _sample_random_scene_labels(
+            args.tasks_dir,
+            args.scene,
+            args.random,
+            args.seed,
+        )
+
+    repo_root = Path(__file__).resolve().parents[1]
+    render_script = repo_root / "render_label_paths.py"
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    total_selected = sum(len(ids) for ids in runs.values())
+    if args.random is not None:
+        print(
+            f"[TEST] Random selection: {total_selected} paths across {len(runs)} scenes (seed={args.seed}).",
+            flush=True,
+        )
+    path_handedness = _resolve_path_handedness(
+        args.path_handedness,
+        args.scenes_dir,
+        args.tasks_dir,
+    )
+    negate_raster_world_xy = _resolve_negate_raster_world_xy(
+        args.negate_raster_world_xy,
+        args.scenes_dir,
+        args.tasks_dir,
+    )
+    print(f"[TEST] Path handedness: {path_handedness}", flush=True)
+    print(f"[TEST] Negate raster_world xy: {negate_raster_world_xy}", flush=True)
+
+    samples: list[dict[str, Any]] = []
+    metrics_payloads: list[dict[str, Any]] = []
+    elapsed = 0.0
+    return_code = 0
+
+    for scene_id, label_ids in runs.items():
+        metrics_name = "quick_metrics.json" if len(runs) == 1 else f"quick_metrics_{scene_id}.json"
+        metrics_path = args.output_dir / metrics_name
+        cmd = [
+            sys.executable,
+            str(render_script),
+            "--scenes-dir",
+            str(args.scenes_dir),
+            "--tasks-dir",
+            str(args.tasks_dir),
+            "--path-handedness",
+            path_handedness,
+            "--scene",
+            scene_id,
+            "--output-dir",
+            str(args.output_dir),
+            "--overwrite",
+            "--video",
+            "--save-camera-metadata",
+            "--ply-transform-backend",
+            args.ply_transform_backend,
+            "--video-backend",
+            args.video_backend,
+            "--metrics-json",
+            str(metrics_path),
+        ]
+        if negate_raster_world_xy:
+            cmd.append("--negate-raster-world-xy")
+        if args.show_bev:
+            cmd.append("--show-BEV")
+        else:
+            cmd.append("--no-show-BEV")
+        if args.video_nvenc_preset:
+            cmd.extend(["--video-nvenc-preset", args.video_nvenc_preset])
+        if args.video_nvenc_bitrate:
+            cmd.extend(["--video-nvenc-bitrate", args.video_nvenc_bitrate])
+        if not args.enable_depth:
+            cmd.append("--no-save-depth-maps")
+        for label_id in label_ids:
+            cmd.extend(["--label-id", label_id])
+        if args.npc:
+            cmd.extend(
+                [
+                    "--npc-render",
+                    "--npc-actor-root",
+                    str(args.npc_actor_root),
+                    "--npc-frame-pool-size",
+                    str(args.npc_frame_pool_size),
+                    "--npc-density-coverage",
+                    str(args.npc_density_coverage),
+                    "--npc-count",
+                    str(args.npc_count),
+                    "--npc-max-count",
+                    str(args.npc_max_count),
+                    "--npc-priority",
+                    str(args.npc_priority),
+                    "--npc-density-mode",
+                    str(args.npc_density_mode),
+                    "--npc-zone-ratio",
+                    str(args.npc_zone_ratio),
+                    "--npc-max-range",
+                    str(args.npc_max_range),
+                    "--npc-free-threshold",
+                    str(args.npc_free_threshold),
+                    "--npc-placement-backend",
+                    str(args.npc_placement_backend),
+                ]
+            )
+            if args.npc_free_white:
+                cmd.append("--npc-free-white")
+            else:
+                cmd.append("--no-npc-free-white")
+            if args.npc_rotate_mask_180:
+                cmd.append("--npc-rotate-mask-180")
+            if args.npc_auto_clearance:
+                cmd.append("--npc-auto-clearance")
+        if args.extra_args:
+            cmd.extend(shlex.split(args.extra_args))
+
+        print("[TEST] Running:", " ".join(shlex.quote(part) for part in cmd), flush=True)
+
+        run_code, run_elapsed, run_samples = _run_render_command(cmd, args.interval)
+        elapsed += run_elapsed
+        samples.extend(run_samples)
+
+        if metrics_path.exists():
+            try:
+                metrics_payloads.append(json.loads(metrics_path.read_text()))
+            except Exception:
+                metrics_payloads.append({})
+
+        if run_code != 0:
+            return_code = run_code
+            break
 
     summary = _summarize_samples(samples)
-    metrics_payload = {}
-    if metrics_path.exists():
-        try:
-            metrics_payload = json.loads(metrics_path.read_text())
-        except Exception:
-            metrics_payload = {}
-
-    fps_values = [
-        p.get("frames_per_sec")
-        for p in metrics_payload.get("paths", [])
-        if p.get("frames_per_sec") is not None
-    ]
+    fps_values: list[float] = []
+    frames_total = 0
+    for metrics_payload in metrics_payloads:
+        for path_payload in metrics_payload.get("paths", []):
+            if path_payload.get("frames_per_sec") is not None:
+                fps_values.append(path_payload["frames_per_sec"])
+            frames_total += int(path_payload.get("frames") or 0)
     avg_fps = sum(fps_values) / len(fps_values) if fps_values else None
-    frames_total = sum(int(p.get("frames") or 0) for p in metrics_payload.get("paths", []))
 
     print("\n[TEST] Summary", flush=True)
     print(f"  return_code: {return_code}", flush=True)

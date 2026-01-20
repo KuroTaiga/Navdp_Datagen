@@ -189,10 +189,14 @@ else
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
 fi
 
-# Force legacy video backends (cpu/nvenc) until camera jumpiness is resolved.
+# GPU video backend tuning for PyNvVideoCodec (avoid frame reordering/jitter).
 if [ "${VIDEO_BACKEND}" = "gpu" ]; then
-  echo "[VIDEO] WARN: video-backend=gpu is disabled in this script; using nvenc instead." >&2
-  VIDEO_BACKEND="nvenc"
+  : "${GPU_VIDEO_DISABLE_BFRAMES:=1}"
+  : "${GPU_VIDEO_CLONE:=1}"
+  : "${GPU_VIDEO_SYNC:=both}"
+  : "${GPU_VIDEO_RETAIN_FRAMES:=4}"
+  export GPU_VIDEO_DISABLE_BFRAMES GPU_VIDEO_CLONE GPU_VIDEO_SYNC GPU_VIDEO_RETAIN_FRAMES
+  echo "[VIDEO] GPU backend: bframes=${GPU_VIDEO_DISABLE_BFRAMES} clone=${GPU_VIDEO_CLONE} sync=${GPU_VIDEO_SYNC} retain=${GPU_VIDEO_RETAIN_FRAMES}" >&2
 fi
 
 #for changing lighting levels. We can also use the script under ./lighting folder to directly modify based on the mp4 results
