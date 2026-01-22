@@ -2498,33 +2498,20 @@ def validate_path_bounds(
     right = float(meta["right"])
     top = float(meta["top"])
     bottom = float(meta["bottom"])
-    lower_z = float(meta["lower_z"])
-    upper_z = float(meta["upper_z"])
 
     xs = [float(pt[0]) for pt in path_xy]
     ys = [float(pt[1]) for pt in path_xy]
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
 
-    z_vals = [float(pt[2]) for pt in raw_points if getattr(pt, "shape", (0,))[0] >= 3]
-    min_z = min(z_vals) if z_vals else None
-    max_z = max(z_vals) if z_vals else None
-
     out_x = min_x < left - eps or max_x > right + eps
     out_y = min_y < bottom - eps or max_y > top + eps
-    out_z = (
-        min_z is not None
-        and max_z is not None
-        and (min_z < lower_z - eps or max_z > upper_z + eps)
-    )
-    if out_x or out_y or out_z:
+    if out_x or out_y:
         msg = (
             f"Path {json_path} outside occupancy bounds: "
             f"x=[{min_x:.3f},{max_x:.3f}] vs [{left:.3f},{right:.3f}], "
             f"y=[{min_y:.3f},{max_y:.3f}] vs [{bottom:.3f},{top:.3f}]"
         )
-        if min_z is not None and max_z is not None:
-            msg += f", z=[{min_z:.3f},{max_z:.3f}] vs [{lower_z:.3f},{upper_z:.3f}]"
         raise ValueError(msg)
 
 
@@ -4453,6 +4440,7 @@ def render_path_frames(
     camera_human_sequence: ActorSequence | None = None,
     camera_human_stride: int = 1,
     camera_human_max_frames: int | None = None,
+    validate_path_bounds_enabled: bool = True,
 ) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
@@ -4477,12 +4465,13 @@ def render_path_frames(
         negate_xy=negate_raster_world_xy,
         resample_step=resample_step,
     )
-    validate_path_bounds(
-        json_path=json_path,
-        meta=meta,
-        path_xy=path_data.path_xy,
-        raw_points=path_data.raw_points,
-    )
+    if validate_path_bounds_enabled:
+        validate_path_bounds(
+            json_path=json_path,
+            meta=meta,
+            path_xy=path_data.path_xy,
+            raw_points=path_data.raw_points,
+        )
     path_xy = path_data.path_xy
     if len(path_xy) < 2:
         raise ValueError(f"Need at least two distinct points in {json_path}")
@@ -5435,6 +5424,12 @@ def parse_args() -> ArgumentParser:
         help="Scene identifier(s) present in both data/scenes and data/task_outputs_10w.",
     )
     parser.add_argument(
+        "--validate-path-bounds",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Validate that raster_world paths stay within occupancy bounds (default: on).",
+    )
+    parser.add_argument(
         "--label-id",
         action="append",
         dest="label_ids",
@@ -5708,6 +5703,18 @@ def parse_args() -> ArgumentParser:
         help="Enable camera-light shading using depth-derived normals (default: off).",
     )
     parser.add_argument(
+        "--cl-light-mode",
+        choices=("headlight", "bulb"),
+        default="headlight",
+        help="Light mode: headlight (camera-aligned) or bulb (point-light style).",
+    )
+    parser.add_argument(
+        "--cl-shading-model",
+        choices=("classic", "lambert"),
+        default="classic",
+        help="Shading model: classic (ambient+diffuse+specular) or lambert (ambient+diffuse).",
+    )
+    parser.add_argument(
         "--cl-strength",
         type=float,
         default=1.0,
@@ -5726,6 +5733,12 @@ def parse_args() -> ArgumentParser:
         type=float,
         default=0.2,
         help="Ambient term applied before camera light (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-base-scale",
+        type=float,
+        default=1.0,
+        help="Scale the base image before lighting (default: 1.0).",
     )
     parser.add_argument(
         "--cl-diffuse",
@@ -5766,10 +5779,40 @@ def parse_args() -> ArgumentParser:
         help="Box blur radius (pixels) for depth before normal recovery (default: 0).",
     )
     parser.add_argument(
+        "--cl-normal-filter",
+        choices=("none", "box", "bilateral"),
+        default="box",
+        help="Depth filter before normal recovery (default: box).",
+    )
+    parser.add_argument(
+        "--cl-normal-kernel",
+        type=int,
+        default=2,
+        help="Bilateral kernel radius in pixels (default: 2).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-range",
+        type=float,
+        default=0.1,
+        help="Bilateral range sigma in depth units (default: 0.1).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-domain",
+        type=float,
+        default=1.0,
+        help="Bilateral domain sigma in pixels (default: 1.0).",
+    )
+    parser.add_argument(
         "--cl-shadow",
         action=BooleanOptionalAction,
         default=False,
         help="Enable shadow mapping from the camera light (default: off).",
+    )
+    parser.add_argument(
+        "--cl-shadow-compare",
+        choices=("auto", "z", "radial"),
+        default="auto",
+        help="Shadow depth compare mode: auto, z, or radial (default: auto).",
     )
     parser.add_argument(
         "--cl-shadow-bias",
@@ -6280,11 +6323,15 @@ def main() -> None:
         cl_range = float(args.cl_range)
         cl_range = cl_range if cl_range > 0.0 else None
         shadow_strength = max(0.0, min(float(args.cl_shadow_strength), 1.0))
+        shadow_compare = str(args.cl_shadow_compare)
+        if shadow_compare == "auto":
+            shadow_compare = "radial" if str(args.cl_light_mode) == "bulb" else "z"
         cl_config = CameraLightConfig(
             enabled=True,
             strength=float(args.cl_strength),
             color=(float(args.cl_color[0]), float(args.cl_color[1]), float(args.cl_color[2])),
             ambient=float(args.cl_ambient),
+            base_scale=float(args.cl_base_scale),
             diffuse=float(args.cl_diffuse),
             specular=float(args.cl_specular),
             shininess=float(args.cl_shininess),
@@ -6299,6 +6346,13 @@ def main() -> None:
             shadow_bias=float(args.cl_shadow_bias),
             shadow_strength=shadow_strength,
             shadow_pcf_radius=max(0, int(args.cl_shadow_pcf)),
+            light_mode=str(args.cl_light_mode),
+            shading_model=str(args.cl_shading_model),
+            shadow_compare=shadow_compare,
+            normal_filter=str(args.cl_normal_filter),
+            normal_kernel=max(0, int(args.cl_normal_kernel)),
+            normal_sigma_range=float(args.cl_normal_sigma_range),
+            normal_sigma_domain=float(args.cl_normal_sigma_domain),
         )
     npc_render_enabled = bool(args.npc_render)
     npc_bev_use_mask = bool(args.npc_bev_use_mask)
@@ -7004,6 +7058,7 @@ def main() -> None:
                         camera_human_sequence=camera_human_sequence,
                         camera_human_stride=int(args.camera_human_stride),
                         camera_human_max_frames=args.camera_human_max_frames,
+                        validate_path_bounds_enabled=bool(args.validate_path_bounds),
                     )
                     record_path_status(scene_id, json_path.stem, STATUS_DONE, error=None)
                     if summary is not None:

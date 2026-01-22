@@ -19,9 +19,9 @@ import shutil
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Quick test run for render_label_paths.py")
-    parser.add_argument("--scenes-dir", type=Path, default=Path("/home/zhangxt/workspace/drivestudio/scenes"))
-    parser.add_argument("--tasks-dir", type=Path, default=Path("waymo_tasks"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data1/waymo_demo"))
+    parser.add_argument("--scenes-dir", type=Path, default=Path("./data/scenes"))
+    parser.add_argument("--tasks-dir", type=Path, default=Path("./data/interiorGS_0500_42"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data1/cl_test"))
     parser.add_argument("--scene", type=str, default=None, help="Scene id to render.")
     parser.add_argument("--label-count", type=int, default=30, help="Number of label paths to render.")
     parser.add_argument("--label-id", action="append", dest="label_ids", default=None)
@@ -93,6 +93,142 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default="--gpu-only",
         help="Extra args forwarded to render_label_paths.py (default: --gpu-only).",
+    )
+    parser.add_argument(
+        "--cl-enable",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable camera-light shading (default: off).",
+    )
+    parser.add_argument(
+        "--cl-light-mode",
+        choices=("headlight", "bulb"),
+        default="headlight",
+        help="Light mode for camera light (default: headlight).",
+    )
+    parser.add_argument(
+        "--cl-shading-model",
+        choices=("classic", "lambert"),
+        default="classic",
+        help="Shading model for camera light (default: classic).",
+    )
+    parser.add_argument(
+        "--cl-strength",
+        type=float,
+        default=1.0,
+        help="Camera light strength multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-color",
+        type=float,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(1.0, 1.0, 1.0),
+        help="Camera light color as RGB in 0..1 (default: 1 1 1).",
+    )
+    parser.add_argument(
+        "--cl-ambient",
+        type=float,
+        default=0.2,
+        help="Ambient term applied before camera light (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-base-scale",
+        type=float,
+        default=1.0,
+        help="Scale the base image before lighting (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-diffuse",
+        type=float,
+        default=1.0,
+        help="Diffuse term multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-specular",
+        type=float,
+        default=0.2,
+        help="Specular term multiplier (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shininess",
+        type=float,
+        default=16.0,
+        help="Specular shininess exponent (default: 16).",
+    )
+    parser.add_argument(
+        "--cl-range",
+        type=float,
+        default=0.0,
+        help="Light falloff range in meters (0 disables attenuation).",
+    )
+    parser.add_argument(
+        "--cl-offset",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Camera-light offset in camera coordinates (meters).",
+    )
+    parser.add_argument(
+        "--cl-normal-smooth",
+        type=int,
+        default=0,
+        help="Box blur radius (pixels) for depth before normal recovery (default: 0).",
+    )
+    parser.add_argument(
+        "--cl-normal-filter",
+        choices=("none", "box", "bilateral"),
+        default="box",
+        help="Depth filter before normal recovery (default: box).",
+    )
+    parser.add_argument(
+        "--cl-normal-kernel",
+        type=int,
+        default=2,
+        help="Bilateral kernel radius in pixels (default: 2).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-range",
+        type=float,
+        default=0.1,
+        help="Bilateral range sigma in depth units (default: 0.1).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-domain",
+        type=float,
+        default=1.0,
+        help="Bilateral domain sigma in pixels (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable shadow mapping from the camera light (default: off).",
+    )
+    parser.add_argument(
+        "--cl-shadow-bias",
+        type=float,
+        default=0.02,
+        help="Depth bias for shadow mapping (default: 0.02).",
+    )
+    parser.add_argument(
+        "--cl-shadow-strength",
+        type=float,
+        default=0.2,
+        help="Shadow strength multiplier (0=black, 1=no shadow; default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shadow-pcf",
+        type=int,
+        default=0,
+        help="Shadow PCF radius in pixels for soft shadows (default: 0).",
+    )
+    parser.add_argument(
+        "--cl-shadow-compare",
+        choices=("auto", "z", "radial"),
+        default="auto",
+        help="Shadow depth compare mode (default: auto).",
     )
     return parser.parse_args()
 
@@ -443,6 +579,46 @@ def main() -> None:
             cmd.append("--no-save-depth-maps")
         for label_id in label_ids:
             cmd.extend(["--label-id", label_id])
+        if args.cl_enable:
+            cmd.append("--cl-enable")
+            cmd.extend(["--cl-light-mode", args.cl_light_mode])
+            cmd.extend(["--cl-shading-model", args.cl_shading_model])
+            cmd.extend(["--cl-strength", str(args.cl_strength)])
+            cmd.extend(
+                [
+                    "--cl-color",
+                    str(args.cl_color[0]),
+                    str(args.cl_color[1]),
+                    str(args.cl_color[2]),
+                ]
+            )
+            cmd.extend(["--cl-ambient", str(args.cl_ambient)])
+            cmd.extend(["--cl-base-scale", str(args.cl_base_scale)])
+            cmd.extend(["--cl-diffuse", str(args.cl_diffuse)])
+            cmd.extend(["--cl-specular", str(args.cl_specular)])
+            cmd.extend(["--cl-shininess", str(args.cl_shininess)])
+            cmd.extend(["--cl-range", str(args.cl_range)])
+            cmd.extend(
+                [
+                    "--cl-offset",
+                    str(args.cl_offset[0]),
+                    str(args.cl_offset[1]),
+                    str(args.cl_offset[2]),
+                ]
+            )
+            cmd.extend(["--cl-normal-smooth", str(args.cl_normal_smooth)])
+            cmd.extend(["--cl-normal-filter", args.cl_normal_filter])
+            cmd.extend(["--cl-normal-kernel", str(args.cl_normal_kernel)])
+            cmd.extend(["--cl-normal-sigma-range", str(args.cl_normal_sigma_range)])
+            cmd.extend(["--cl-normal-sigma-domain", str(args.cl_normal_sigma_domain)])
+            if args.cl_shadow:
+                cmd.append("--cl-shadow")
+            else:
+                cmd.append("--no-cl-shadow")
+            cmd.extend(["--cl-shadow-bias", str(args.cl_shadow_bias)])
+            cmd.extend(["--cl-shadow-strength", str(args.cl_shadow_strength)])
+            cmd.extend(["--cl-shadow-pcf", str(args.cl_shadow_pcf)])
+            cmd.extend(["--cl-shadow-compare", args.cl_shadow_compare])
         if args.npc:
             cmd.extend(
                 [

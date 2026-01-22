@@ -24,7 +24,7 @@ show_usage_and_exit() {
 
 PIPELINE_MODE=${PIPELINE_MODE:-gpu}
 RESUME_MODE=true
-RESUME_LOG_PATH="0500_fpv_npc.log"
+RESUME_LOG_PATH="0500_fpv_npc_250.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     RESUME)
@@ -121,20 +121,20 @@ fi
 CONDA_ENV=${CONDA_ENV:-cuda121}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
 TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc}
+OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc_250}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/npc_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_npc_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_status.json}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_npc_250_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_250_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_npc_metrics}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc.json}
-ERROR_LOG=${ERROR_LOG:-./0500_npc.log}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc_250.json}
+ERROR_LOG=${ERROR_LOG:-./0500_npc_250.log}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_npc}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-36}
+WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -173,8 +173,9 @@ ENABLE_RGB_FRAMES=${ENABLE_RGB_FRAMES:-false}
 ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
-VERBOSE=${VERBOSE:-true}
+VERBOSE=${VERBOSE:-false}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
+WORKER_PROGRESS=${WORKER_PROGRESS:-false}
 VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
 VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
 
@@ -185,7 +186,7 @@ if [ "$PIPELINE_MODE" = "legacy" ]; then
   : "${NPC_PLACEMENT_BACKEND:=cpu}" #was set to GPU but the imapct is small so CPU is fine
 else
   : "${PLY_TRANSFORM_BACKEND:=gpu}"
-  : "${VIDEO_BACKEND:=nvenc}"
+  : "${VIDEO_BACKEND:=gpu}"
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
 fi
 
@@ -228,7 +229,7 @@ CL_SHADOW_BIAS=${CL_SHADOW_BIAS:-0.02}
 CL_SHADOW_STRENGTH=${CL_SHADOW_STRENGTH:-0.2}
 CL_SHADOW_PCF=${CL_SHADOW_PCF:-0}
 
-render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET}"
+render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --view-mode forward --height-offset ${HEIGHT_OFFSET} --no-validate-path-bounds"
 render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
 render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
@@ -754,13 +755,15 @@ parallel_cmd=(
   --output-dir "${OUTPUT_DIR}"
   --error-log "${ERROR_LOG}"
   --progress-json "${PROGRESS_JSON}"
-  --worker-progress
   --status-json "${STATUS_JSON}"
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
   --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
   --cuda-oom-max-retries "${CUDA_OOM_MAX_RETRIES}"
 )
+if storage_bool_true "$WORKER_PROGRESS"; then
+  parallel_cmd+=(--worker-progress)
+fi
 if storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
   parallel_cmd+=(--exclude-detailed-labels)
 else

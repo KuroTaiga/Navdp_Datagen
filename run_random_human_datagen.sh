@@ -194,7 +194,7 @@ fi
 export STRICT_GPU_BACKENDS
 
 # Default render_label_paths.py snippets appended to every worker invocation.
-render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET}"
+render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --navdp-ply-per-scene --height-offset ${HEIGHT_OFFSET} --no-validate-path-bounds"
 render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
 render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
