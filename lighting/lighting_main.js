@@ -891,7 +891,7 @@ function createWorker(self) {
             gaussianCount = 0;
             buffer = processPlyBuffer(e.data.ply);
             gaussianCount = Math.floor(buffer.byteLength / PADDED_SPLAT_LENGTH);
-            postMessage({ buffer: buffer });
+            postMessage({ buffer: buffer, gaussianCount });
         } else if (e.data.buffer) {
             buffer = e.data.buffer;
             gaussianCount = e.data.gaussianCount;
@@ -1398,6 +1398,7 @@ async function main() {
     let splatData = new Uint8Array(Math.max(0, contentLength - headerSkip));
     let downloadComplete = false;
     const totalGaussians = Math.max(1, Math.floor(splatData.length / PADDED_SPLAT_LENGTH));
+    let processingTotal = totalGaussians;
 
     const downsample =
         splatData.length / PADDED_SPLAT_LENGTH > 500000 ? 1 : 1 / devicePixelRatio;
@@ -1899,6 +1900,8 @@ async function main() {
     worker.onmessage = (e) => {
         if (e.data.buffer) {
             splatData = new Uint8Array(e.data.buffer);
+            const bufferGaussianCount = e.data.gaussianCount ?? Math.floor(splatData.length / PADDED_SPLAT_LENGTH);
+            processingTotal = Math.max(1, bufferGaussianCount);
             const exportedSplatData = new Uint8Array(LSPLAT_MAGIC_HEADER.length + splatData.length);
             exportedSplatData.set(LSPLAT_MAGIC_HEADER, 0);
             exportedSplatData.set(splatData, LSPLAT_MAGIC_HEADER.length);
@@ -1912,7 +1915,7 @@ async function main() {
             link.click();
             worker.postMessage({
                 buffer: splatData.buffer,
-                gaussianCount: Math.floor(splatData.length / PADDED_SPLAT_LENGTH),
+                gaussianCount: bufferGaussianCount,
             });
         } else if (e.data.texdata) {
             const { texdata, texwidth, texheight, hasNormals } = e.data;
@@ -2667,7 +2670,7 @@ async function main() {
             start = Date.now() + 2000;
         }
         if (downloadComplete) {
-            const progress = (100 * gaussianCount) / totalGaussians;
+            const progress = (100 * gaussianCount) / Math.max(1, processingTotal);
             if (progress < 100) {
                 updateLoadingProgress(progress, `Processing ${Math.floor(progress)}%`);
             } else {

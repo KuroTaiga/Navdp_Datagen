@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Any
 
 import shutil
+import imageio.v2 as imageio
+import numpy as np
 
 
 def _parse_args() -> argparse.Namespace:
@@ -171,6 +173,32 @@ def _parse_args() -> argparse.Namespace:
         help="Camera-light offset in camera coordinates (meters).",
     )
     parser.add_argument(
+        "--cl-light-reverse",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Rotate camera light direction 180 degrees (headlight only).",
+    )
+    parser.add_argument(
+        "--cl-light-world",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Fixed world-space light position; overrides camera-relative offset if set.",
+    )
+    parser.add_argument(
+        "--cl-light-center",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Place the light at the occupancy center (overrides --cl-light-world).",
+    )
+    parser.add_argument(
+        "--cl-light-center-z",
+        type=float,
+        default=2.0,
+        help="Z height (meters) used with --cl-light-center (default: 2.0).",
+    )
+    parser.add_argument(
         "--cl-normal-smooth",
         type=int,
         default=0,
@@ -229,6 +257,18 @@ def _parse_args() -> argparse.Namespace:
         choices=("auto", "z", "radial"),
         default="auto",
         help="Shadow depth compare mode (default: auto).",
+    )
+    parser.add_argument(
+        "--cl-residual-visualize",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Save residual PNGs between CL render and ambient-only render (quick test only).",
+    )
+    parser.add_argument(
+        "--cl-residual-normalize",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Normalize residuals per-frame to full 0..255 range (default: on).",
     )
     return parser.parse_args()
 
@@ -494,6 +534,68 @@ def _run_render_command(cmd: list[str], interval: float) -> tuple[int, float, li
     return return_code, elapsed, samples
 
 
+def _set_bool_flag(cmd: list[str], flag: str, enabled: bool) -> None:
+    neg_flag = "--no-" + flag.lstrip("-")
+    while flag in cmd:
+        cmd.remove(flag)
+    while neg_flag in cmd:
+        cmd.remove(neg_flag)
+    cmd.append(flag if enabled else neg_flag)
+
+
+def _set_flag_value(cmd: list[str], flag: str, value: str) -> None:
+    if flag in cmd:
+        idx = cmd.index(flag)
+        if idx + 1 < len(cmd):
+            cmd[idx + 1] = value
+        else:
+            cmd.append(value)
+    else:
+        cmd.extend([flag, value])
+
+
+def _remove_flag(cmd: list[str], flag: str) -> None:
+    while flag in cmd:
+        idx = cmd.index(flag)
+        del cmd[idx]
+        if idx < len(cmd) and not cmd[idx].startswith("--"):
+            del cmd[idx]
+
+
+def _compute_residuals(
+    *,
+    global_root: Path,
+    ambient_root: Path,
+    output_root: Path,
+    scene_id: str,
+    label_ids: list[str],
+    normalize: bool,
+) -> None:
+    for label_id in label_ids:
+        global_dir = global_root / scene_id / label_id
+        ambient_dir = ambient_root / scene_id / label_id
+        if not global_dir.is_dir() or not ambient_dir.is_dir():
+            continue
+        out_dir = output_root / scene_id / label_id / "__residual"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for frame_path in sorted(global_dir.glob("frame_*.png")):
+            ambient_path = ambient_dir / frame_path.name
+            if not ambient_path.is_file():
+                continue
+            g_img = imageio.imread(frame_path)
+            a_img = imageio.imread(ambient_path)
+            if g_img.shape != a_img.shape or g_img.ndim != 3:
+                continue
+            diff = np.abs(g_img.astype(np.float32) - a_img.astype(np.float32))
+            gray = diff.mean(axis=2)
+            if normalize:
+                max_val = float(gray.max())
+                if max_val > 1e-6:
+                    gray = (gray / max_val) * 255.0
+            gray = np.clip(gray, 0.0, 255.0).astype(np.uint8)
+            imageio.imwrite(out_dir / frame_path.name, gray)
+
+
 def main() -> None:
     args = _parse_args()
     if args.random is not None and args.label_ids:
@@ -606,6 +708,22 @@ def main() -> None:
                     str(args.cl_offset[2]),
                 ]
             )
+            if args.cl_light_reverse:
+                cmd.append("--cl-light-reverse")
+            else:
+                cmd.append("--no-cl-light-reverse")
+            if args.cl_light_center:
+                cmd.append("--cl-light-center")
+                cmd.extend(["--cl-light-center-z", str(args.cl_light_center_z)])
+            if args.cl_light_world is not None:
+                cmd.extend(
+                    [
+                        "--cl-light-world",
+                        str(args.cl_light_world[0]),
+                        str(args.cl_light_world[1]),
+                        str(args.cl_light_world[2]),
+                    ]
+                )
             cmd.extend(["--cl-normal-smooth", str(args.cl_normal_smooth)])
             cmd.extend(["--cl-normal-filter", args.cl_normal_filter])
             cmd.extend(["--cl-normal-kernel", str(args.cl_normal_kernel)])
@@ -658,21 +776,66 @@ def main() -> None:
         if args.extra_args:
             cmd.extend(shlex.split(args.extra_args))
 
-        print("[TEST] Running:", " ".join(shlex.quote(part) for part in cmd), flush=True)
+        if args.cl_residual_visualize:
+            if not args.cl_enable:
+                raise SystemExit("--cl-residual-visualize requires --cl-enable.")
+            cmd_global = cmd.copy()
+            _set_bool_flag(cmd_global, "--rgb-frames", True)
+            print("[TEST] Running (global):", " ".join(shlex.quote(part) for part in cmd_global), flush=True)
+            run_code, run_elapsed, run_samples = _run_render_command(cmd_global, args.interval)
+            elapsed += run_elapsed
+            samples.extend(run_samples)
+            if metrics_path.exists():
+                try:
+                    metrics_payloads.append(json.loads(metrics_path.read_text()))
+                except Exception:
+                    metrics_payloads.append({})
+            if run_code != 0:
+                return_code = run_code
+                break
 
-        run_code, run_elapsed, run_samples = _run_render_command(cmd, args.interval)
-        elapsed += run_elapsed
-        samples.extend(run_samples)
+            ambient_dir = args.output_dir / "__ambient_only"
+            cmd_ambient = cmd_global.copy()
+            _set_flag_value(cmd_ambient, "--output-dir", str(ambient_dir))
+            _set_bool_flag(cmd_ambient, "--video", False)
+            _remove_flag(cmd_ambient, "--metrics-json")
+            _set_flag_value(cmd_ambient, "--cl-strength", "0")
+            _set_flag_value(cmd_ambient, "--cl-diffuse", "0")
+            _set_flag_value(cmd_ambient, "--cl-specular", "0")
+            print("[TEST] Running (ambient-only):", " ".join(shlex.quote(part) for part in cmd_ambient), flush=True)
+            run_code, run_elapsed, run_samples = _run_render_command(cmd_ambient, args.interval)
+            elapsed += run_elapsed
+            samples.extend(run_samples)
+            if run_code != 0:
+                return_code = run_code
+                break
 
-        if metrics_path.exists():
-            try:
-                metrics_payloads.append(json.loads(metrics_path.read_text()))
-            except Exception:
-                metrics_payloads.append({})
+            residual_root = args.output_dir / "__residual"
+            _compute_residuals(
+                global_root=args.output_dir,
+                ambient_root=ambient_dir,
+                output_root=residual_root,
+                scene_id=scene_id,
+                label_ids=label_ids,
+                normalize=bool(args.cl_residual_normalize),
+            )
+            print(f"[TEST] Residuals written to {residual_root}", flush=True)
+        else:
+            print("[TEST] Running:", " ".join(shlex.quote(part) for part in cmd), flush=True)
 
-        if run_code != 0:
-            return_code = run_code
-            break
+            run_code, run_elapsed, run_samples = _run_render_command(cmd, args.interval)
+            elapsed += run_elapsed
+            samples.extend(run_samples)
+
+            if metrics_path.exists():
+                try:
+                    metrics_payloads.append(json.loads(metrics_path.read_text()))
+                except Exception:
+                    metrics_payloads.append({})
+
+            if run_code != 0:
+                return_code = run_code
+                break
 
     summary = _summarize_samples(samples)
     fps_values: list[float] = []

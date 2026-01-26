@@ -23,8 +23,8 @@ show_usage_and_exit() {
 }
 
 PIPELINE_MODE=${PIPELINE_MODE:-gpu}
-RESUME_MODE=true
-RESUME_LOG_PATH="0500_fpv_npc_250.log"
+RESUME_MODE=false
+RESUME_LOG_PATH="0500_fpv_npc_250_datadrive_moredense_40workers.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     RESUME)
@@ -121,20 +121,20 @@ fi
 CONDA_ENV=${CONDA_ENV:-cuda121}
 SCENES_DIR=${SCENES_DIR:-./data/scenes}
 TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_fpv_npc_250}
+OUTPUT_DIR=${OUTPUT_DIR:-./data/0500_fpv_npc_250}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/npc_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/fpv_npc_250_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/500_fpv_npc_250_status.json}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/0500_fpv_npc_250_datadrive_moredense_40workers_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/0500_fpv_npc_250_datadrive_moredense_40workers_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_npc_metrics}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500fpv_npc_250.json}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500_fpv_npc_250_datadrive_moredense_40workers.json}
 ERROR_LOG=${ERROR_LOG:-./0500_npc_250.log}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_npc}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-24}
+WORKERS=${WORKERS:-40}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -143,9 +143,9 @@ HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3} #1.3m
 
 # Optional NPC placement/debug. Leave values empty to skip.
 NPC_ENABLE=${NPC_ENABLE:-true}
-NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.75}
-NPC_COUNT=${NPC_COUNT:-10}
-NPC_MAX_COUNT=${NPC_MAX_COUNT:-10}
+NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.8}
+NPC_COUNT=${NPC_COUNT:-20}
+NPC_MAX_COUNT=${NPC_MAX_COUNT:-20}
 NPC_PRIORITY=${NPC_PRIORITY:-coverage}
 NPC_MAX_RANGE=${NPC_MAX_RANGE:-15}
 NPC_FREE_THRESHOLD=${NPC_FREE_THRESHOLD:-250}

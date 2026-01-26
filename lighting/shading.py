@@ -31,6 +31,7 @@ class CameraLightConfig:
     normal_sigma_range: float = 0.1
     normal_sigma_domain: float = 1.0
     base_scale: float = 1.0
+    light_reverse: bool = False
 
     def active(self) -> bool:
         return self.enabled
@@ -176,8 +177,9 @@ def _compute_shadow_factor(
     points_light = points_cam - offset[None, None, :]
     z = points_light[..., 2]
     valid = z > 0.0
-    u = fx * (points_light[..., 0] / z) + cx
-    v = cy - fy * (points_light[..., 1] / z)
+    z_safe = np.where(valid, z, 1.0)
+    u = fx * (points_light[..., 0] / z_safe) + cx
+    v = cy - fy * (points_light[..., 1] / z_safe)
     u_i = np.rint(u).astype(np.int32)
     v_i = np.rint(v).astype(np.int32)
     in_bounds = (u_i >= 0) & (u_i < w) & (v_i >= 0) & (v_i < h)
@@ -276,6 +278,8 @@ def apply_camera_light_shading(
     light_pos = offset[None, None, :]
     l_vec = light_pos - points_cam
     l_dir = _normalize_vectors(l_vec)
+    if bool(config.light_reverse):
+        l_dir = -l_dir
     v_dir = _normalize_vectors(-points_cam)
 
     diff = np.maximum(np.sum(normals * l_dir, axis=-1), 0.0)

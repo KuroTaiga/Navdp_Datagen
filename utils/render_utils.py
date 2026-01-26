@@ -141,6 +141,15 @@ def load_occupancy_metadata(dataset_dir: Path) -> dict:
     upper = occ.get("upper") or [max_x, max_y, max_z]
     lower_z = float(lower[2])
     upper_z = float(upper[2])
+    center = occ.get("center")
+    if center is not None and len(center) >= 2:
+        center_x = float(center[0])
+        center_y = float(center[1])
+        center_z = float(center[2]) if len(center) > 2 else 0.0
+    else:
+        center_x = 0.5 * (min_x + max_x)
+        center_y = 0.5 * (min_y + max_y)
+        center_z = 0.5 * (min_z + max_z)
 
     occ_png = dataset_dir / "occupancy.png"
     if not occ_png.is_file():
@@ -163,6 +172,7 @@ def load_occupancy_metadata(dataset_dir: Path) -> dict:
         "bottom": bottom,
         "lower_z": lower_z,
         "upper_z": upper_z,
+        "center": [center_x, center_y, center_z],
     }
 
 
