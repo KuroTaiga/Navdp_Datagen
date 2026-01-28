@@ -22,9 +22,9 @@ show_usage_and_exit() {
   exit 1
 }
 
-PIPELINE_MODE=${PIPELINE_MODE:-gpu}
+PIPELINE_MODE=${PIPELINE_MODE:-legacy}
 RESUME_MODE=false
-RESUME_LOG_PATH="0500_fpv_npc_250_datadrive_moredense_40workers.log"
+RESUME_LOG_PATH="CHINGMU_0800.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     RESUME)
@@ -119,22 +119,23 @@ if [ "$REMOTE_STORAGE_GUARD_ENABLED" = true ] && [ -z "$SETSID_BIN" ]; then
 fi
 
 CONDA_ENV=${CONDA_ENV:-cuda121}
-SCENES_DIR=${SCENES_DIR:-./data/scenes}
-TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data/0500_fpv_npc_250}
+SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
+TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
+OUTPUT_DIR=${OUTPUT_DIR:-./data/CHINGMU_0800}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/npc_dataset_10w}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/0500_fpv_npc_250_datadrive_moredense_40workers_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/0500_fpv_npc_250_datadrive_moredense_40workers_status.json}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/CHINGMU_0800_progress.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/CHINGMU_0800_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/fpv_npc_metrics}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500_fpv_npc_250_datadrive_moredense_40workers.json}
-ERROR_LOG=${ERROR_LOG:-./0500_npc_250.log}
-REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_npc}}
-REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_CHINGMU_0800.json}
+ERROR_LOG=${ERROR_LOG:-./CHINGMU_0800.log}
+REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/baicj-telenav}}
+REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lixinhai@root@ssh-34.default@58.59.115.26}
+: "${REMOTE_SSH_PORT:=30022}"
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-40}
+WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -142,7 +143,7 @@ FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3} #1.3m
 
 # Optional NPC placement/debug. Leave values empty to skip.
-NPC_ENABLE=${NPC_ENABLE:-true}
+NPC_ENABLE=${NPC_ENABLE:-false}
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.8}
 NPC_COUNT=${NPC_COUNT:-20}
 NPC_MAX_COUNT=${NPC_MAX_COUNT:-20}
@@ -173,11 +174,14 @@ ENABLE_RGB_FRAMES=${ENABLE_RGB_FRAMES:-false}
 ENABLE_DEPTH_OUTPUT=${ENABLE_DEPTH_OUTPUT:-false}
 ENABLE_CAMERA_METADATA=${ENABLE_CAMERA_METADATA:-true}
 ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-false}
-VERBOSE=${VERBOSE:-false}
+VERBOSE=${VERBOSE:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
 WORKER_PROGRESS=${WORKER_PROGRESS:-false}
 VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
 VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
+ANTIALIASING=${ANTIALIASING:-false}
+MAX_LABELS=${MAX_LABELS:-}
+SH_DEGREE=${SH_DEGREE:--1}
 
 GPU_ONLY_FLAG="--gpu-only"
 if [ "$PIPELINE_MODE" = "legacy" ]; then
@@ -270,6 +274,17 @@ else
 fi
 if storage_bool_true "$VERBOSE"; then
   render_extra_args+=' --verbose'
+fi
+if storage_bool_true "$ANTIALIASING"; then
+  render_extra_args+=' --antialiasing'
+else
+  render_extra_args+=' --no-antialiasing'
+fi
+if [ -n "${MAX_LABELS}" ]; then
+  render_extra_args+=" --max-labels ${MAX_LABELS}"
+fi
+if [ -n "${SH_DEGREE}" ]; then
+  render_extra_args+=" --sh-degree ${SH_DEGREE}"
 fi
 if [ "${LIGHT_MODE}" != "none" ]; then
   render_extra_args+=" --light-mode ${LIGHT_MODE}"

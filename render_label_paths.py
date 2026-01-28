@@ -2957,7 +2957,14 @@ def render_actor_camera_only_sequence(
             device,
             verbose,
         ):
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = render_or(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
         shadow_depth_inv = None
         shadow_intrinsics = None
         if cl_config is not None and cl_config.shadow_enabled:
@@ -2987,7 +2994,14 @@ def render_actor_camera_only_sequence(
                 zfar=zfar,
                 device=device,
             )
-            light_pkg = render_or(light_cam, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            light_pkg = render_or(
+                light_cam,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
             shadow_depth_inv = light_pkg.get("depth")
             if shadow_depth_inv is not None:
                 shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
@@ -3568,7 +3582,14 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}")
                 print(f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}")
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = render_or(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
             shadow_depth_inv = None
             shadow_intrinsics = None
             if cl_config is not None and cl_config.shadow_enabled:
@@ -3590,7 +3611,14 @@ def render_actor_follow_sequence(
                     zfar=zfar,
                     device=device,
                 )
-                light_pkg = render_or(light_cam, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+                light_pkg = render_or(
+                    light_cam,
+                    combined_model,
+                    pipeline,
+                    bg_color=bg_color,
+                    orthographic=False,
+                    antialiasing=pipeline.antialiasing,
+                )
                 shadow_depth_inv = light_pkg.get("depth")
                 if shadow_depth_inv is not None:
                     shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
@@ -3942,7 +3970,14 @@ def render_actor_follow_sequence(
             device=device,
         )
 
-        img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+        img_pkg = render_or(
+            camera,
+            frame_gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=False,
+            antialiasing=pipeline.antialiasing,
+        )
         shadow_depth_inv = None
         shadow_intrinsics = None
         if cl_config is not None and cl_config.shadow_enabled:
@@ -3972,7 +4007,14 @@ def render_actor_follow_sequence(
                 zfar=zfar,
                 device=device,
             )
-            light_pkg = render_or(light_cam, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+            light_pkg = render_or(
+                light_cam,
+                frame_gaussians,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
             shadow_depth_inv = light_pkg.get("depth")
             if shadow_depth_inv is not None:
                 shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
@@ -4123,6 +4165,27 @@ def find_ply_file(dataset_dir: Path) -> Path:
         if candidate.suffix == ".ply":
             return candidate
     raise FileNotFoundError(f"No .ply file found in {dataset_dir}")
+
+
+def infer_sh_degree_from_ply(ply_path: Path) -> int:
+    """Infer spherical harmonic degree from a PLY file (compressed or raw)."""
+
+    ply = PlyData.read(str(ply_path))
+    if "sh" in ply:
+        sh_names = ply["sh"].data.dtype.names or ()
+        sh_count = len(sh_names)
+        if sh_count and sh_count % 3 == 0:
+            rest_dim = sh_count // 3
+            return int(round(math.sqrt(rest_dim + 1) - 1))
+        return 0
+
+    vertex = ply["vertex"]
+    vertex_names = vertex.data.dtype.names or ()
+    rest_names = [name for name in vertex_names if name.startswith("f_rest_")]
+    if rest_names:
+        rest_dim = len(rest_names) // 3
+        return int(round(math.sqrt(rest_dim + 1) - 1))
+    return 0
 
 
 def prepare_path_data(
@@ -5164,7 +5227,14 @@ def render_path_frames(
                         device,
                         verbose,
                     ):
-                        img_pkg = render_or(camera, render_gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
+                        img_pkg = render_or(
+                            camera,
+                            render_gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=orthographic,
+                            antialiasing=pipeline.antialiasing,
+                        )
                     shadow_depth_inv = None
                     shadow_intrinsics = None
                     if not orthographic and cl_config is not None and cl_config.shadow_enabled:
@@ -5194,7 +5264,14 @@ def render_path_frames(
                             zfar=zfar,
                             device=device,
                         )
-                        light_pkg = render_or(light_cam, render_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+                        light_pkg = render_or(
+                            light_cam,
+                            render_gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=False,
+                            antialiasing=pipeline.antialiasing,
+                        )
                         shadow_depth_inv = light_pkg.get("depth")
                         if shadow_depth_inv is not None:
                             shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
@@ -5493,6 +5570,18 @@ def parse_args() -> ArgumentParser:
         type=float,
         default=0.0,
         help="Resample path points at a fixed step (meters) after stride/mirror to reduce jitter (default: 0).",
+    )
+    parser.add_argument(
+        "--sh-degree",
+        type=int,
+        default=-1,
+        help="Spherical harmonic degree cap (-1 for no limit; InteriorGS commonly used 3).",
+    )
+    parser.add_argument(
+        "--antialiasing",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable Gaussian rasterizer antialiasing (default: off).",
     )
     parser.add_argument(
         "--height-offset",
@@ -6351,7 +6440,8 @@ def main() -> None:
 
     pipeline_parser = ArgumentParser(description="Pipeline parameters placeholder")
     pipeline = PipelineParams(pipeline_parser)
-    pipeline.antialiasing = True
+    pipeline.antialiasing = bool(args.antialiasing)
+    print(f"[CONFIG] ANTIALIASING={pipeline.antialiasing}", flush=True)
     bg_color = torch.tensor([1.0, 1.0, 1.0], device=device)
     debug_enabled = bool(args.debug)
     verbose_enabled = bool(args.verbose)
@@ -6915,7 +7005,13 @@ def main() -> None:
                     )
                 print(f"[DEBUG] Loading Gaussian model from: {ply_path}", flush=True)
             print(f"  Loading point cloud: {ply_path.name}", flush=True)
-            gaussians = GaussianModel(sh_degree=3)
+            requested_sh_degree = int(args.sh_degree)
+            if requested_sh_degree < 0:
+                sh_degree = infer_sh_degree_from_ply(ply_path)
+            else:
+                sh_degree = requested_sh_degree
+            print(f"[CONFIG] SH_DEGREE={sh_degree} (requested={requested_sh_degree})", flush=True)
+            gaussians = GaussianModel(sh_degree=sh_degree)
             gaussians.load_ply(str(ply_path))
             scene_template = ply_utils.GaussianPly.read(ply_path)
             if verbose_enabled:

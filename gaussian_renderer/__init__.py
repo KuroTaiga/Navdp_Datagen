@@ -129,7 +129,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     return out
 
 
-def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, orthographic=False):
+def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False, orthographic=False, antialiasing=None):
     """
     Render the scene. 
     
@@ -151,6 +151,9 @@ def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tenso
     else:
         tanfovx, tanfovy, full_proj_transform = viewpoint_camera.get_full_proj_transform(orthographic)
 
+    if antialiasing is None:
+        antialiasing = bool(pipe.antialiasing)
+
     raster_settings = GaussianRasterizationSettings(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
@@ -164,7 +167,7 @@ def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tenso
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=False,
+        antialiasing=antialiasing,
         orthographic=orthographic
     )
 

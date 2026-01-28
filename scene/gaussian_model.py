@@ -386,21 +386,41 @@ class GaussianModel:
             w_new /= norm
             rotations = np.stack((w_new, x_new, y_new, z_new), axis=1)
 
+            sh_element = None
+            sh_names = None
+            try:
+                sh_element = plydata['sh']
+                sh_names = sh_element.data.dtype.names
+            except KeyError:
+                sh_element = None
+                sh_names = None
+
             rest_dim = (self.max_sh_degree + 1) ** 2 - 1
-            if rest_dim > 0:
-                try:
-                    sh_element = plydata['sh']
-                    sh_names = sh_element.data.dtype.names
-                    sh_array = np.column_stack([sh_element.data[name] for name in sh_names]).astype(np.float32)
-                    expected = rest_dim * 3
-                    if sh_array.shape[1] != expected:
-                        raise ValueError(f"Unexpected SH coefficient count: {sh_array.shape[1]} vs {expected}")
-                    features_extra = sh_array / 255.0 * 2.0 - 1.0
-                    features_extra = features_extra.reshape(vert_count, 3, rest_dim)
-                except KeyError:
-                    features_extra = np.zeros((vert_count, 3, rest_dim), dtype=np.float32)
+            if sh_names:
+                sh_count = len(sh_names)
+                if sh_count % 3 != 0:
+                    raise ValueError(f"Unexpected SH coefficient count: {sh_count}")
+                sh_rest_dim = sh_count // 3
+                if rest_dim == 0:
+                    sh_degree = int(round(math.sqrt(sh_rest_dim + 1) - 1))
+                    self.max_sh_degree = sh_degree
+                    rest_dim = sh_rest_dim
+                elif rest_dim != sh_rest_dim:
+                    rest_dim = min(rest_dim, sh_rest_dim)
+                    self.max_sh_degree = int(round(math.sqrt(rest_dim + 1) - 1))
+                print(f"[INFO] Compressed PLY SH degree: {self.max_sh_degree}", flush=True)
+
+            if rest_dim > 0 and sh_element is not None and sh_names:
+                sh_array = np.column_stack([sh_element.data[name] for name in sh_names]).astype(np.float32)
+                expected = rest_dim * 3
+                if sh_array.shape[1] < expected:
+                    raise ValueError(f"Unexpected SH coefficient count: {sh_array.shape[1]} vs {expected}")
+                if sh_array.shape[1] > expected:
+                    sh_array = sh_array[:, :expected]
+                features_extra = sh_array / 255.0 * 2.0 - 1.0
+                features_extra = features_extra.reshape(vert_count, 3, rest_dim)
             else:
-                features_extra = np.zeros((vert_count, 3, 0), dtype=np.float32)
+                features_extra = np.zeros((vert_count, 3, max(rest_dim, 0)), dtype=np.float32)
 
             xyz_tensor = torch.tensor(xyz, dtype=torch.float, device="cuda")
             log_scale_tensor = torch.tensor(log_scales, dtype=torch.float, device="cuda")
