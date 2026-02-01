@@ -11,10 +11,19 @@
 
 import torch
 import math
+import inspect
 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
 from scene.gaussian_model import GaussianModel
 from utils.sh_utils import eval_sh
+
+def _supports_orthographic() -> bool:
+    try:
+        params = inspect.signature(GaussianRasterizationSettings).parameters
+        return "orthographic" in params
+    except Exception:
+        return False
+
 
 def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, separate_sh = False, override_color = None, use_trained_exp=False):
     """
@@ -34,7 +43,7 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     tanfovx = math.tan(viewpoint_camera.FoVx * 0.5)
     tanfovy = math.tan(viewpoint_camera.FoVy * 0.5)
 
-    raster_settings = GaussianRasterizationSettings(
+    raster_kwargs = dict(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -47,8 +56,9 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
         campos=viewpoint_camera.camera_center,
         prefiltered=False,
         debug=pipe.debug,
-        antialiasing=pipe.antialiasing
+        antialiasing=pipe.antialiasing,
     )
+    raster_settings = GaussianRasterizationSettings(**raster_kwargs)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
@@ -154,7 +164,7 @@ def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tenso
     if antialiasing is None:
         antialiasing = bool(pipe.antialiasing)
 
-    raster_settings = GaussianRasterizationSettings(
+    raster_kwargs = dict(
         image_height=int(viewpoint_camera.image_height),
         image_width=int(viewpoint_camera.image_width),
         tanfovx=tanfovx,
@@ -168,8 +178,10 @@ def render_or(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tenso
         prefiltered=False,
         debug=pipe.debug,
         antialiasing=antialiasing,
-        orthographic=orthographic
     )
+    if _supports_orthographic():
+        raster_kwargs["orthographic"] = orthographic
+    raster_settings = GaussianRasterizationSettings(**raster_kwargs)
 
     rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 

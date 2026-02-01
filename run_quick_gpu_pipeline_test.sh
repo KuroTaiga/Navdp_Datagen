@@ -31,6 +31,8 @@ for ((i=1; i<=$#; i++)); do
   fi
 done
 
-conda run --no-capture-output -n "$CONDA_ENV" python "${SCRIPT_DIR}/scripts/quick_gpu_pipeline_test.py" "$@"
+conda run --no-capture-output -n "$CONDA_ENV" python "${SCRIPT_DIR}/scripts/quick_gpu_pipeline_test.py" \
+  --render-script "${SCRIPT_DIR}/render_label_paths_telesim.py" \
+  "$@"
 
 # Camera comparison runs inside quick_gpu_pipeline_test.py by default.

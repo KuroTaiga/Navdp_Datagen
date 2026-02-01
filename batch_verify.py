@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from arguments import PipelineParams
-from gaussian_renderer import render_or
+from gaussian_renderer import render, render_or
 from scene import GaussianModel
 from scene.cameras import MiniCam
 from utils.graphics_utils import getProjectionMatrix
@@ -41,6 +41,18 @@ VIDEO_FRAMES_DIR = BASE_DIR / "data" / "video_frames"
 DEFAULT_VIDEO_STEP_DEG = 10
 DEFAULT_VIDEO_FOV_DEG = 60.0
 VIDEO_FRAME_RESOLUTION = 100
+
+
+def _render_gaussians(camera, gaussians, pipeline, *, bg_color, orthographic=False):
+    if orthographic:
+        return render_or(
+            camera,
+            gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=True,
+        )
+    return render(camera, gaussians, pipeline, bg_color=bg_color)
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
@@ -259,7 +271,7 @@ def render_video_frames(
             full_proj_transform=full_proj_transform,
         )
 
-        img_pkg = render_or(
+        img_pkg = _render_gaussians(
             camera,
             gaussians,
             pipeline,
@@ -365,7 +377,13 @@ def render_dataset(
     gaussians.load_ply(str(ply_path))
 
     camera = build_camera(meta, device)
-    img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color, orthographic=True)
+    img_pkg = _render_gaussians(
+        camera,
+        gaussians,
+        pipeline,
+        bg_color=bg_color,
+        orthographic=True,
+    )
     rendered = img_pkg["render"].detach().cpu().numpy()
     render_uint8 = (np.clip(rendered, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
     render_uint8 = np.rot90(render_uint8, k=-1)

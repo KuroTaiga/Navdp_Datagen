@@ -23,9 +23,9 @@ show_usage_and_exit() {
 }
 
 # CLI parsing: optional RESUME enables resume mode; optional log path accepted.
-PIPELINE_MODE=${PIPELINE_MODE:-gpu}
-RESUME_MODE=true
-RESUME_LOG_PATH="0500_follow_1.log"
+PIPELINE_MODE=${PIPELINE_MODE:-legacy}
+RESUME_MODE=false
+RESUME_LOG_PATH="CHINGMU_0800_follow_1.log"
 while [ $# -gt 0 ]; do
   case "$1" in
     RESUME)
@@ -129,16 +129,16 @@ CONDA_ENV=${CONDA_ENV:-cuda121}
 # ACTOR_ROOT=${ACTOR_ROOT:-./data/SHHQ_gs/walking}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
-ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_0500_42_follow.json}
-PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_0500_42_follow.json}
-SCENES_DIR=${SCENES_DIR:-./data/scenes}
-TASKS_DIR=${TASKS_DIR:-./data/interiorGS_0500_42}
-OUTPUT_DIR=${OUTPUT_DIR:-./data1/0500_42_follow_key_1}
+ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_CHINGMU.json}
+PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_CHINGMU_key1.json}
+SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
+TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
+OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow_flaw}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w_1}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
-PROGRESS_JSON=${PROGRESS_JSON:-./analysis/random_human_progress.json}
-STATUS_JSON=${STATUS_JSON:-./analysis/random_human_status.json}
-PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/random_human_metrics}
+PROGRESS_JSON=${PROGRESS_JSON:-./analysis/CHINGMU_0800_follow_1.json}
+STATUS_JSON=${STATUS_JSON:-./analysis/CHINGMU_0800_follow_status.json}
+PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/CHINGMU_0800_follow_metrics}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_33w_1}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"

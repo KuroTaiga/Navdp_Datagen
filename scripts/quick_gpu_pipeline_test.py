@@ -502,6 +502,8 @@ def build_render_command(args: argparse.Namespace, *, output_dir: Path, metrics_
         cmd.extend(["--height-offset", str(args.height_offset)])
     if args.view_mode:
         cmd.extend(["--view-mode", args.view_mode])
+    if args.resolution:
+        cmd.extend(["--resolution", str(args.resolution[0]), str(args.resolution[1])])
     if args.video_nvenc_preset:
         cmd.extend(["--video-nvenc-preset", args.video_nvenc_preset])
     if args.video_nvenc_bitrate:
@@ -599,6 +601,14 @@ def main() -> int:
     )
     parser.add_argument("--height-offset", type=float, default=float(os.getenv("HEIGHT_OFFSET", "0.3")))
     parser.add_argument("--view-mode", default=os.getenv("VIEW_MODE", "forward"))
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=None,
+        help="Render resolution forwarded to render_label_paths.py (example: 1920 1080).",
+    )
     parser.add_argument("--video-nvenc-preset", default=os.getenv("VIDEO_NVENC_PRESET"))
     parser.add_argument("--video-nvenc-bitrate", default=os.getenv("VIDEO_NVENC_BITRATE"))
     parser.add_argument(

@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from arguments import PipelineParams
-from gaussian_renderer import render_or
+from gaussian_renderer import render
 from scene import GaussianModel
 
 from utils.render_utils import build_perspective_camera, load_raster_world_points_only
@@ -80,7 +80,7 @@ def render_path_first_frame(
     )
 
     with torch.no_grad():
-        img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color)
+        img_pkg = render(camera, gaussians, pipeline, bg_color=bg_color)
         render = img_pkg["render"].detach().cpu().numpy()
         render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
         render_uint8 = np.rot90(render_uint8, k=2)

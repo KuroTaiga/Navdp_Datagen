@@ -24,6 +24,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+LOG_FILE=${LOG_FILE:-transfer.log}
+LOG_DIR=${LOG_DIR:-.}
+if [[ -t 1 ]]; then
+  exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+echo "[BOOT ] $(date "+%F %T")  starting prepare_data_transfer.sh"
+
 mkdir -p "$DEST" "$DEST/data1" "$DEST/data2" "$DEST/waymo"
 
 items=()
@@ -55,16 +63,7 @@ add_dataset() {
   local base
   base=$(basename "$root")
   local sub="$subroot/$base"
-  local found=0
-  for d in "$root"/*; do
-    if [[ -d "$d" ]]; then
-      add_item "$d" "$sub"
-      found=1
-    fi
-  done
-  if (( found == 0 )); then
-    add_item "$root" "$sub"
-  fi
+  add_item "$root" "$sub"
 }
 
 # data2 (completed ones commented out)
@@ -77,8 +76,18 @@ add_dataset() {
 
 # data1
 add_dataset "$BASE/data1/0500_42_follow_key_1" "data1"
-add_dataset "$BASE/data1/33w_key2" "data1"
-add_dataset "$BASE/data1/0500_fpv_npc_dense" "data1"
+# add_dataset "$BASE/data1/33w_key2" "data1"
+# add_dataset "$BASE/data1/0500_fpv_npc_dense" "data1"
+
+# data2 TOD (hues) datasets
+add_dataset "$BASE/data2/0500_fpv_afternoon" "data2"
+add_dataset "$BASE/data2/0500_fpv_blue_hour" "data2"
+add_dataset "$BASE/data2/0500_fpv_dawn" "data2"
+add_dataset "$BASE/data2/0500_fpv_dusk" "data2"
+add_dataset "$BASE/data2/0500_fpv_golden_hour" "data2"
+# add_dataset "$BASE/data2/0500_fpv_morning" "data2"
+# add_dataset "$BASE/data2/0500_fpv_night" "data2"
+# add_dataset "$BASE/data2/0500_fpv_noon" "data2"
 
 # waymo (dereference links)
 add_item "$WAYMO_SRC" "waymo"
@@ -97,9 +106,7 @@ dataset_key() {
     echo "waymo"
     return
   fi
-  local a b
-  IFS=/ read -r a b _ <<< "$label"
-  echo "$a/$b"
+  echo "$label"
 }
 
 declare -A dataset_total
@@ -117,12 +124,7 @@ if command -v stdbuf >/dev/null 2>&1; then
 fi
 
 # rsync options: -L deref symlinks; avoid chown/perms on exFAT
-RSYNC_OPTS=(-rLpt --numeric-ids --no-owner --no-group --no-perms --no-acls --no-xattrs --no-specials --no-devices --modify-window=2)
-if (( WORKERS > 1 )); then
-  RSYNC_OPTS+=(--info=stats2,flist0)
-else
-  RSYNC_OPTS+=(--info=progress2)
-fi
+RSYNC_OPTS=(-rpt --ignore-existing --numeric-ids --no-owner --no-group --no-perms --no-acls --no-xattrs --no-specials --no-devices --info=progress2 --info=stats2,flist0)
 
 # write per-dataset worklists (1 worker per dataset)
 declare -A DATASET_LIST
@@ -142,23 +144,32 @@ run_queue() {
   local list_file="$1"
   local workers="$2"
   local name="${3:-queue}"
+  local per_log="$LOG_DIR/transfer_${name//\//_}.log"
   if [[ ! -s "$list_file" ]]; then
     return 0
   fi
-  echo "[QUEUE] $(date "+%F %T")  ${name} (workers=${workers})"
-  xargs -P "$workers" -I{} "${STDBUF_CMD[@]}" bash -c '
-    IFS="|" read -r src sub <<< "{}"
-    base=$(basename "$src")
-    if [[ "$sub" == "waymo" ]]; then
-      label="waymo"
-    else
-      label="$sub/$base"
-    fi
-    echo "[START] $(date "+%F %T")  $label"
-    rsync '"${RSYNC_OPTS[*]}"' "$src" "'"$DEST"'/$sub/"
-    echo "[DONE ] $(date "+%F %T")  $label"
-    echo "$label" >> "'"$DONE_FILE"'"
-  ' _ {} < "$list_file" &
+  {
+    echo "[QUEUE] $(date "+%F %T")  ${name} (workers=${workers})"
+    echo "[DATASET START] $(date "+%F %T")  ${name}"
+    xargs -P "$workers" -I{} "${STDBUF_CMD[@]}" bash -c '
+      IFS="|" read -r src sub <<< "{}"
+      label="$sub"
+      LOG_FILE="'"$per_log"'"
+      exec > >(tee -a "$LOG_FILE") 2>&1
+      echo "[START] $(date "+%F %T")  $label"
+      rsync_opts=( '"${RSYNC_OPTS[*]}"' )
+      if [[ "$sub" == "waymo" ]]; then
+        rsync_opts+=(-L)
+      fi
+      if [[ "'"$IMPATIENT"'" -eq 1 && "$sub" == data2/0500_fpv_* ]]; then
+        rsync_opts+=(--exclude="*.264")
+      fi
+      rsync "${rsync_opts[@]}" "$src" "'"$DEST"'/$sub/"
+      echo "[DONE ] $(date "+%F %T")  $label"
+      echo "$label" >> "'"$DONE_FILE"'"
+    ' _ {} < "$list_file"
+    echo "[DATASET DONE ] $(date "+%F %T")  ${name}"
+  } &
   echo $!
 }
 
@@ -233,66 +244,5 @@ if [[ -t 2 ]]; then
   printf "\n" >&2
 fi
 printf "\nCopy complete.\n"
-
-# TOD folders only after main copy finishes
-tod_copy() {
-  local name="$1"
-  local src="$BASE/data2/$name"
-  local dst="$DEST/data2/$name/"
-  if (( IMPATIENT == 1 )) || ([[ -f "$LOG" ]] && grep -iE "${name}.*(done|complete|finished)" "$LOG" >/dev/null); then
-    if [[ -d "$src" ]]; then
-      mkdir -p "$dst"
-      local found=0
-      for d in "$src"/*; do
-        if [[ -d "$d" ]]; then
-          base=$(basename "$d")
-          echo "[START] $(date "+%F %T")  data2/$name/$base"
-          if (( IMPATIENT == 1 )); then
-            tmp_excludes="/tmp/navdata_hues_excludes.$$.${name}.${base}"
-            : > "$tmp_excludes"
-            # skip all .264 in hues folders
-            echo "*.264" >> "$tmp_excludes"
-            rsync "${RSYNC_OPTS[@]}" --exclude-from="$tmp_excludes" "$d" "$dst"
-            rm -f "$tmp_excludes"
-          else
-            rsync "${RSYNC_OPTS[@]}" "$d" "$dst"
-          fi
-          echo "[DONE ] $(date "+%F %T")  data2/$name/$base"
-          found=1
-        fi
-      done
-      if (( found == 0 )); then
-        echo "[START] $(date "+%F %T")  data2/$name"
-        if (( IMPATIENT == 1 )); then
-          tmp_excludes="/tmp/navdata_hues_excludes.$$.${name}"
-          : > "$tmp_excludes"
-          echo "*.264" >> "$tmp_excludes"
-          rsync "${RSYNC_OPTS[@]}" --exclude-from="$tmp_excludes" "$src" "$dst"
-          rm -f "$tmp_excludes"
-        else
-          rsync "${RSYNC_OPTS[@]}" "$src" "$dst"
-        fi
-        echo "[DONE ] $(date "+%F %T")  data2/$name"
-      fi
-    else
-      echo "SKIP missing: $src"
-    fi
-  else
-    echo "TOD not done per log: $name"
-  fi
-}
-
-for d in \
-  0500_fpv_afternoon \
-  0500_fpv_blue_hour \
-  0500_fpv_dawn \
-  0500_fpv_dusk \
-  0500_fpv_golden_hour \
-  0500_fpv_morning \
-  0500_fpv_night \
-  0500_fpv_noon
-do
-  tod_copy "$d"
-done
 
 rm -f "${LIST_FILES[@]}" "$DONE_FILE"

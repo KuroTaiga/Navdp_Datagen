@@ -402,7 +402,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--render-script",
         type=Path,
-        default=Path(__file__).with_name("render_label_paths.py"),
+        default=Path(__file__).with_name("render_label_paths_telesim.py"), # setting this to telesim's script to fix the issue in the rendering quality
         help="Path to the render_label_paths.py script (default: alongside this file).",
     )
     parser.add_argument(

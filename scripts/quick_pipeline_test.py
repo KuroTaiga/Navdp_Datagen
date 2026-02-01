@@ -97,6 +97,14 @@ def _parse_args() -> argparse.Namespace:
         help="Extra args forwarded to render_label_paths.py (default: --gpu-only).",
     )
     parser.add_argument(
+        "--resolution",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=None,
+        help="Render resolution forwarded to render_label_paths.py (example: 1920 1080).",
+    )
+    parser.add_argument(
         "--cl-enable",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -614,7 +622,7 @@ def main() -> None:
         )
 
     repo_root = Path(__file__).resolve().parents[1]
-    render_script = repo_root / "render_label_paths.py"
+    render_script = repo_root / "render_label_paths_telesim.py"# testing telesim's pipeline results
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     total_selected = sum(len(ids) for ids in runs.values())
@@ -660,8 +668,8 @@ def main() -> None:
             "--overwrite",
             "--video",
             "--save-camera-metadata",
-            "--ply-transform-backend",
-            args.ply_transform_backend,
+            # "--ply-transform-backend",# not for telesim backend yet
+            # args.ply_transform_backend,
             "--video-backend",
             args.video_backend,
             "--metrics-json",
@@ -679,6 +687,8 @@ def main() -> None:
             cmd.extend(["--video-nvenc-bitrate", args.video_nvenc_bitrate])
         if not args.enable_depth:
             cmd.append("--no-save-depth-maps")
+        if args.resolution:
+            cmd.extend(["--resolution", str(args.resolution[0]), str(args.resolution[1])])
         for label_id in label_ids:
             cmd.extend(["--label-id", label_id])
         if args.cl_enable:
