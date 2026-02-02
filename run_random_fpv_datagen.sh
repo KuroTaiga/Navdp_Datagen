@@ -135,7 +135,7 @@ REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lixinhai@root@ssh-34.default@58.59.115.26
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
-WORKERS=${WORKERS:-12}
+WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
@@ -161,8 +161,6 @@ NPC_FRAME_POOL_SIZE=${NPC_FRAME_POOL_SIZE:-30} # pool size 30 is a good middle g
 NPC_PLACEMENT_BACKEND=${NPC_PLACEMENT_BACKEND:-}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/SHHQ_gs/walking}
 
-RESERVE_VRAM_GB=${RESERVE_VRAM_GB:-0}
-RESERVE_VRAM_HEADROOM_GB=${RESERVE_VRAM_HEADROOM_GB:-1}
 RETRY_CUDA_OOM=${RETRY_CUDA_OOM:-true}
 CUDA_OOM_RETRY_DELAY=${CUDA_OOM_RETRY_DELAY:-10}
 CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:--1}
@@ -367,14 +365,6 @@ if storage_bool_true "$NPC_ENABLE"; then
   render_extra_snippets+=("${npc_args[*]}")
 fi
 
-if ! [[ "$RESERVE_VRAM_GB" =~ ^[0-9]+$ ]]; then
-  echo "[VRAM] ERROR: RESERVE_VRAM_GB must be an integer value (received '$RESERVE_VRAM_GB')." >&2
-  exit 1
-fi
-if ! [[ "$RESERVE_VRAM_HEADROOM_GB" =~ ^[0-9]+$ ]]; then
-  echo "[VRAM] ERROR: RESERVE_VRAM_HEADROOM_GB must be an integer value (received '$RESERVE_VRAM_HEADROOM_GB')." >&2
-  exit 1
-fi
 if ! [[ "$REMOTE_STORAGE_LIMIT_GB" =~ ^[0-9]+$ ]]; then
   echo "[STORAGE] ERROR: REMOTE_STORAGE_LIMIT_GB must be an integer value (received '$REMOTE_STORAGE_LIMIT_GB')." >&2
   exit 1
@@ -392,116 +382,11 @@ if ! [[ "$REMOTE_STORAGE_GUARD_INTERVAL_SECS" =~ ^[0-9]+$ ]]; then
   exit 1
 fi
 
-VRAM_RESERVATION_PID=""
-reserve_vram() {
-  local reserve_gb="$1"
-  if [ -z "$reserve_gb" ]; then
-    return
-  fi
-  local bytes=$((reserve_gb * 1024 * 1024 * 1024))
-  if [ "$bytes" -le 0 ]; then
-    return
-  fi
-  local headroom_bytes=$((RESERVE_VRAM_HEADROOM_GB * 1024 * 1024 * 1024))
-  echo "[VRAM] Guarding ${reserve_gb} GiB (headroom ${RESERVE_VRAM_HEADROOM_GB} GiB) to discourage other jobs."
-  RESERVE_VRAM_TARGET_BYTES="$bytes" \
-  RESERVE_VRAM_HEADROOM_BYTES="$headroom_bytes" \
-    conda run --no-capture-output -n "$CONDA_ENV" python - <<'PY' &
-import os
-import sys
-import time
-
-try:
-    import torch
-except Exception as exc:  # pylint: disable=broad-except
-    print(f"[VRAM] ERROR: Unable to import torch: {exc}", file=sys.stderr, flush=True)
-    sys.exit(1)
-
-target_bytes = int(os.environ.get("RESERVE_VRAM_TARGET_BYTES", "0"))
-headroom_bytes = int(os.environ.get("RESERVE_VRAM_HEADROOM_BYTES", str(512 * 1024 * 1024)))
-if target_bytes <= 0:
-    sys.exit(0)
-device = torch.device("cuda:0")
-torch.cuda.set_device(device)
-dev_index = torch.cuda.current_device()
-dev_name = torch.cuda.get_device_name(dev_index)
-
-CHUNK_BYTES = 256 * 1024 * 1024
-tensors = []
-
-def reserved_bytes() -> int:
-    return sum(t.element_size() * t.numel() for t in tensors)
-
-def grow(target_delta: int) -> None:
-    remaining = target_delta
-    while remaining > 0:
-        chunk = min(remaining, CHUNK_BYTES)
-        if chunk >= 4:
-            tensors.append(torch.empty((chunk // 4,), dtype=torch.float32, device=device))
-            chunk = (chunk // 4) * 4
-        else:
-            tensors.append(torch.empty((chunk,), dtype=torch.uint8, device=device))
-        remaining -= chunk
-
-def shrink(target_delta: int) -> None:
-    remaining = target_delta
-    while tensors and remaining > 0:
-        tensor = tensors.pop()
-        size = tensor.element_size() * tensor.numel()
-        remaining -= size
-        del tensor
-    torch.cuda.empty_cache()
-
-def refresh_reservation() -> None:
-    free_bytes, total_bytes = torch.cuda.mem_get_info()
-    max_hold = max(0, free_bytes - headroom_bytes)
-    desired = min(target_bytes, max_hold)
-    current = reserved_bytes()
-    delta = desired - current
-    if abs(delta) < (32 * 1024 * 1024):
-        return
-    if delta > 0:
-        grow(delta)
-    else:
-        shrink(-delta)
-    new_total = reserved_bytes()
-    print(
-        f"[VRAM] Adjusted guard tensors to {new_total / (1024 ** 3):.2f} GiB (free {free_bytes / (1024 ** 3):.2f} / total {total_bytes / (1024 ** 3):.2f} GiB).",
-        flush=True,
-    )
-
-print(
-    f"[VRAM] Dynamic guard active on cuda:{dev_index} ({dev_name}), target {target_bytes / (1024 ** 3):.2f} GiB, headroom {headroom_bytes / (1024 ** 3):.2f} GiB.",
-    flush=True,
-)
-try:
-    while True:
-        refresh_reservation()
-        time.sleep(5)
-except KeyboardInterrupt:
-    pass
-PY
-  VRAM_RESERVATION_PID=$!
-  sleep 1
-  if ! kill -0 "$VRAM_RESERVATION_PID" >/dev/null 2>&1; then
-    echo "[VRAM] ERROR: Failed to start reservation helper." >&2
-    exit 1
-  fi
-}
-
-release_vram() {
-  if [ -n "$VRAM_RESERVATION_PID" ]; then
-    kill "$VRAM_RESERVATION_PID" >/dev/null 2>&1 || true
-    wait "$VRAM_RESERVATION_PID" >/dev/null 2>&1 || true
-    echo "[VRAM] Released reserved GPU memory."
-    VRAM_RESERVATION_PID=""
-  fi
-}
-
 REMOTE_SYNC_WORKER_PID=""
 REMOTE_SYNC_DONE_FILE=""
 REMOTE_STORAGE_UNAVAILABLE=false
 PARALLEL_PID=""
+PARALLEL_GROUP_ID=""
 STOP_REQUESTED=false
 
 handle_remote_storage_unavailable() {
@@ -510,8 +395,10 @@ handle_remote_storage_unavailable() {
   fi
   REMOTE_STORAGE_UNAVAILABLE=true
   echo "[STORAGE] Remote destination unavailable; pausing generation to avoid data loss." >&2
-  if [ -n "$PARALLEL_PID" ]; then
-    kill "$PARALLEL_PID" >/dev/null 2>&1 || true
+  if [ -n "$PARALLEL_GROUP_ID" ]; then
+    kill -TERM -- "-$PARALLEL_GROUP_ID" >/dev/null 2>&1 || true
+  elif [ -n "$PARALLEL_PID" ]; then
+    kill -TERM "$PARALLEL_PID" >/dev/null 2>&1 || true
   fi
 }
 
@@ -657,7 +544,6 @@ stop_storage_guard() {
 }
 
 cleanup_run() {
-  release_vram
   wait_remote_sync_worker
   stop_storage_guard
 }
@@ -672,8 +558,16 @@ handle_interrupt() {
   STOP_REQUESTED=true
   echo "[RUN] Interrupt received; stopping workers..." >&2
   trap - EXIT
+  if [ -n "$PARALLEL_GROUP_ID" ]; then
+    kill -INT -- "-$PARALLEL_GROUP_ID" >/dev/null 2>&1 || true
+    sleep 1
+    kill -TERM -- "-$PARALLEL_GROUP_ID" >/dev/null 2>&1 || true
+  elif [ -n "$PARALLEL_PID" ]; then
+    kill -INT "$PARALLEL_PID" >/dev/null 2>&1 || true
+    sleep 1
+    kill -TERM "$PARALLEL_PID" >/dev/null 2>&1 || true
+  fi
   if [ -n "$PARALLEL_PID" ]; then
-    kill -SIGINT "$PARALLEL_PID" >/dev/null 2>&1 || true
     wait "$PARALLEL_PID" >/dev/null 2>&1 || true
     PARALLEL_PID=""
   fi
@@ -752,47 +646,41 @@ echo "[CONFIG] ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE}"
 echo "[CONFIG] ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE}"
 echo "[CONFIG] ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE}"
 
-if [ "$RESERVE_VRAM_GB" -gt 0 ]; then
-  reserve_vram "$RESERVE_VRAM_GB"
-fi
 
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   render_extra_snippets+=("--offload-nas-dir ${OFFLOAD_NAS_DIR} --offload-min-free-gb ${OFFLOAD_MIN_FREE_GB}")
 fi
 
 parallel_cmd=(
-  conda run --no-capture-output -n "$CONDA_ENV" python parallel_render_paths.py
-  --fpv-only
-  --fpv-follow-distance "${FPV_FOLLOW_DISTANCE}"
+  conda run --no-capture-output -n "$CONDA_ENV" python parallel_render_paths_telesim.py
   --scenes-dir "${SCENES_DIR}"
   --tasks-dir "${TASKS_DIR}"
   --workers "${WORKERS}"
-  --minimal-frames "${MINIMAL_FRAMES}"
   --output-dir "${OUTPUT_DIR}"
-  --error-log "${ERROR_LOG}"
-  --progress-json "${PROGRESS_JSON}"
-  --status-json "${STATUS_JSON}"
-  --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
-  --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
-  --cuda-oom-max-retries "${CUDA_OOM_MAX_RETRIES}"
 )
+#  --fpv-only   --fpv-follow-distance "${FPV_FOLLOW_DISTANCE}"   --minimal-frames "${MINIMAL_FRAMES}"
+# --progress-json "${PROGRESS_JSON}"
+# --status-json "${STATUS_JSON}"
+# --error-log "${ERROR_LOG}"   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
+# --cuda-oom-retry-delay "${CUDA_OOM_RETRY_DELAY}"
+# --cuda-oom-max-retries "${CUDA_OOM_MAX_RETRIES}"
 if storage_bool_true "$WORKER_PROGRESS"; then
   parallel_cmd+=(--worker-progress)
 fi
-if storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
-  parallel_cmd+=(--exclude-detailed-labels)
-else
-  parallel_cmd+=(--no-exclude-detailed-labels)
-fi
-if $RESUME_MODE && [ -n "$RESUME_LOG_PATH" ]; then
-  parallel_cmd+=(--skip-completed-log "$RESUME_LOG_PATH")
-fi
-if storage_bool_true "$RETRY_CUDA_OOM"; then
-  parallel_cmd+=(--retry-cuda-oom)
-else
-  parallel_cmd+=(--no-retry-cuda-oom)
-fi
+# if storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
+#   parallel_cmd+=(--exclude-detailed-labels)
+# else
+#   parallel_cmd+=(--no-exclude-detailed-labels)
+# fi
+# if $RESUME_MODE && [ -n "$RESUME_LOG_PATH" ]; then
+#   parallel_cmd+=(--skip-completed-log "$RESUME_LOG_PATH")
+# fi
+# if storage_bool_true "$RETRY_CUDA_OOM"; then
+#   parallel_cmd+=(--retry-cuda-oom)
+# else
+#   parallel_cmd+=(--no-retry-cuda-oom)
+# fi
 for snippet in "${render_extra_snippets[@]}"; do
   parallel_cmd+=(--render-extra-args "$snippet")
 done
@@ -813,8 +701,8 @@ else
   "${parallel_cmd[@]}" &
 fi
 PARALLEL_PID=$!
+PARALLEL_GROUP_ID="$PARALLEL_PID"
 if [ "$REMOTE_STORAGE_GUARD_ENABLED" = true ]; then
-  PARALLEL_GROUP_ID="$PARALLEL_PID"
   if ! start_storage_guard "$OUTPUT_DIR" "$PARALLEL_GROUP_ID" "$REMOTE_STORAGE_LIMIT_GB" "$REMOTE_STORAGE_RESUME_GB" "$REMOTE_STORAGE_GUARD_INTERVAL_SECS"; then
     echo "[STORAGE] WARN: Failed to start storage guard; continuing without throttling." >&2
     REMOTE_STORAGE_GUARD_ENABLED=false

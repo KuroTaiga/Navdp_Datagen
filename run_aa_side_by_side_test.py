@@ -35,7 +35,6 @@ def _run_render(
     scenes_dir: Path,
     tasks_dir: Path,
     output_dir: Path,
-    error_log: Path,
     max_labels: int,
     width: int,
     height: int,
@@ -45,7 +44,7 @@ def _run_render(
 ) -> None:
     cmd = [
         python_bin,
-        str(script_dir / "render_label_paths.py"),
+        str(script_dir / "render_label_paths_telesim.py"),
         "--scene",
         scene_id,
         "--scenes-dir",
@@ -54,8 +53,6 @@ def _run_render(
         str(tasks_dir),
         "--output-dir",
         str(output_dir),
-        "--error-log",
-        str(error_log),
         "--max-labels",
         str(max_labels),
         "--video",
@@ -93,9 +90,6 @@ def main() -> int:
     aa_on_dir = output_root / "aa_on"
     aa_off_dir = output_root / "aa_off"
     compare_out = output_root / "aa_side_by_side.mp4"
-    error_log_on = output_root / "aa_on_error.log"
-    error_log_off = output_root / "aa_off_error.log"
-
     ffmpeg_bin = _resolve_ffmpeg_bin()
     if not ffmpeg_bin:
         print("[ERROR] ffmpeg is required for side-by-side comparison but was not found in PATH.", file=sys.stderr)
@@ -117,7 +111,6 @@ def main() -> int:
         scenes_dir,
         tasks_dir,
         aa_on_dir,
-        error_log_on,
         max_labels,
         width,
         height,
@@ -132,7 +125,6 @@ def main() -> int:
         scenes_dir,
         tasks_dir,
         aa_off_dir,
-        error_log_off,
         max_labels,
         width,
         height,

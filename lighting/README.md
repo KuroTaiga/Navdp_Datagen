@@ -132,6 +132,19 @@ Outputs are written to folders named like `./data2/0500_fpv_dawn`. Use `--preset
 custom tone settings.
 Built-in presets: `dawn`, `morning`, `noon`, `afternoon`, `golden_hour`, `dusk`, `blue_hour`, `night`.
 
+## CHINGMU_0800 HDD Helpers
+
+For HDD-backed navdata (symlinked at `./navdata`), use the helper scripts below. They reuse a
+cached MP4 list and default to low worker counts for HDD-friendly IO.
+
+```bash
+bash lighting/run_chingmu_0800_hdd_time_of_day.sh
+bash lighting/run_chingmu_0800_hdd_luma.sh
+```
+
+Override paths and settings via env vars such as `INPUT_DIR`, `OUTPUT_ROOT`, `WORKERS`,
+`SUFFIX_MODE`, and `BASE_LUMA`.
+
 ## Time-of-Day Method Comparison (Render vs MP4)
 
 Compare golden/blue hour lighting between render-time filtering and MP4 post-processing:

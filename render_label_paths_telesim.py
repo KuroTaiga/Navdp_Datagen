@@ -21,6 +21,7 @@ from typing import Iterable, Sequence
 
 import imageio.v2 as imageio
 import numpy as np
+import torch
 
 _script_path = Path(__file__).absolute()
 REPO_ROOT = _script_path.parent
@@ -29,6 +30,9 @@ if str(REPO_ROOT) not in sys.path:
 TELESIM_ROOT = REPO_ROOT / "TeleSim3D"
 if str(TELESIM_ROOT) not in sys.path:
     sys.path.insert(0, str(TELESIM_ROOT))
+TELESIM_GAUSSIAN_ROOT = TELESIM_ROOT / "gaussian-splatting"
+if TELESIM_GAUSSIAN_ROOT.exists():
+    sys.path.insert(0, str(TELESIM_GAUSSIAN_ROOT))
 
 from utils.render_utils import (  # type: ignore
     build_look_at,
@@ -38,10 +42,25 @@ from utils.render_utils import (  # type: ignore
     load_raster_world_points,
     sample_points,
 )
+from utils.ply_transform_utils import apply_transform_to_frame, build_transform_matrix, rotation_matrix_z_np
+from lighting.lighting_utils import LightFilterConfig, apply_light_filter, stable_hash_seed
+from lighting.shading import CameraLightConfig, apply_camera_light_shading, intrinsics_from_camera
 from tele_sim.core.viewer import Pose
 from tele_sim.rendering import GaussianRendererBackend, GaussianRendererConfig
 from tele_sim.rendering.gaussian_transform import GaussianPly, _matrix_to_quat_wxyz  # type: ignore
 from tele_sim.scene.assets import SceneAsset
+from gaussian_renderer import render as render_gaussians  # type: ignore
+from utils.telesim_actor_utils import (  # type: ignore
+    ActorOptions,
+    ActorRuntime,
+    CombinedGaussianModel,
+    DEFAULT_ACTOR_PATTERN,
+    DEFAULT_ACTOR_SPEED,
+    DEFAULT_VIDEO_FPS,
+    build_path_metadata,
+    load_actor_sequence,
+    actor_data_to_tensors,
+)
 
 LOGGER = logging.getLogger("render_label_paths_telesim")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -49,7 +68,92 @@ logging.basicConfig(level=logging.INFO, format="%(message)s")
 STABILIZE_WINDOW = 5
 FORWARD_SMOOTH_BLEND = 0.35
 EPS = 1e-6
-DEFAULT_VIDEO_FPS = 10
+STATUS_NOT_RUN = 0
+STATUS_DONE = 1
+STATUS_RETRY = 2
+STATUS_SKIP = 3
+
+
+def _is_cuda_oom_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "cuda out of memory" in message
+        or "cublas_status_alloc_failed" in message
+        or "cudnn_status_alloc_failed" in message
+        or "out of memory" in message
+    )
+
+
+def _apply_light_filter_if_enabled(
+    render: np.ndarray,
+    light_config: LightFilterConfig | None,
+    *,
+    frame_index: int,
+    seed_offset: int,
+) -> np.ndarray:
+    if light_config is None or not light_config.enabled():
+        return render
+    return apply_light_filter(
+        render,
+        light_config,
+        frame_index=frame_index,
+        seed_offset=seed_offset,
+    )
+
+
+def _apply_camera_light_if_enabled(
+    render: np.ndarray,
+    depth_inv: np.ndarray | None,
+    camera,
+    cl_config: CameraLightConfig | None,
+    *,
+    cl_light_world: np.ndarray | None,
+) -> np.ndarray:
+    if cl_config is None or not cl_config.active():
+        return render
+    if depth_inv is None:
+        return render
+    fx, fy, cx, cy = intrinsics_from_camera(camera)
+    frame_config = cl_config
+    if cl_light_world is not None:
+        cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+        world_to_cam_rot = cam_to_world[:3, :3].T
+        cam_center = camera.camera_center.detach().cpu().numpy()
+        offset_cam = world_to_cam_rot @ (cl_light_world - cam_center)
+        frame_config = CameraLightConfig(
+            enabled=cl_config.enabled,
+            strength=cl_config.strength,
+            color=cl_config.color,
+            ambient=cl_config.ambient,
+            diffuse=cl_config.diffuse,
+            specular=cl_config.specular,
+            shininess=cl_config.shininess,
+            range_m=cl_config.range_m,
+            offset_cam=(float(offset_cam[0]), float(offset_cam[1]), float(offset_cam[2])),
+            normal_smooth=cl_config.normal_smooth,
+            shadow_enabled=cl_config.shadow_enabled,
+            shadow_bias=cl_config.shadow_bias,
+            shadow_strength=cl_config.shadow_strength,
+            shadow_pcf_radius=cl_config.shadow_pcf_radius,
+            light_mode=cl_config.light_mode,
+            shading_model=cl_config.shading_model,
+            shadow_compare=cl_config.shadow_compare,
+            normal_filter=cl_config.normal_filter,
+            normal_kernel=cl_config.normal_kernel,
+            normal_sigma_range=cl_config.normal_sigma_range,
+            normal_sigma_domain=cl_config.normal_sigma_domain,
+            base_scale=cl_config.base_scale,
+            light_reverse=cl_config.light_reverse,
+        )
+    return apply_camera_light_shading(
+        render,
+        depth_inv,
+        config=frame_config,
+        camera_fx=fx,
+        camera_fy=fy,
+        camera_cx=cx,
+        camera_cy=cy,
+    )
 
 
 class PathSampler:
@@ -329,6 +433,42 @@ def collect_labels(
     return candidates
 
 
+def _parse_resume_log(log_path: Path) -> dict[str, set[str]]:
+    """Parse a render log to detect completed labels per scene."""
+    completed: dict[str, set[str]] = {}
+    current_scene: str | None = None
+    try:
+        for line in log_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "Rendering" in line and "scene" in line:
+                parts = line.strip().split()
+                if parts and parts[-1]:
+                    current_scene = parts[-1]
+                    completed.setdefault(current_scene, set())
+                continue
+            if line.strip().startswith("->") or line.strip().startswith("->"):
+                label = line.strip().replace("->", "").strip()
+                if current_scene and label:
+                    completed.setdefault(current_scene, set()).add(label)
+                continue
+            if line.strip().startswith("->") or line.strip().startswith("  ->"):
+                label = line.strip().replace("->", "").strip()
+                if current_scene and label:
+                    completed.setdefault(current_scene, set()).add(label)
+    except Exception:
+        return completed
+    return completed
+
+
+def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str) -> bool:
+    video_path = output_dir / scene_id / f"{label_id}.mp4"
+    if video_path.is_file():
+        return True
+    frames_dir = output_dir / scene_id / label_id
+    if frames_dir.is_dir() and any(frames_dir.glob("frame_*")):
+        return True
+    return False
+
+
 def build_camera_poses(
     path_xy: Sequence[np.ndarray],
     *,
@@ -377,6 +517,124 @@ def build_camera_poses(
         pose = Pose(position=tuple(cam_pos.astype(float)), orientation=tuple(quat.astype(float)))
         poses.append((pose, cam_pos))
     return poses
+
+
+def build_actor_follow_plans(
+    path_xy: Sequence[np.ndarray],
+    *,
+    floor_z: float,
+    ceiling: float,
+    follow_distance: float,
+    height_offset: float,
+    look_ahead: float,
+    look_down: float,
+    stabilize: bool,
+    actor_runtime: ActorRuntime,
+) -> tuple[list[tuple[Pose, np.ndarray]], list[np.ndarray], list[int]]:
+    sampler = PathSampler([pt[:2] for pt in path_xy])
+    distances = list(sampler.cumulative)
+    total_length = sampler.total_length
+
+    follow_distance_m = max(float(actor_runtime.options.follow_distance), 0.0)
+    max_camera_distance = max(total_length - follow_distance_m, 0.0)
+    actor_ground_z = float(floor_z + actor_runtime.options.foot_offset)
+
+    cycle_mod = max(1, int(getattr(actor_runtime.options, "animation_cycle_mod", 1)))
+    anim_step = (actor_runtime.options.fps / float(DEFAULT_VIDEO_FPS)) * cycle_mod
+    anim_cursor = 0.0
+    num_actor_frames = len(actor_runtime.sequence.frames)
+
+    camera_positions: list[np.ndarray] = []
+    actor_plans: list[np.ndarray] = []
+    actor_indices: list[int] = []
+    cached_direction = np.array([0.0, 1.0], dtype=np.float32)
+    prev_actor_dir: np.ndarray | None = None
+
+    for dist in distances:
+        camera_distance = min(dist, max_camera_distance)
+        actor_distance = min(camera_distance + follow_distance_m, total_length)
+
+        direction_xy = sampler.direction_at(actor_distance)
+        if np.linalg.norm(direction_xy) < 1e-6:
+            direction_xy = cached_direction
+        actor_dir = direction_xy.copy()
+        if stabilize and prev_actor_dir is not None:
+            blended_actor = prev_actor_dir * (1.0 - FORWARD_SMOOTH_BLEND) + actor_dir * FORWARD_SMOOTH_BLEND
+            norm_actor = np.linalg.norm(blended_actor)
+            if norm_actor > EPS:
+                actor_dir = blended_actor / norm_actor
+        if np.linalg.norm(direction_xy) >= 1e-6:
+            cached_direction = actor_dir
+        prev_actor_dir = actor_dir
+
+        theta = math.atan2(actor_dir[0], actor_dir[1]) + math.pi
+        rotation_np = rotation_matrix_z_np(theta)
+
+        actor_pos_xy = sampler.position_at(actor_distance)
+        translation_vec = np.array([actor_pos_xy[0], actor_pos_xy[1], actor_ground_z], dtype=np.float64)
+        transform = build_transform_matrix(rotation_np, translation_vec)
+
+        if actor_runtime.options.loop:
+            anim_idx = int(anim_cursor) % num_actor_frames
+        else:
+            anim_idx = min(int(anim_cursor), num_actor_frames - 1)
+        anim_cursor += anim_step
+
+        actor_plans.append(transform)
+        actor_indices.append(anim_idx)
+
+        cam_xy = sampler.position_at(camera_distance)
+        camera_positions.append(np.array([cam_xy[0], cam_xy[1], ceiling + height_offset], dtype=np.float32))
+        if camera_distance >= max_camera_distance - 1e-6:
+            break
+
+    poses: list[tuple[Pose, np.ndarray]] = []
+    direction_window = STABILIZE_WINDOW if stabilize else 1
+    prev_forward: np.ndarray | None = None
+    for idx, cam_pos in enumerate(camera_positions):
+        fwd = forward_direction(camera_positions, idx, window=direction_window)
+        if np.linalg.norm(fwd[:2]) < EPS:
+            fwd = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        if stabilize and prev_forward is not None:
+            blended = prev_forward * (1.0 - FORWARD_SMOOTH_BLEND) + fwd * FORWARD_SMOOTH_BLEND
+            bnorm = float(np.linalg.norm(blended))
+            if bnorm > EPS:
+                fwd = (blended / bnorm).astype(np.float32)
+        prev_forward = fwd.copy()
+        target_xy = cam_pos[:2] + fwd[:2] * look_ahead
+        target_z = max(cam_pos[2] - abs(look_down), floor_z + 0.05)
+        target = np.array([target_xy[0], target_xy[1], target_z], dtype=np.float32)
+        view = build_look_at(cam_pos, target, np.array([0.0, 0.0, 1.0], dtype=np.float32))
+        rot_world = view[:3, :3].T.astype(np.float32)
+        quat = _matrix_to_quat_wxyz(rot_world[None, ...])[0]
+        pose = Pose(position=tuple(cam_pos.astype(float)), orientation=tuple(quat.astype(float)))
+        poses.append((pose, cam_pos))
+
+    return poses, actor_plans, actor_indices
+
+
+def _render_custom_gaussians(
+    renderer: GaussianRendererBackend,
+    pose: Pose,
+    gaussians,
+) -> tuple[np.ndarray, np.ndarray | None, object]:
+    camera = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+    with torch.no_grad():
+        result = render_gaussians(
+            camera,
+            gaussians,
+            renderer._pipe,  # pylint: disable=protected-access
+            renderer._background,  # pylint: disable=protected-access
+            scaling_modifier=renderer._scaling_modifier,  # pylint: disable=protected-access
+            separate_sh=renderer._separate_sh,  # pylint: disable=protected-access
+            use_trained_exp=renderer._use_trained_exposure,  # pylint: disable=protected-access
+        )
+    image = result["render"].permute(1, 2, 0).detach().cpu().numpy()
+    image = np.clip(image, 0.0, 1.0)
+    depth_inv = None
+    if result.get("depth") is not None:
+        depth_inv = result["depth"].detach().cpu().numpy()
+    return (image * 255.0).astype(np.uint8), depth_inv, camera
 
 
 def _serialize_camera(
@@ -431,6 +689,39 @@ def _write_camera_metadata(
 ) -> None:
     cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
     cam_json_path.write_text(json.dumps(payload, indent=2))
+
+
+def _quantize_depth(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
+    if bit_depth <= 0:
+        raise ValueError("bit_depth must be positive.")
+    depth = depth_m.astype(np.float32, copy=False)
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    max_val = float(depth.max()) if depth.size else 0.0
+    if max_val <= 1e-6:
+        max_val = 1.0
+    depth_norm = np.clip(depth / max_val, 0.0, 1.0)
+    scale = (1 << bit_depth) - 1
+    return (depth_norm * scale + 0.5).astype(np.uint16 if bit_depth > 8 else np.uint8)
+
+
+def _save_depth_map(
+    *,
+    depth_inv: np.ndarray,
+    frames_dir: Path,
+    frame_prefix: str,
+    frame_idx: int,
+    rotate_180: bool,
+    bit_depth: int = 16,
+) -> None:
+    if depth_inv.ndim > 2:
+        depth_inv = np.squeeze(depth_inv)
+    with np.errstate(divide="ignore"):
+        depth_m = np.where(depth_inv > 0.0, 1.0 / depth_inv, 0.0)
+    if rotate_180:
+        depth_m = np.flipud(np.fliplr(depth_m))
+    depth_quant = _quantize_depth(depth_m, bit_depth=bit_depth)
+    depth_png_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.png"
+    imageio.imwrite(depth_png_path, depth_quant)
 
 
 def _write_video_frames(
@@ -488,12 +779,30 @@ def render_label(
     frames_rendered = 0
     fov_y_rad = math.radians(float(args.fov_deg))
 
+    light_config: LightFilterConfig | None = getattr(args, "light_config", None)
+    cl_config: CameraLightConfig | None = getattr(args, "cl_config", None)
+    cl_light_world = getattr(args, "cl_light_world", None)
+    light_seed_offset = getattr(args, "light_seed_offset", 0)
+
     def _frame_iter():
         nonlocal render_time, frames_rendered
         for idx, (pose, _) in enumerate(poses):
             start = time.monotonic()
-            rgb = renderer.render_rgb(pose)
+            rgb, depth_inv, camera = _render_custom_gaussians(renderer, pose, renderer._gaussians)  # pylint: disable=protected-access
             render_time += time.monotonic() - start
+            rgb = _apply_light_filter_if_enabled(
+                rgb,
+                light_config,
+                frame_index=idx,
+                seed_offset=light_seed_offset,
+            )
+            rgb = _apply_camera_light_if_enabled(
+                rgb,
+                depth_inv,
+                camera,
+                cl_config,
+                cl_light_world=cl_light_world,
+            )
             if args.rotate_180:
                 rgb = np.flipud(np.fliplr(rgb))
             frames_rendered += 1
@@ -509,6 +818,191 @@ def render_label(
                     frame_prefix=frame_prefix,
                     frame_idx=idx,
                     payload=cam_payload,
+                )
+            if args.save_depth_maps and depth_inv is not None:
+                _save_depth_map(
+                    depth_inv=depth_inv,
+                    frames_dir=frames_dir,
+                    frame_prefix=frame_prefix,
+                    frame_idx=idx,
+                    rotate_180=args.rotate_180,
+                )
+            if args.rgb_frames:
+                frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
+                imageio.imwrite(frame_path, rgb)
+            yield rgb
+
+    if args.video:
+        encode_holder = [0.0]
+        _write_video_frames(
+            video_path=video_path,
+            frames=_frame_iter(),
+            fps=args.video_fps,
+            encode_time_accum=encode_holder,
+        )
+        encode_time = encode_holder[0]
+    else:
+        for _ in _frame_iter():
+            pass
+
+    duration = render_time + encode_time
+    return {
+        "scene_id": args.scene,
+        "label_id": label_id,
+        "frames": frames_rendered,
+        "duration_sec": duration,
+        "stage_seconds": {
+            "render": render_time,
+            "encode": encode_time,
+        },
+    }
+
+
+def _camera_xy_sequence(
+    prepared: PreparedPath,
+    args: argparse.Namespace,
+    actor_runtime: ActorRuntime | None,
+) -> list[np.ndarray]:
+    if actor_runtime is None:
+        poses = build_camera_poses(
+            prepared.path_xy,
+            floor_z=prepared.floor_z,
+            ceiling=prepared.ceiling,
+            follow_distance=args.follow_distance,
+            height_offset=args.height_offset,
+            look_ahead=args.look_ahead,
+            look_down=args.look_down,
+            stabilize=args.stabilize,
+        )
+        return [pos[:2].copy() for _, pos in poses]
+    poses, _, _ = build_actor_follow_plans(
+        prepared.path_xy,
+        floor_z=prepared.floor_z,
+        ceiling=prepared.ceiling,
+        follow_distance=args.follow_distance,
+        height_offset=args.height_offset,
+        look_ahead=args.look_ahead,
+        look_down=args.look_down,
+        stabilize=args.stabilize,
+        actor_runtime=actor_runtime,
+    )
+    return [pos[:2].copy() for _, pos in poses]
+
+
+def render_label_with_actor(
+    *,
+    renderer: GaussianRendererBackend,
+    prepared: PreparedPath,
+    output_dir: Path,
+    label_id: str,
+    args: argparse.Namespace,
+    actor_runtime: ActorRuntime,
+) -> dict:
+    poses, actor_transforms, actor_indices = build_actor_follow_plans(
+        prepared.path_xy,
+        floor_z=prepared.floor_z,
+        ceiling=prepared.ceiling,
+        follow_distance=args.follow_distance,
+        height_offset=args.height_offset,
+        look_ahead=args.look_ahead,
+        look_down=args.look_down,
+        stabilize=args.stabilize,
+        actor_runtime=actor_runtime,
+    )
+
+    if args.minimal_frames is not None and args.minimal_frames > 0:
+        poses = poses[: args.minimal_frames]
+        actor_transforms = actor_transforms[: args.minimal_frames]
+        actor_indices = actor_indices[: args.minimal_frames]
+
+    scene_dir = output_dir / args.scene
+    _safe_mkdir(scene_dir)
+    frames_dir = scene_dir / label_id
+    if args.save_camera_metadata:
+        _safe_mkdir(frames_dir)
+
+    video_path = scene_dir / f"{label_id}.mp4"
+    frame_prefix = "frame"
+
+    render_time = 0.0
+    encode_time = 0.0
+    frames_rendered = 0
+    fov_y_rad = math.radians(float(args.fov_deg))
+
+    base_gaussians = renderer._gaussians  # pylint: disable=protected-access
+    scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
+    combined_model: CombinedGaussianModel | None = None
+    combined_actor_size: int | None = None
+
+    light_config: LightFilterConfig | None = getattr(args, "light_config", None)
+    cl_config: CameraLightConfig | None = getattr(args, "cl_config", None)
+    cl_light_world = getattr(args, "cl_light_world", None)
+    light_seed_offset = getattr(args, "light_seed_offset", 0)
+
+    def _frame_iter():
+        nonlocal render_time, frames_rendered, combined_model, combined_actor_size
+        for idx, ((pose, _), transform, actor_idx) in enumerate(
+            zip(poses, actor_transforms, actor_indices)
+        ):
+            sequence_frame = actor_runtime.sequence.frames[actor_idx]
+            actor_data = apply_transform_to_frame(
+                sequence_frame.base_data,
+                transform,
+                rotate_normals=True,
+                rotate_sh=True,
+            )
+            actor_render = actor_data_to_tensors(
+                actor_data,
+                actor_runtime.sequence,
+                device=base_gaussians.get_xyz.device,
+                target_rest_dim=scene_rest_dim,
+            )
+            current_actor_size = int(actor_render.xyz.shape[0])
+            if combined_model is None or combined_actor_size != current_actor_size:
+                combined_actor_size = current_actor_size
+                combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+            else:
+                combined_model.update_actor(actor_render)
+
+            start = time.monotonic()
+            rgb, depth_inv, camera = _render_custom_gaussians(renderer, pose, combined_model)
+            render_time += time.monotonic() - start
+            rgb = _apply_light_filter_if_enabled(
+                rgb,
+                light_config,
+                frame_index=idx,
+                seed_offset=light_seed_offset,
+            )
+            rgb = _apply_camera_light_if_enabled(
+                rgb,
+                depth_inv,
+                camera,
+                cl_config,
+                cl_light_world=cl_light_world,
+            )
+            if args.rotate_180:
+                rgb = np.flipud(np.fliplr(rgb))
+            frames_rendered += 1
+            if args.save_camera_metadata:
+                cam_payload = _serialize_camera(
+                    renderer=renderer,
+                    pose=pose,
+                    frame_size=tuple(args.resolution),
+                    fov_y_rad=fov_y_rad,
+                )
+                _write_camera_metadata(
+                    frames_dir=frames_dir,
+                    frame_prefix=frame_prefix,
+                    frame_idx=idx,
+                    payload=cam_payload,
+                )
+            if args.save_depth_maps and depth_inv is not None:
+                _save_depth_map(
+                    depth_inv=depth_inv,
+                    frames_dir=frames_dir,
+                    frame_prefix=frame_prefix,
+                    frame_idx=idx,
+                    rotate_180=args.rotate_180,
                 )
             if args.rgb_frames:
                 frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
@@ -548,20 +1042,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene", required=True, help="Scene ID to render.")
     parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "data" / "tmp" / "test_telesim3d")
     parser.add_argument("--metrics-json", type=Path, default=None)
+    parser.add_argument("--error-log", type=Path, default=None)
+    parser.add_argument("--skip-completed-log", type=Path, default=None)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--label-id", action="append", default=None)
     parser.add_argument("--max-labels", type=int, default=None)
     parser.add_argument("--exclude-detailed-labels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--resample-step", type=float, default=0.0)
-    parser.add_argument("--path-handedness", choices=["left", "right"], default="left")
+    parser.add_argument("--path-handedness", choices=["left", "right", "auto"], default="left")
     parser.add_argument("--swap-xy", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--negate-xy", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--negate-raster-world-xy",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Alias for --negate-xy.",
+    )
     parser.add_argument("--mirror-translation", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--look-ahead", type=float, default=2.0)
     parser.add_argument("--look-down", type=float, default=0.1)
     parser.add_argument("--height-offset", type=float, default=0.3)
-    parser.add_argument("--follow-distance", type=float, default=1.5)
     parser.add_argument("--resolution", type=int, nargs=2, default=(960, 720), metavar=("W", "H"))
     parser.add_argument("--fov-deg", type=float, default=70.0)
     parser.add_argument("--znear", type=float, default=0.001)
@@ -589,6 +1091,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-BEV", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-depth-maps", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-follow-metadata", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--depth-bit-depth", type=int, default=16)
+    parser.add_argument("--no-validate-path-bounds", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--navdp-ply-per-scene", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--ply-transform-backend", default=None)
+    parser.add_argument("--cl-enable", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cl-light-mode", default="headlight")
+    parser.add_argument("--cl-shading-model", default="classic")
+    parser.add_argument("--cl-strength", type=float, default=1.0)
+    parser.add_argument("--cl-color", type=float, nargs=3, default=(1.0, 1.0, 1.0))
+    parser.add_argument("--cl-ambient", type=float, default=0.2)
+    parser.add_argument("--cl-base-scale", type=float, default=1.0)
+    parser.add_argument("--cl-diffuse", type=float, default=1.0)
+    parser.add_argument("--cl-specular", type=float, default=0.2)
+    parser.add_argument("--cl-shininess", type=float, default=16.0)
+    parser.add_argument("--cl-range", type=float, default=0.0)
+    parser.add_argument("--cl-offset", type=float, nargs=3, default=(0.0, 0.0, 0.0))
+    parser.add_argument("--cl-light-reverse", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cl-light-world", type=float, nargs=3, default=None)
+    parser.add_argument("--cl-light-center", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cl-light-center-z", type=float, default=0.0)
+    parser.add_argument("--cl-normal-smooth", type=float, default=0.0)
+    parser.add_argument("--cl-normal-filter", default="box")
+    parser.add_argument("--cl-normal-kernel", type=int, default=2)
+    parser.add_argument("--cl-normal-sigma-range", type=float, default=0.1)
+    parser.add_argument("--cl-normal-sigma-domain", type=float, default=1.0)
+    parser.add_argument("--cl-shadow", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--cl-shadow-bias", type=float, default=0.02)
+    parser.add_argument("--cl-shadow-strength", type=float, default=0.2)
+    parser.add_argument("--cl-shadow-pcf", type=float, default=0)
+    parser.add_argument("--cl-shadow-compare", default="z")
     parser.add_argument("--npc-render", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--npc-count", type=int, default=0)
     parser.add_argument("--npc-max-count", type=int, default=0)
@@ -598,6 +1130,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npc-zone-ratio", default=None)
     parser.add_argument("--npc-max-range", type=float, default=0.0)
     parser.add_argument("--npc-free-threshold", type=int, default=0)
+    parser.add_argument("--npc-placement-backend", default=None)
     parser.add_argument("--npc-seed", type=int, default=0)
     parser.add_argument("--npc-free-white", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--npc-rotate-mask-180", action=argparse.BooleanOptionalAction, default=True)
@@ -605,13 +1138,84 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--npc-frame-pool-size", type=int, default=0)
     parser.add_argument("--job-slot", type=int, default=None)
     parser.add_argument("--job-name", default=None)
-    return parser.parse_args()
+    parser.add_argument("--job-actor-id", default=None)
+    parser.add_argument("--light-mode", default="none")
+    parser.add_argument("--light-strength", type=float, default=0.0)
+    parser.add_argument("--light-radius", type=float, default=0.45)
+    parser.add_argument("--light-center", type=float, nargs=2, default=(0.5, 0.5))
+    parser.add_argument("--light-jitter", type=float, default=0.0)
+    parser.add_argument("--light-temp-k", type=float, default=0.0)
+    parser.add_argument("--light-vignette", type=float, default=0.0)
+    parser.add_argument("--light-seed", type=int, default=0)
+    parser.add_argument("--actor-seq-dir", type=Path, default=None)
+    parser.add_argument("--actor-pattern", default=DEFAULT_ACTOR_PATTERN)
+    parser.add_argument("--actor-height", type=float, default=1.7)
+    parser.add_argument("--actor-speed", type=float, default=DEFAULT_ACTOR_SPEED)
+    parser.add_argument("--actor-fps", type=float, default=float(DEFAULT_VIDEO_FPS))
+    parser.add_argument("--follow-distance", type=float, default=1.5)
+    parser.add_argument("--follow-buffer", type=float, default=0.0)
+    parser.add_argument("--actor-foot-offset", type=float, default=0.0)
+    parser.add_argument("--animation-cycle-mod", type=int, default=3)
+    parser.add_argument("--actor-no-loop", dest="actor_loop", action="store_false")
+    parser.set_defaults(actor_loop=True)
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        LOGGER.warning("Ignoring unsupported args: %s", " ".join(unknown))
+    return args
 
 
 def main() -> int:
     args = parse_args()
     if args.view_mode not in ("forward", ""):
         LOGGER.warning("view-mode '%s' is not supported; using 'forward'.", args.view_mode)
+    if args.path_handedness == "auto":
+        args.path_handedness = "left"
+    if getattr(args, "negate_raster_world_xy", False):
+        args.negate_xy = True
+    if args.light_mode != "none":
+        args.light_config = LightFilterConfig(
+            mode=str(args.light_mode),
+            strength=float(args.light_strength),
+            radius_frac=float(args.light_radius),
+            center_xy=(float(args.light_center[0]), float(args.light_center[1])),
+            center_jitter=float(args.light_jitter),
+            temp_k=float(args.light_temp_k),
+            vignette=float(args.light_vignette),
+            seed=int(args.light_seed),
+        )
+        args.light_seed_offset = stable_hash_seed(f"{args.scene}:{args.light_seed}")
+    else:
+        args.light_config = None
+        args.light_seed_offset = 0
+    if args.cl_enable:
+        range_m = None if float(args.cl_range) <= 0.0 else float(args.cl_range)
+        args.cl_config = CameraLightConfig(
+            enabled=True,
+            strength=float(args.cl_strength),
+            color=(float(args.cl_color[0]), float(args.cl_color[1]), float(args.cl_color[2])),
+            ambient=float(args.cl_ambient),
+            diffuse=float(args.cl_diffuse),
+            specular=float(args.cl_specular),
+            shininess=float(args.cl_shininess),
+            range_m=range_m,
+            offset_cam=(float(args.cl_offset[0]), float(args.cl_offset[1]), float(args.cl_offset[2])),
+            normal_smooth=int(args.cl_normal_smooth),
+            shadow_enabled=bool(args.cl_shadow),
+            shadow_bias=float(args.cl_shadow_bias),
+            shadow_strength=float(args.cl_shadow_strength),
+            shadow_pcf_radius=int(args.cl_shadow_pcf),
+            light_mode=str(args.cl_light_mode),
+            shading_model=str(args.cl_shading_model),
+            shadow_compare=str(args.cl_shadow_compare),
+            normal_filter=str(args.cl_normal_filter),
+            normal_kernel=int(args.cl_normal_kernel),
+            normal_sigma_range=float(args.cl_normal_sigma_range),
+            normal_sigma_domain=float(args.cl_normal_sigma_domain),
+            base_scale=float(args.cl_base_scale),
+            light_reverse=bool(args.cl_light_reverse),
+        )
+    else:
+        args.cl_config = None
 
     scene_dir = resolve_scene_dir(args.scenes_dir, args.scene)
     scene_id = scene_dir.name
@@ -638,6 +1242,9 @@ def main() -> int:
     renderer = build_renderer(asset, args)
 
     label_paths = collect_labels(label_dir, args.label_id, args.max_labels, args.exclude_detailed_labels)
+    completed_labels: set[str] = set()
+    if args.skip_completed_log is not None and args.skip_completed_log.is_file():
+        completed_labels = _parse_resume_log(args.skip_completed_log).get(scene_id, set())
     if not label_paths:
         LOGGER.warning("No label paths found under %s", label_dir)
         return 1
@@ -649,9 +1256,49 @@ def main() -> int:
     total_frames = 0
     total_duration = 0.0
     total_encode = 0.0
+    path_statuses: dict[tuple[str, str], dict] = {}
+
+    def record_path_status(label_id: str, status: int, error: str | None = None) -> None:
+        path_statuses[(scene_id, label_id)] = {
+            "scene_id": scene_id,
+            "label_id": label_id,
+            "status": int(status),
+            "error": error,
+        }
+
+    actor_runtime: ActorRuntime | None = None
+    if args.actor_seq_dir is not None:
+        actor_options = ActorOptions(
+            sequence_dir=args.actor_seq_dir,
+            pattern=args.actor_pattern,
+            height=float(args.actor_height),
+            speed=float(args.actor_speed),
+            fps=float(args.actor_fps),
+            loop=bool(args.actor_loop),
+            foot_offset=float(args.actor_foot_offset),
+            follow_distance=float(args.follow_distance),
+            buffer_distance=float(args.follow_buffer),
+            animation_cycle_mod=int(args.animation_cycle_mod),
+        )
+        if actor_options.fps <= 0.0:
+            raise ValueError("actor_fps must be positive.")
+        if actor_options.speed <= 0.0:
+            raise ValueError("actor_speed must be positive.")
+        if actor_options.buffer_distance > actor_options.follow_distance:
+            raise ValueError("follow_buffer must be <= follow_distance.")
+        actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
+        actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
 
     for path_file in label_paths:
         label_id = path_file.stem
+        if label_id in completed_labels:
+            if args.verbose:
+                LOGGER.info("  -> %s (skip: completed in log)", label_id)
+            continue
+        if args.resume and _label_already_rendered(args.output_dir, scene_id, label_id):
+            if args.verbose:
+                LOGGER.info("  -> %s (skip: outputs exist)", label_id)
+            continue
         if args.verbose:
             LOGGER.info("  -> %s", label_id)
         prepared = prepare_path_data(
@@ -664,18 +1311,54 @@ def main() -> int:
             handedness=args.path_handedness,
             negate_xy=args.negate_xy,
         )
-        path_metrics = render_label(
-            renderer=renderer,
-            prepared=prepared,
-            output_dir=args.output_dir,
-            label_id=label_id,
-            args=args,
-        )
-        paths_payload.append(path_metrics)
-        total_frames += int(path_metrics.get("frames", 0))
-        total_duration += float(path_metrics.get("duration_sec", 0.0))
-        stage = path_metrics.get("stage_seconds") or {}
-        total_encode += float(stage.get("encode", 0.0))
+        try:
+            record_path_status(label_id, STATUS_RETRY, error="started")
+            if actor_runtime is not None:
+                path_metrics = render_label_with_actor(
+                    renderer=renderer,
+                    prepared=prepared,
+                    output_dir=args.output_dir,
+                    label_id=label_id,
+                    args=args,
+                    actor_runtime=actor_runtime,
+                )
+            else:
+                path_metrics = render_label(
+                    renderer=renderer,
+                    prepared=prepared,
+                    output_dir=args.output_dir,
+                    label_id=label_id,
+                    args=args,
+                )
+            record_path_status(label_id, STATUS_DONE, error=None)
+            paths_payload.append(path_metrics)
+            total_frames += int(path_metrics.get("frames", 0))
+            total_duration += float(path_metrics.get("duration_sec", 0.0))
+            stage = path_metrics.get("stage_seconds") or {}
+            total_encode += float(stage.get("encode", 0.0))
+
+            if args.save_follow_metadata:
+                cam_seq = _camera_xy_sequence(prepared, args, actor_runtime)
+                metadata_payload = build_path_metadata(
+                    scene_id=scene_id,
+                    label_id=label_id,
+                    path_xy=prepared.path_xy,
+                    camera_xy_seq=cam_seq,
+                    meta=meta,
+                    follow_distance=float(args.follow_distance),
+                    limit_to_follow=actor_runtime is not None,
+                )
+                metadata_path = args.output_dir / scene_id / f"{label_id}_follow_path.json"
+                metadata_path.parent.mkdir(parents=True, exist_ok=True)
+                metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
+        except Exception as exc:  # pylint: disable=broad-except
+            is_oom = _is_cuda_oom_error(exc)
+            record_path_status(label_id, STATUS_RETRY if is_oom else STATUS_SKIP, error="cuda_oom" if is_oom else "fatal")
+            LOGGER.warning("Rendering %s failed: %s", path_file.name, exc)
+            if args.error_log is not None:
+                args.error_log.parent.mkdir(parents=True, exist_ok=True)
+                with args.error_log.open("a", encoding="utf-8") as handle:
+                    handle.write(f"Scene={scene_id} Label={path_file.name} Error={exc}\n")
 
     renderer.shutdown()
 
@@ -693,6 +1376,7 @@ def main() -> int:
         "vram_peak_max_bytes": 0.0,
         "vram_avg_max_worker_bytes": 0.0,
         "paths": paths_payload,
+        "path_statuses": list(path_statuses.values()),
     }
 
     if args.metrics_json is not None:
