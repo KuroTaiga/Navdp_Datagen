@@ -94,6 +94,69 @@ def _compute_dirs(
     return dirs
 
 
+def _smooth_dirs(
+    dirs: list[tuple[float, float] | None],
+    window: int = 5,
+) -> list[tuple[float, float] | None]:
+    """
+    Smooth heading using a centered window of yaw angles.
+    - Uses circular mean (sin/cos) over the window.
+    - Pads with first/last available yaw at the boundaries.
+    """
+    n = len(dirs)
+    if n == 0 or window <= 1:
+        return dirs
+    half = window // 2
+
+    # Extract yaw angles; fill gaps with nearest known yaw.
+    yaws: list[float | None] = [None] * n
+    last = None
+    for i, d in enumerate(dirs):
+        if d is not None:
+            last = math.atan2(d[1], d[0])
+            yaws[i] = last
+        else:
+            yaws[i] = None
+
+    # Forward fill from first non-None.
+    first_yaw = next((y for y in yaws if y is not None), None)
+    if first_yaw is None:
+        return dirs  # nothing to smooth
+    for i in range(n):
+        if yaws[i] is None:
+            yaws[i] = last if last is not None else first_yaw
+        else:
+            last = yaws[i]
+
+    # Backward fill trailing None (if any).
+    last = yaws[-1]
+    for i in range(n - 1, -1, -1):
+        if yaws[i] is None:
+            yaws[i] = last
+        else:
+            last = yaws[i]
+
+    smoothed: list[tuple[float, float] | None] = [None] * n
+    sin = math.sin
+    cos = math.cos
+    atan2 = math.atan2
+
+    for i in range(n):
+        start = max(0, i - half)
+        end = min(n - 1, i + half)
+        # pad by clamping indices to [0, n-1]
+        angles: list[float] = []
+        for k in range(i - half, i + half + 1):
+            kk = min(max(0, k), n - 1)
+            angles.append(yaws[kk])
+        sum_sin = sum(sin(a) for a in angles)
+        sum_cos = sum(cos(a) for a in angles)
+        mean_angle = atan2(sum_sin, sum_cos)
+        smoothed[i] = (math.cos(mean_angle), math.sin(mean_angle))
+
+    return smoothed
+
+
 def _compute_prev_actions(
     frames: list[dict],
     dirs: list[tuple[float, float] | None],
@@ -271,6 +334,8 @@ def _process_input(
         camera_centers = _load_camera_centers(camera_dir)
 
     dirs = _compute_dirs(frames, camera_centers)
+    # Smooth heading using a 5-frame centered window (endpoint padded).
+    dirs = _smooth_dirs(dirs, window=5)
 
     reverse_frames: list[dict[str, Any]] = []
     for idx, frame in enumerate(frames):
