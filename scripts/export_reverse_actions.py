@@ -10,7 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-
+eps = 1e-6
 
 def _load_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -126,7 +126,7 @@ def _compute_prev_actions(
     signed_delta = _signed_angle_delta
 
     distance_accum = 0.0
-    angle_accum = 0.0
+    # Track signed yaw change so opposite small wiggles cancel out instead of stacking.
     angle_signed = 0.0
 
     curr_dir = dirs[index] or dirs[index - 1]
@@ -147,12 +147,13 @@ def _compute_prev_actions(
 
         prev_yaw = atan2(prev_dir[1], prev_dir[0])
         delta = signed_delta(prev_yaw, curr_yaw)
-        delta_deg = abs(degrees(delta))
+        delta_deg = degrees(delta)  # signed: left positive, right negative
 
         distance_accum += step_dist
-        angle_accum += delta_deg
-        angle_signed += delta_deg * (1.0 if delta >= 0 else -1.0)
+        angle_signed += delta_deg
 
+        # Newer frames are appended first; by handling move before turn, the
+        # reconstructed history (oldest -> newest) becomes "turn, then move."
         if distance_accum >= move_thresh:
             prev_actions.append(int(forward_action))
             prev_frames.append(int(frames[step]["frame"]))
@@ -160,8 +161,8 @@ def _compute_prev_actions(
             if len(prev_actions) >= window:
                 break
 
-        if angle_accum >= turn_thresh:
-            turns = int(angle_accum // turn_thresh)
+        if abs(angle_signed) >= turn_thresh:
+            turns = int(abs(angle_signed) // turn_thresh)
             direction = left_action if angle_signed >= 0 else right_action
             for _ in range(turns):
                 if len(prev_actions) >= window:
@@ -169,8 +170,8 @@ def _compute_prev_actions(
                 prev_actions.append(int(direction))
                 prev_frames.append(int(frames[step]["frame"]))
 
-            angle_accum = angle_accum % turn_thresh
-            angle_signed = (1.0 if angle_signed >= 0 else -1.0) * angle_accum
+            remainder = abs(angle_signed) % turn_thresh
+            angle_signed = remainder if angle_signed >= 0 else -remainder
             if len(prev_actions) >= window:
                 break
 
@@ -248,6 +249,12 @@ def _process_input(
     output_path = output_override or _default_output_path(input_path, label)
     if output_path.exists() and not overwrite:
         return output_path
+    if output_path.exists() and overwrite:
+        print(f"[OVERWRITE] Removing existing reverse file: {output_path}")
+        try:
+            output_path.unlink()
+        except OSError as exc:
+            print(f"[OVERWRITE][WARN] Failed to remove {output_path}: {exc}")
 
     frames = _iter_frames(data.get("frames") or [])
     scene = data.get("scene")
@@ -402,11 +409,15 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    print(f"[DISCOVER] Scanning input root: {args.input_actions}")
     inputs = _iter_inputs(args.input_actions)
     if not inputs:
         raise SystemExit(f"[ERROR] No *_actions.json found at {args.input_actions}")
     if len(inputs) > 1 and args.output is not None:
         raise SystemExit("[ERROR] --output can only be used with a single input file.")
+    print(f"[DISCOVER] Found {len(inputs)} action file(s):")
+    for i, path in enumerate(inputs, 1):
+        print(f"  [{i}/{len(inputs)}] {path}")
 
     if args.input_actions.is_file():
         output_path = _process_input(
@@ -432,6 +443,7 @@ def main() -> int:
 
     if worker_count == 1 or len(groups) <= 1:
         for scene_dir, scene_inputs in sorted(groups.items()):
+            print(f"[SCENE] {scene_dir} ({len(scene_inputs)} file(s))")
             outputs = _process_scene(
                 scene_dir=scene_dir,
                 inputs=scene_inputs,
@@ -452,6 +464,7 @@ def main() -> int:
     futures = []
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         for scene_dir, scene_inputs in groups.items():
+            print(f"[SCENE][QUEUE] {scene_dir} ({len(scene_inputs)} file(s))")
             futures.append(
                 executor.submit(
                     _process_scene,
