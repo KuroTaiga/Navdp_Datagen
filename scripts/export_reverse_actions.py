@@ -164,8 +164,6 @@ def _compute_prev_actions(
     window: int,
     padding_action: int,
     padding_frame: int,
-    step_distance: float,
-    move_threshold: float,
     turn_threshold_deg: float,
     forward_action: int,
     left_action: int,
@@ -316,7 +314,6 @@ def _process_input(
     padding_action: int,
     padding_frame: int,
     step_distance: float,
-    move_threshold: float,
     turn_threshold_deg: float,
     output_override: Path | None,
     overwrite: bool,
@@ -364,8 +361,6 @@ def _process_input(
             window=window,
             padding_action=padding_action,
             padding_frame=padding_frame,
-            step_distance=step_distance,
-            move_threshold=move_threshold,
             turn_threshold_deg=turn_threshold_deg,
             forward_action=1,
             left_action=2,
@@ -389,7 +384,6 @@ def _process_input(
         "padding_action": int(padding_action),
         "padding_frame": int(padding_frame),
         "step_distance": float(step_distance),
-        "move_threshold": float(move_threshold),
         "turn_threshold_deg": float(turn_threshold_deg),
         "frames": reverse_frames,
     }
@@ -405,7 +399,6 @@ def _process_scene(
     padding_action: int,
     padding_frame: int,
     step_distance: float,
-    move_threshold: float,
     turn_threshold_deg: float,
     overwrite: bool,
     camera_root: Path | None,
@@ -419,7 +412,6 @@ def _process_scene(
                 padding_action=padding_action,
                 padding_frame=padding_frame,
                 step_distance=step_distance,
-                move_threshold=move_threshold,
                 turn_threshold_deg=turn_threshold_deg,
                 output_override=None,
                 overwrite=overwrite,
@@ -478,12 +470,6 @@ def main() -> int:
         help="Per-frame distance increment in meters (default: 0.05).",
     )
     ap.add_argument(
-        "--move-threshold",
-        type=float,
-        default=0.25,
-        help="Forward action distance threshold in meters (default: 0.25).",
-    )
-    ap.add_argument(
         "--turn-threshold-deg",
         type=float,
         default=15.0,
@@ -503,17 +489,16 @@ def main() -> int:
 
     if args.input_actions.is_file():
         output_path = _process_input(
-            input_path=inputs[0],
-            window=args.window,
-            padding_action=args.padding_action,
-            padding_frame=args.padding_frame,
-            step_distance=args.step_distance,
-            move_threshold=args.move_threshold,
-            turn_threshold_deg=args.turn_threshold_deg,
-            output_override=args.output,
-            overwrite=args.overwrite,
-            camera_root=args.camera_root,
-        )
+                input_path=inputs[0],
+                window=args.window,
+                padding_action=args.padding_action,
+                padding_frame=args.padding_frame,
+                step_distance=args.step_distance,
+                turn_threshold_deg=args.turn_threshold_deg,
+                output_override=args.output,
+                overwrite=args.overwrite,
+                camera_root=args.camera_root,
+            )
         print(f"Wrote reverse actions: {output_path}" if output_path.exists() else f"Skipped: {output_path}")
         return 0
 
@@ -533,7 +518,6 @@ def main() -> int:
                 padding_action=args.padding_action,
                 padding_frame=args.padding_frame,
                 step_distance=args.step_distance,
-                move_threshold=args.move_threshold,
                 turn_threshold_deg=args.turn_threshold_deg,
                 overwrite=args.overwrite,
                 camera_root=args.camera_root,
