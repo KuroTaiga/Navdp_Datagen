@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""Generate per-frame reverse actions from a *_actions.json input.
-
-This is a scaffold: action inference logic is intentionally left as a TODO.
-"""
+"""Generate per-frame reverse actions from a *_actions.json input."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
 
 
 def _load_json(path: Path) -> dict:
@@ -42,42 +39,57 @@ def _signed_angle_delta(a: float, b: float) -> float:
 
 
 def _load_camera_centers(camera_dir: Path) -> dict[int, tuple[float, float]]:
+    """
+    Load per-frame camera center XY from:
+      <camera_dir>/frame_*_camera.json
+    """
     centers: dict[int, tuple[float, float]] = {}
     if not camera_dir.is_dir():
         return centers
-    for cam_path in sorted(camera_dir.glob("frame_*_camera.json")):
-        name = cam_path.stem
-        parts = name.split("_")
+
+    # No deep recursion; each file corresponds to a frame.
+    for cam_path in camera_dir.glob("frame_*_camera.json"):
+        stem = cam_path.stem  # frame_000123_camera
+        parts = stem.split("_")
         if len(parts) < 3:
             continue
         try:
             frame_id = int(parts[1])
         except ValueError:
             continue
-        payload = json.loads(cam_path.read_text(encoding="utf-8"))
+
+        payload = _load_json(cam_path)
         center = payload.get("camera_center_world")
-        if not center or len(center) < 2:
-            continue
-        centers[frame_id] = (float(center[0]), float(center[1]))
+        if isinstance(center, list) and len(center) >= 2:
+            centers[frame_id] = (float(center[0]), float(center[1]))
+
     return centers
 
 
-def _compute_dirs(frames: list[dict], camera_centers: dict[int, tuple[float, float]] | None) -> list[tuple[float, float] | None]:
+def _compute_dirs(
+    frames: list[dict],
+    camera_centers: dict[int, tuple[float, float]] | None,
+) -> list[tuple[float, float] | None]:
     dirs: list[tuple[float, float] | None] = [None] * len(frames)
     for i in range(1, len(frames)):
         prev = frames[i - 1]
         curr = frames[i]
+
         dx = None
         dy = None
         if camera_centers is not None:
             prev_id = int(prev.get("frame", i - 1))
             curr_id = int(curr.get("frame", i))
-            if prev_id in camera_centers and curr_id in camera_centers:
-                dx = camera_centers[curr_id][0] - camera_centers[prev_id][0]
-                dy = camera_centers[curr_id][1] - camera_centers[prev_id][1]
+            p = camera_centers.get(prev_id)
+            c = camera_centers.get(curr_id)
+            if p is not None and c is not None:
+                dx = c[0] - p[0]
+                dy = c[1] - p[1]
+
         if dx is None or dy is None:
             dx = float(curr["world"][0]) - float(prev["world"][0])
             dy = float(curr["world"][1]) - float(prev["world"][1])
+
         dirs[i] = _normalize_xy((dx, dy))
     return dirs
 
@@ -98,25 +110,32 @@ def _compute_prev_actions(
 ) -> tuple[list[int], list[int]]:
     prev_actions: list[int] = []
     prev_frames: list[int] = []
+
     if index <= 0:
         return (
             [int(padding_action)] * int(window),
             [int(padding_frame)] * int(window),
         )
 
+    # Hoist casts/lookups for speed in tight loops
+    step_dist = float(step_distance)
+    move_thresh = float(move_threshold)
+    turn_thresh = float(turn_threshold_deg)
+    atan2 = math.atan2
+    degrees = math.degrees
+    signed_delta = _signed_angle_delta
+
     distance_accum = 0.0
     angle_accum = 0.0
     angle_signed = 0.0
 
-    curr_dir = dirs[index]
-    if curr_dir is None:
-        curr_dir = dirs[index - 1]
+    curr_dir = dirs[index] or dirs[index - 1]
     if curr_dir is None:
         return (
             [int(padding_action)] * int(window),
             [int(padding_frame)] * int(window),
         )
-    curr_yaw = math.atan2(curr_dir[1], curr_dir[0])
+    curr_yaw = atan2(curr_dir[1], curr_dir[0])
 
     for step in range(index - 1, -1, -1):
         if len(prev_actions) >= window:
@@ -125,33 +144,32 @@ def _compute_prev_actions(
         prev_dir = dirs[step]
         if prev_dir is None:
             continue
-        prev_yaw = math.atan2(prev_dir[1], prev_dir[0])
-        delta = _signed_angle_delta(prev_yaw, curr_yaw)
-        delta_deg = abs(math.degrees(delta))
 
-        distance_accum += float(step_distance)
-        angle_accum += float(delta_deg)
-        angle_signed += float(delta_deg) * (1.0 if delta >= 0 else -1.0)
+        prev_yaw = atan2(prev_dir[1], prev_dir[0])
+        delta = signed_delta(prev_yaw, curr_yaw)
+        delta_deg = abs(degrees(delta))
 
-        move_ready = distance_accum >= float(move_threshold)
-        turn_ready = angle_accum >= float(turn_threshold_deg)
+        distance_accum += step_dist
+        angle_accum += delta_deg
+        angle_signed += delta_deg * (1.0 if delta >= 0 else -1.0)
 
-        if move_ready:
+        if distance_accum >= move_thresh:
             prev_actions.append(int(forward_action))
             prev_frames.append(int(frames[step]["frame"]))
             distance_accum = 0.0
             if len(prev_actions) >= window:
                 break
 
-        if turn_ready:
-            turns = int(angle_accum // float(turn_threshold_deg))
+        if angle_accum >= turn_thresh:
+            turns = int(angle_accum // turn_thresh)
             direction = left_action if angle_signed >= 0 else right_action
             for _ in range(turns):
                 if len(prev_actions) >= window:
                     break
                 prev_actions.append(int(direction))
                 prev_frames.append(int(frames[step]["frame"]))
-            angle_accum = angle_accum % float(turn_threshold_deg)
+
+            angle_accum = angle_accum % turn_thresh
             angle_signed = (1.0 if angle_signed >= 0 else -1.0) * angle_accum
             if len(prev_actions) >= window:
                 break
@@ -173,26 +191,34 @@ def _iter_frames(frames: Iterable[dict]) -> list[dict]:
 
 def _default_output_path(input_path: Path, label: str | None) -> Path:
     if label:
-        return input_path.parent / f"{label}_reverse_actions.json"
+        return input_path.parent / f"{label}_reverse.json"
     stem = input_path.stem
     if stem.endswith("_actions"):
         stem = stem[: -len("_actions")]
-    return input_path.parent / f"{stem}_reverse_actions.json"
+    return input_path.parent / f"{stem}_reverse.json"
 
 
 def _iter_inputs(root: Path) -> list[Path]:
+    """
+    Fast bounded discovery (NO rglob):
+    - If root is a file: use it
+    - If root contains *_actions.json directly: use those
+    - Else: search exactly ONE level down: root/<child>/*_actions.json
+    """
     if root.is_file():
         return [root]
-    if root.is_dir():
-        direct_hits: list[Path] = []
-        for child in sorted(root.iterdir()):
-            if not child.is_dir():
-                continue
-            direct_hits.extend(sorted(child.glob("*_actions.json")))
-        if direct_hits:
-            return direct_hits
-        return sorted(root.rglob("*_actions.json"))
-    return []
+    if not root.is_dir():
+        return []
+
+    direct = list(root.glob("*_actions.json"))
+    if direct:
+        return sorted(direct)
+
+    hits: list[Path] = []
+    for child in root.iterdir():
+        if child.is_dir():
+            hits.extend(child.glob("*_actions.json"))
+    return sorted(hits)
 
 
 def _group_by_scene(inputs: Sequence[Path]) -> dict[Path, list[Path]]:
@@ -215,20 +241,29 @@ def _process_input(
     overwrite: bool,
     camera_root: Path | None,
 ) -> Path:
+    # Need label to decide output filename. Load once.
     data = _load_json(input_path)
+    label = data.get("label")
+
+    output_path = output_override or _default_output_path(input_path, label)
+    if output_path.exists() and not overwrite:
+        return output_path
+
     frames = _iter_frames(data.get("frames") or [])
     scene = data.get("scene")
-    label = data.get("label")
+
     camera_centers = None
-    if camera_root is None:
+    effective_camera_root = camera_root
+    if effective_camera_root is None:
         dataset_root = data.get("dataset_root")
         if dataset_root:
-            camera_root = Path(dataset_root)
-    if camera_root is not None and scene and label:
-        camera_dir = camera_root / str(scene) / str(label)
+            effective_camera_root = Path(dataset_root)
+
+    if effective_camera_root is not None and scene and label:
+        camera_dir = effective_camera_root / str(scene) / str(label)
         camera_centers = _load_camera_centers(camera_dir)
+
     dirs = _compute_dirs(frames, camera_centers)
-    output_path = output_override or _default_output_path(input_path, label)
 
     reverse_frames: list[dict[str, Any]] = []
     for idx, frame in enumerate(frames):
@@ -269,8 +304,7 @@ def _process_input(
         "turn_threshold_deg": float(turn_threshold_deg),
         "frames": reverse_frames,
     }
-    if output_path.exists() and not overwrite:
-        return output_path
+
     _write_json(output_path, payload)
     return output_path
 
@@ -326,12 +360,15 @@ def main() -> int:
         default=None,
         help="Root directory containing <scene>/<label>/frame_*_camera.json (default: dataset_root in actions).",
     )
+
+    # ✅ Default overwrite is False; pass --overwrite to enable.
     ap.add_argument(
         "--overwrite",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Overwrite existing reverse action files (default: True).",
+        action="store_true",
+        default=False,
+        help="Overwrite existing reverse action files (default: False).",
     )
+
     ap.add_argument("--window", type=int, default=8, help="Number of previous actions (default: 8).")
     ap.add_argument(
         "--padding-action",
@@ -384,8 +421,7 @@ def main() -> int:
             overwrite=args.overwrite,
             camera_root=args.camera_root,
         )
-        if output_path.exists():
-            print(f"Wrote reverse actions: {output_path}")
+        print(f"Wrote reverse actions: {output_path}" if output_path.exists() else f"Skipped: {output_path}")
         return 0
 
     groups = _group_by_scene(inputs)
@@ -393,6 +429,7 @@ def main() -> int:
     total_files = len(inputs)
     completed = 0
     worker_count = max(1, int(args.workers))
+
     if worker_count == 1 or len(groups) <= 1:
         for scene_dir, scene_inputs in sorted(groups.items()):
             outputs = _process_scene(
