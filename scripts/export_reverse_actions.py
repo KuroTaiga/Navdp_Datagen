@@ -224,9 +224,29 @@ def _compute_prev_actions(
             if len(prev_actions) >= window:
                 break
 
-        if abs(angle_signed) >= turn_thresh:
-            turns = int(abs(angle_signed) // turn_thresh)
+        turn_ready = abs(angle_signed) >= turn_thresh and distance_accum >= move_thresh * 0.5
+        if turn_ready:
             direction = left_action if angle_signed >= 0 else right_action
+
+            # Cancel tiny opposite wiggles: if the last emitted turn was the
+            # opposite direction, the accumulated angle is small, and we
+            # haven't moved much, drop that last turn instead of adding more.
+            if (
+                prev_actions
+                and prev_actions[-1] in (left_action, right_action)
+                and prev_actions[-1] != direction
+                and abs(angle_signed) <= turn_thresh * 1.5
+                and distance_accum <= move_thresh
+            ):
+                prev_actions.pop()
+                prev_frames.pop()
+                # Nudge distance so the next turn can't fire immediately.
+                distance_accum = min(move_thresh, distance_accum + move_thresh * 0.5)
+                angle_signed = 0.0
+                curr_yaw = prev_yaw
+                continue
+
+            turns = int(abs(angle_signed) // turn_thresh)
             for _ in range(turns):
                 if len(prev_actions) >= window:
                     break
@@ -235,6 +255,8 @@ def _compute_prev_actions(
 
             remainder = abs(angle_signed) % turn_thresh
             angle_signed = remainder if angle_signed >= 0 else -remainder
+            # Force some forward progress before another turn fires.
+            distance_accum = 0.0
             if len(prev_actions) >= window:
                 break
 
