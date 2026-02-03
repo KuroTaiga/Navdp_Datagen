@@ -194,9 +194,10 @@ def _compute_prev_actions(
             yaws.append(atan2(d[1], d[0]))
 
     curr = index
+    angle_carry = 0.0  # radians; carries residual yaw between chunks
     while len(prev_actions) < window and curr > 0:
         block_start = max(0, curr - 5)
-        angle_accum = 0.0  # radians, signed
+        angle_accum = angle_carry  # start with carry from previous chunk
         block_events: list[tuple[int, int]] = []  # (action, frame_id)
 
         # Trace back within the 5-frame chunk.
@@ -227,7 +228,7 @@ def _compute_prev_actions(
             yaw_start = yaws[block_start]
             yaw_end = yaws[curr] if curr < len(yaws) else yaw_start
             if yaw_start is not None and yaw_end is not None:
-                delta_total = signed_delta(yaw_start, yaw_end)
+                delta_total = signed_delta(yaw_start, yaw_end) + angle_carry
                 total_deg = abs(degrees(delta_total))
                 direction = left_action if delta_total > 0 else right_action
                 turns_needed = int(total_deg // turn_thresh)
@@ -252,6 +253,8 @@ def _compute_prev_actions(
             prev_actions.append(int(action))
             prev_frames.append(int(frame_id))
 
+        # Carry residual yaw into next chunk.
+        angle_carry = angle_accum
         curr = block_start
 
     while len(prev_actions) < window:
