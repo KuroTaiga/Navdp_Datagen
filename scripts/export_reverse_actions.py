@@ -180,87 +180,79 @@ def _compute_prev_actions(
             [int(padding_frame)] * int(window),
         )
 
-    # Hoist casts/lookups for speed in tight loops
-    step_dist = float(step_distance)
-    move_thresh = float(move_threshold)
     turn_thresh = float(turn_threshold_deg)
+    signed_delta = _signed_angle_delta
     atan2 = math.atan2
     degrees = math.degrees
-    signed_delta = _signed_angle_delta
 
-    distance_accum = 0.0
-    # Track signed yaw change so opposite small wiggles cancel out instead of stacking.
-    angle_signed = 0.0
+    # Precompute yaws for all dirs (None if dir missing).
+    yaws: list[float | None] = []
+    for d in dirs:
+        if d is None:
+            yaws.append(None)
+        else:
+            yaws.append(atan2(d[1], d[0]))
 
-    curr_dir = dirs[index] or dirs[index - 1]
-    if curr_dir is None:
-        return (
-            [int(padding_action)] * int(window),
-            [int(padding_frame)] * int(window),
-        )
-    curr_yaw = atan2(curr_dir[1], curr_dir[0])
+    curr = index
+    while len(prev_actions) < window and curr > 0:
+        block_start = max(0, curr - 5)
+        angle_accum = 0.0  # radians, signed
+        block_events: list[tuple[int, int]] = []  # (action, frame_id)
 
-    for step in range(index - 1, -1, -1):
-        if len(prev_actions) >= window:
-            break
-
-        prev_dir = dirs[step]
-        if prev_dir is None:
-            continue
-
-        prev_yaw = atan2(prev_dir[1], prev_dir[0])
-        delta = signed_delta(prev_yaw, curr_yaw)
-        delta_deg = degrees(delta)  # signed: left positive, right negative
-
-        distance_accum += step_dist
-        angle_signed += delta_deg
-
-        # Newer frames are appended first; by handling move before turn, the
-        # reconstructed history (oldest -> newest) becomes "turn, then move."
-        if distance_accum >= move_thresh:
-            prev_actions.append(int(forward_action))
-            prev_frames.append(int(frames[step]["frame"]))
-            distance_accum = 0.0
-            if len(prev_actions) >= window:
-                break
-
-        turn_ready = abs(angle_signed) >= turn_thresh and distance_accum >= move_thresh * 0.5
-        if turn_ready:
-            direction = left_action if angle_signed >= 0 else right_action
-
-            # Cancel tiny opposite wiggles: if the last emitted turn was the
-            # opposite direction, the accumulated angle is small, and we
-            # haven't moved much, drop that last turn instead of adding more.
-            if (
-                prev_actions
-                and prev_actions[-1] in (left_action, right_action)
-                and prev_actions[-1] != direction
-                and abs(angle_signed) <= turn_thresh * 1.5
-                and distance_accum <= move_thresh
-            ):
-                prev_actions.pop()
-                prev_frames.pop()
-                # Nudge distance so the next turn can't fire immediately.
-                distance_accum = min(move_thresh, distance_accum + move_thresh * 0.5)
-                angle_signed = 0.0
-                curr_yaw = prev_yaw
+        # Trace back within the 5-frame chunk.
+        for step in range(curr - 1, block_start - 1, -1):
+            yaw_prev = yaws[step]
+            yaw_curr = yaws[step + 1] if step + 1 < len(yaws) else yaw_prev
+            if yaw_prev is None or yaw_curr is None:
                 continue
 
-            turns = int(abs(angle_signed) // turn_thresh)
-            for _ in range(turns):
-                if len(prev_actions) >= window:
-                    break
-                prev_actions.append(int(direction))
-                prev_frames.append(int(frames[step]["frame"]))
+            delta = signed_delta(yaw_prev, yaw_curr)
+            angle_accum += delta
 
-            remainder = abs(angle_signed) % turn_thresh
-            angle_signed = remainder if angle_signed >= 0 else -remainder
-            # Force some forward progress before another turn fires.
-            distance_accum = 0.0
+            while abs(degrees(angle_accum)) >= turn_thresh:
+                direction = left_action if angle_accum > 0 else right_action
+                if (
+                    block_events
+                    and block_events[-1][0] in (left_action, right_action)
+                    and block_events[-1][0] != direction
+                ):
+                    block_events.append((int(forward_action), int(frames[step]["frame"])))
+                block_events.append((int(direction), int(frames[step]["frame"])))
+                angle_accum -= math.copysign(math.radians(turn_thresh), angle_accum)
+
+        # If no turns inside the chunk, add a move and any net turn from chunk start to current.
+        has_turn = any(a in (left_action, right_action) for a, _ in block_events)
+        if not has_turn:
+            block_events.append((int(forward_action), int(frames[block_start]["frame"])))
+            yaw_start = yaws[block_start]
+            yaw_end = yaws[curr] if curr < len(yaws) else yaw_start
+            if yaw_start is not None and yaw_end is not None:
+                delta_total = signed_delta(yaw_start, yaw_end)
+                total_deg = abs(degrees(delta_total))
+                direction = left_action if delta_total > 0 else right_action
+                turns_needed = int(total_deg // turn_thresh)
+                for _ in range(turns_needed):
+                    block_events.append((int(direction), int(frames[block_start]["frame"])))
+
+        # Push block events into history, inserting a move between opposite turns across chunks.
+        for action, frame_id in block_events:
             if len(prev_actions) >= window:
                 break
+            if (
+                prev_actions
+                and action in (left_action, right_action)
+                and prev_actions[-1] in (left_action, right_action)
+                and prev_actions[-1] != action
+                and len(prev_actions) < window
+            ):
+                prev_actions.append(int(forward_action))
+                prev_frames.append(int(frame_id))
+                if len(prev_actions) >= window:
+                    break
+            prev_actions.append(int(action))
+            prev_frames.append(int(frame_id))
 
-        curr_yaw = prev_yaw
+        curr = block_start
 
     while len(prev_actions) < window:
         prev_actions.append(int(padding_action))
