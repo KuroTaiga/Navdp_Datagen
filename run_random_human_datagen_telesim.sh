@@ -15,6 +15,8 @@ fi
 
 # User-configurable defaults (override via env vars)
 CONDA_ENV=${CONDA_ENV:-cuda121}
+USE_CONDA_RUN=${USE_CONDA_RUN:-auto}
+SCENE_ID=${SCENE_ID:-}
 SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
 OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow_flaw}
@@ -105,8 +107,20 @@ if [ "${SH_DEGREE}" != "-1" ]; then
   render_extra_args+=" --sh-degree ${SH_DEGREE}"
 fi
 
-parallel_cmd=(
-  conda run --no-capture-output -n "$CONDA_ENV" "$PYTHON_BIN" "$SCRIPT_DIR/parallel_render_paths_telesim.py"
+parallel_cmd=()
+if [ "${USE_CONDA_RUN}" = "auto" ]; then
+  if [ -n "${CONDA_DEFAULT_ENV:-}" ] && [ "${CONDA_DEFAULT_ENV}" = "${CONDA_ENV}" ]; then
+    USE_CONDA_RUN="false"
+  else
+    USE_CONDA_RUN="true"
+  fi
+fi
+
+if [ "${USE_CONDA_RUN}" = "true" ]; then
+  parallel_cmd+=(conda run --no-capture-output -n "$CONDA_ENV")
+fi
+parallel_cmd+=(
+  "$PYTHON_BIN" "$SCRIPT_DIR/parallel_render_paths_telesim.py"
   --scenes-dir "${SCENES_DIR}"
   --tasks-dir "${TASKS_DIR}"
   --workers "${WORKERS}"
@@ -118,6 +132,9 @@ parallel_cmd=(
   --per-job-metrics-dir "${PER_JOB_METRICS_DIR}"
   --report-out "${PARALLEL_REPORT_DIR}"
 )
+if [ -n "${SCENE_ID}" ]; then
+  parallel_cmd+=(--scene "${SCENE_ID}")
+fi
 if [ -n "${ASSIGNMENTS_OUT}" ]; then
   parallel_cmd+=(--assignment-manifest "${ASSIGNMENTS_OUT}")
 fi
@@ -141,4 +158,25 @@ else
 fi
 parallel_cmd+=(--render-extra-args "$render_extra_args")
 
-"${parallel_cmd[@]}"
+PARALLEL_PID=""
+on_interrupt() {
+  if [ -n "${PARALLEL_PID}" ]; then
+    kill -INT -- "-${PARALLEL_PID}" 2>/dev/null || kill -INT "${PARALLEL_PID}" 2>/dev/null || true
+    wait "${PARALLEL_PID}" 2>/dev/null || true
+  fi
+  exit 130
+}
+trap on_interrupt INT TERM
+
+if command -v setsid >/dev/null 2>&1; then
+  setsid "${parallel_cmd[@]}" &
+else
+  "${parallel_cmd[@]}" &
+fi
+PARALLEL_PID=$!
+set +e
+wait "${PARALLEL_PID}"
+RC=$?
+set -e
+trap - INT TERM
+exit $RC

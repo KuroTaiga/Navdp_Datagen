@@ -274,6 +274,12 @@ def main() -> int:
         _write_json(args.status_json, status_map)
 
     procs: list[subprocess.Popen] = []
+
+    def _handle_terminate(_signum: int, _frame: object | None) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, _handle_terminate)
+    signal.signal(signal.SIGTERM, _handle_terminate)
     try:
         with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
             futures = {}
