@@ -540,7 +540,6 @@ def main() -> int:
                     args.padding_action,
                     args.padding_frame,
                     args.step_distance,
-                    args.move_threshold,
                     args.turn_threshold_deg,
                     args.overwrite,
                     args.camera_root,
