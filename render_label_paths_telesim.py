@@ -1354,7 +1354,7 @@ def main() -> int:
         except Exception as exc:  # pylint: disable=broad-except
             is_oom = _is_cuda_oom_error(exc)
             record_path_status(label_id, STATUS_RETRY if is_oom else STATUS_SKIP, error="cuda_oom" if is_oom else "fatal")
-            LOGGER.warning("Rendering %s failed: %s", path_file.name, exc)
+            LOGGER.warning("Rendering failed scene=%s label=%s error=%s", scene_id, path_file.name, exc)
             if args.error_log is not None:
                 args.error_log.parent.mkdir(parents=True, exist_ok=True)
                 with args.error_log.open("a", encoding="utf-8") as handle:
@@ -1383,7 +1383,16 @@ def main() -> int:
         args.metrics_json.parent.mkdir(parents=True, exist_ok=True)
         args.metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
 
-    LOGGER.info("Done. Outputs in %s", args.output_dir)
+    # Be explicit: this script runs per-scene (the parallel dispatcher fans out scenes),
+    # so logging should always include scene context.
+    outputs_dir = args.output_dir / scene_id
+    LOGGER.info(
+        "Done scene=%s paths_ok=%d/%d outputs=%s",
+        scene_id,
+        len(paths_payload),
+        len(label_paths),
+        outputs_dir,
+    )
     return 0
 
 

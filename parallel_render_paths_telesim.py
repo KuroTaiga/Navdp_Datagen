@@ -12,9 +12,11 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -214,6 +216,61 @@ def _run_command(cmd: list[str], procs: list[subprocess.Popen]) -> int:
     return proc.wait()
 
 
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 0:
+        seconds = 0.0
+    total = int(round(seconds))
+    mins, sec = divmod(total, 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    if days:
+        return f"{days}d{hrs:02d}h{mins:02d}m{sec:02d}s"
+    if hrs:
+        return f"{hrs}h{mins:02d}m{sec:02d}s"
+    return f"{mins}m{sec:02d}s"
+
+
+def _format_bytes(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "-"
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    return f"{value:.2f}{units[idx]}"
+
+
+def _dir_size_bytes(path: Path) -> int | None:
+    """
+    Best-effort directory size.
+    Uses `du -sb` when available (fast on Linux), otherwise falls back to Python walk.
+    """
+    try:
+        out = subprocess.check_output(["du", "-sb", str(path)], text=True, stderr=subprocess.DEVNULL).strip()
+        if out:
+            return int(out.split()[0])
+    except Exception:
+        pass
+    try:
+        total = 0
+        for root, _, files in os.walk(path):
+            for name in files:
+                try:
+                    total += (Path(root) / name).stat().st_size
+                except OSError:
+                    continue
+        return total
+    except Exception:
+        return None
+
+
 def _terminate_processes(procs: list[subprocess.Popen]) -> None:
     for proc in procs:
         if proc.poll() is None:
@@ -261,6 +318,24 @@ def main() -> int:
     parser.add_argument("--worker-progress", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--job-slot", type=int, default=None)
     parser.add_argument("--job-name", default=None)
+    parser.add_argument(
+        "--monitor-interval-sec",
+        type=float,
+        default=60.0,
+        help="How often to print overall progress/ETA/space stats (default: 60s).",
+    )
+    parser.add_argument(
+        "--avg-path-length-m",
+        type=float,
+        default=15.6,
+        help="Average path length for derived speed reporting (default: 15.6m).",
+    )
+    parser.add_argument(
+        "--step-distance-m",
+        type=float,
+        default=0.05,
+        help="Meters per frame for derived FPS reporting (default: 0.05m).",
+    )
 
     args, unknown = parser.parse_known_args()
     if unknown:
@@ -304,11 +379,25 @@ def main() -> int:
     scene_done: dict[str, int] = {}
     total_done = 0
     results: list[dict] = []
+    worker_count = max(1, int(args.workers))
+    start_ts = time.time()
+    last_disk_ts = 0.0
+    last_disk_bytes: int | None = None
 
     def _update_progress(last_scene: str | None = None) -> None:
+        stats = _compute_stats(time.time())
         payload = {
             "total": total_jobs,
             "completed": min(completed_jobs, total_jobs),
+            "paths_total": (total_planned if total_planned > 0 else None),
+            "paths_done": total_done,
+            "workers": worker_count,
+            "elapsed_sec": stats.get("elapsed_sec"),
+            "speed_paths_per_sec": stats.get("speed_paths_per_sec"),
+            "eta_sec": stats.get("eta_sec"),
+            "disk_usage_bytes": stats.get("disk_usage_bytes"),
+            "disk_free_bytes": stats.get("disk_free_bytes"),
+            "disk_est_total_bytes": stats.get("disk_est_total_bytes"),
             "last_scene": last_scene,
             "timestamp": time.time(),
         }
@@ -330,11 +419,61 @@ def main() -> int:
     def _print_plans() -> None:
         if not scene_planned:
             return
+        print(f"[PLAN] Workers: {worker_count}")
         print("[PLAN] Planned labels per scene:")
         for scene_id, planned in sorted(scene_planned.items()):
             print(f"  - {scene_id}: {planned} planned")
         if total_planned > 0:
             print(f"[PLAN] Overall planned labels: {total_planned}")
+
+    def _compute_stats(now_ts: float) -> dict:
+        elapsed = max(0.0, now_ts - start_ts)
+        speed_paths = (total_done / elapsed) if elapsed > 0 and total_done > 0 else None
+        remaining = (total_planned - total_done) if total_planned > 0 else None
+        eta_sec = (remaining / speed_paths) if remaining is not None and speed_paths and speed_paths > 0 else None
+
+        avg_len_m = float(args.avg_path_length_m or 0.0)
+        step_m = float(args.step_distance_m or 0.0)
+        frames_per_path = (avg_len_m / step_m) if avg_len_m > 0 and step_m > 0 else None
+
+        speed_mps = (speed_paths * avg_len_m) if speed_paths and avg_len_m > 0 else None
+        speed_fps = (speed_paths * frames_per_path) if speed_paths and frames_per_path else None
+
+        nonlocal last_disk_ts, last_disk_bytes
+        usage_bytes = None
+        free_bytes = None
+        total_bytes = None
+        est_total_bytes = None
+        if args.output_dir is not None:
+            if last_disk_ts <= 0 or now_ts - last_disk_ts >= 30.0:
+                usage_bytes = _dir_size_bytes(Path(args.output_dir))
+                last_disk_bytes = usage_bytes
+                last_disk_ts = now_ts
+            else:
+                usage_bytes = last_disk_bytes
+            try:
+                du = shutil.disk_usage(str(args.output_dir))
+                free_bytes = int(du.free)
+                total_bytes = int(du.total)
+            except Exception:
+                free_bytes = None
+                total_bytes = None
+
+        if usage_bytes is not None and total_done > 0 and total_planned > 0:
+            bytes_per_path = usage_bytes / float(total_done)
+            est_total_bytes = int(bytes_per_path * float(total_planned))
+
+        return {
+            "elapsed_sec": elapsed,
+            "speed_paths_per_sec": speed_paths,
+            "speed_m_per_sec": speed_mps,
+            "speed_frames_per_sec": speed_fps,
+            "eta_sec": eta_sec,
+            "disk_usage_bytes": usage_bytes,
+            "disk_free_bytes": free_bytes,
+            "disk_total_bytes": total_bytes,
+            "disk_est_total_bytes": est_total_bytes,
+        }
 
     def _note_completion(
         scene_id: str,
@@ -358,7 +497,31 @@ def main() -> int:
         overall_progress = (
             f"{total_done}/{total_planned}" if total_planned not in (None, 0) else f"{total_done}"
         )
-        print(f"[PROGRESS] Scene {scene_id}: {scene_progress} | Overall: {overall_progress}")
+        stats = _compute_stats(time.time())
+        speed = stats.get("speed_paths_per_sec")
+        speed_mps = stats.get("speed_m_per_sec")
+        speed_fps = stats.get("speed_frames_per_sec")
+        eta_sec = stats.get("eta_sec")
+        disk_used = stats.get("disk_usage_bytes")
+        disk_free = stats.get("disk_free_bytes")
+        disk_est_total = stats.get("disk_est_total_bytes")
+        if speed is not None:
+            print(
+                "[PROGRESS] "
+                f"scene={scene_id} paths={scene_progress} overall={overall_progress} workers={worker_count} "
+                f"speed={speed:.3f} paths/s ({(speed_mps or 0.0):.2f} m/s, {(speed_fps or 0.0):.1f} fps) "
+                f"eta={_format_seconds(eta_sec)} "
+                f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                flush=True,
+            )
+        else:
+            print(
+                "[PROGRESS] "
+                f"scene={scene_id} paths={scene_progress} overall={overall_progress} workers={worker_count} "
+                f"eta={_format_seconds(eta_sec)} "
+                f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                flush=True,
+            )
         _update_progress(scene_id)
 
     def _handle_terminate(_signum: int, _frame: object | None) -> None:
@@ -366,9 +529,50 @@ def main() -> int:
 
     signal.signal(signal.SIGINT, _handle_terminate)
     signal.signal(signal.SIGTERM, _handle_terminate)
+    monitor_stop = threading.Event()
+    monitor_thread: threading.Thread | None = None
     try:
         _print_plans()
-        with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+
+        def _monitor_loop() -> None:
+            interval = float(args.monitor_interval_sec or 0.0)
+            if interval <= 0:
+                return
+            while not monitor_stop.is_set():
+                time.sleep(interval)
+                if monitor_stop.is_set():
+                    break
+                stats = _compute_stats(time.time())
+                speed = stats.get("speed_paths_per_sec")
+                eta_sec = stats.get("eta_sec")
+                disk_used = stats.get("disk_usage_bytes")
+                disk_free = stats.get("disk_free_bytes")
+                disk_est_total = stats.get("disk_est_total_bytes")
+                overall_progress = (
+                    f"{total_done}/{total_planned}" if total_planned not in (None, 0) else f"{total_done}"
+                )
+                running = max(0, total_jobs - completed_jobs)
+                if speed is not None:
+                    print(
+                        "[MON] "
+                        f"jobs={completed_jobs}/{total_jobs} running={running} paths={overall_progress} workers={worker_count} "
+                        f"speed={speed:.3f} paths/s eta={_format_seconds(eta_sec)} "
+                        f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "[MON] "
+                        f"jobs={completed_jobs}/{total_jobs} running={running} paths={overall_progress} workers={worker_count} "
+                        f"eta={_format_seconds(eta_sec)} "
+                        f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                        flush=True,
+                    )
+
+        monitor_thread = threading.Thread(target=_monitor_loop, name="telesim-progress", daemon=True)
+        monitor_thread.start()
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {}
             for job in jobs:
                 scene_id = job["scene"]
@@ -416,6 +620,9 @@ def main() -> int:
                 _note_completion(info["scene"], info.get("metrics_path"), info.get("planned_labels"))
                 _update_status_from_metrics(info.get("metrics_path"))
     except KeyboardInterrupt:
+        monitor_stop.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=2.0)
         _terminate_processes(procs)
         raise
 
@@ -445,7 +652,7 @@ def main() -> int:
                 if retry_delay > 0:
                     time.sleep(retry_delay)
                 retry_results: list[dict] = []
-                with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
                     futures = {}
                     for job in retry_jobs:
                         scene_id = job["scene"]
@@ -491,6 +698,9 @@ def main() -> int:
                 if remaining > 0:
                     remaining -= 1
         except KeyboardInterrupt:
+            monitor_stop.set()
+            if monitor_thread is not None:
+                monitor_thread.join(timeout=2.0)
             _terminate_processes(procs)
             raise
 
@@ -503,6 +713,10 @@ def main() -> int:
         with args.error_log.open("a", encoding="utf-8") as handle:
             for entry in failures:
                 handle.write(f"{entry['scene']} failed with {entry['returncode']}\n")
+
+    monitor_stop.set()
+    if monitor_thread is not None:
+        monitor_thread.join(timeout=2.0)
 
     return 0 if not failures else 1
 
