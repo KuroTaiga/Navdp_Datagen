@@ -945,11 +945,11 @@ def render_label_with_actor(
             zip(poses, actor_transforms, actor_indices)
         ):
             sequence_frame = actor_runtime.sequence.frames[actor_idx]
+            # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
             actor_data = apply_transform_to_frame(
-                sequence_frame.base_data,
+                sequence_frame,
+                actor_runtime.sequence,
                 transform,
-                rotate_normals=True,
-                rotate_sh=True,
             )
             actor_render = actor_data_to_tensors(
                 actor_data,
