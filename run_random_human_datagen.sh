@@ -493,25 +493,21 @@ handle_interrupt() {
 }
 trap handle_interrupt INT TERM
 
-# Assignment manifest generation helper.
+# Assignment manifest generation helper (shared implementation lives in scripts/).
 generate_assignment_manifest() {
-  local manifest_dir
-  manifest_dir="$(dirname "$ASSIGNMENTS_OUT")"
-  mkdir -p "$manifest_dir"
-  echo "[RUN] Random human data generation, seed ${SEED}"
-  local detailed_flag="--exclude-detailed-labels"
+  local exclude_detailed="true"
   if ! storage_bool_true "$EXCLUDE_DETAILED_LABELS"; then
-    detailed_flag="--no-exclude-detailed-labels"
+    exclude_detailed="false"
   fi
-  conda run --no-capture-output -n "$CONDA_ENV" python random_actor_assignments.py \
-    --actor-root "${ACTOR_ROOT}" \
-    --ban-list "${BAN_LIST}" \
-    --assignments-out "${ASSIGNMENTS_OUT}" \
-    --scenes-dir "${SCENES_DIR}" \
-    --tasks-dir "${TASKS_DIR}" \
-    --seed "${SEED}" \
-    "$detailed_flag"
-  echo "Assignment manifest generated at ${ASSIGNMENTS_OUT}"
+  CONDA_ENV="${CONDA_ENV}" \
+  ACTOR_ROOT="${ACTOR_ROOT}" \
+  BAN_LIST="${BAN_LIST}" \
+  ASSIGNMENTS_OUT="${ASSIGNMENTS_OUT}" \
+  SCENES_DIR="${SCENES_DIR}" \
+  TASKS_DIR="${TASKS_DIR}" \
+  SEED="${SEED}" \
+  EXCLUDE_DETAILED_LABELS="${exclude_detailed}" \
+  bash "${SCRIPT_DIR}/scripts/generate_assignment_manifest.sh"
 }
 
 if $RESUME_MODE; then

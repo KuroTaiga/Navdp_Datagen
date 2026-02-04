@@ -16,6 +16,7 @@ fi
 # User-configurable defaults (override via env vars)
 CONDA_ENV=${CONDA_ENV:-cuda121}
 USE_CONDA_RUN=${USE_CONDA_RUN:-auto}
+SEED=${SEED:-1}
 SCENE_ID=${SCENE_ID:-}
 SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
@@ -28,6 +29,8 @@ ERROR_LOG=${ERROR_LOG:-./CHINGMU_0800_follow_telesim.log}
 WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
+ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
+BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
 ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_CHINGMU.json}
 RESUME_LOG_PATH=${RESUME_LOG_PATH:-}
 RESUME_MODE=${RESUME_MODE:-false}
@@ -48,14 +51,30 @@ ANTIALIASING=${ANTIALIASING:-false}
 MAX_LABELS=${MAX_LABELS:-}
 SH_DEGREE=${SH_DEGREE:--1}
 
-# Unsupported features in TeleSim pipeline (warn if enabled)
-ACTOR_ROOT=${ACTOR_ROOT:-}
-ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-}
+# Unsupported features in TeleSim pipeline (warn if enabled).
+# Actor follow IS supported via --assignment-manifest.
 NPC_ENABLE=${NPC_ENABLE:-false}
 LIGHT_MODE=${LIGHT_MODE:-none}
 CL_ENABLE=${CL_ENABLE:-false}
 if [ "${NPC_ENABLE}" != "false" ] || [ "${LIGHT_MODE}" != "none" ] || [ "${CL_ENABLE}" != "false" ]; then
   echo "[WARN] TeleSim pipeline ignores NPC/lighting/CL settings (actor follow is supported)." >&2
+fi
+
+generate_assignment_manifest() {
+  CONDA_ENV="${CONDA_ENV}" \
+  ACTOR_ROOT="${ACTOR_ROOT}" \
+  BAN_LIST="${BAN_LIST}" \
+  ASSIGNMENTS_OUT="${ASSIGNMENTS_OUT}" \
+  SCENES_DIR="${SCENES_DIR}" \
+  TASKS_DIR="${TASKS_DIR}" \
+  SEED="${SEED}" \
+  EXCLUDE_DETAILED_LABELS="${EXCLUDE_DETAILED_LABELS}" \
+  bash "${SCRIPT_DIR}/scripts/generate_assignment_manifest.sh"
+}
+
+if [ -n "${ASSIGNMENTS_OUT}" ] && [ ! -f "${ASSIGNMENTS_OUT}" ]; then
+  echo "[RUN] Assignment manifest missing at ${ASSIGNMENTS_OUT}; generating..." >&2
+  generate_assignment_manifest
 fi
 
 render_extra_args="--overwrite --stabilize --height-offset ${HEIGHT_OFFSET}"
