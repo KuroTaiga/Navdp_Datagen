@@ -26,6 +26,46 @@ STATUS_RETRY = 2
 STATUS_SKIP = 3
 
 
+def _resolve_label_directory(scene_task_dir: Path) -> Path | None:
+    label_paths_dir = scene_task_dir / "label_paths"
+    if label_paths_dir.is_dir() and any(label_paths_dir.glob("*.json")):
+        return label_paths_dir
+    if scene_task_dir.is_dir() and any(scene_task_dir.glob("*.json")):
+        return scene_task_dir
+    return None
+
+
+def _count_planned_labels(tasks_dir: Path | None, scene_id: str, label_ids: list[str] | None) -> int | None:
+    if label_ids:
+        return len(label_ids)
+    if tasks_dir is None:
+        return None
+    scene_dir = tasks_dir / scene_id
+    label_dir = _resolve_label_directory(scene_dir)
+    if label_dir is None:
+        return None
+    json_paths = [
+        p
+        for p in label_dir.glob("*.json")
+        if not p.name.endswith("_detailed.json") and p.name != "summary.json"
+    ]
+    return len(json_paths)
+
+
+def _extract_rendered_labels(metrics_path: Path | None) -> int | None:
+    if metrics_path is None or not metrics_path.is_file():
+        return None
+    try:
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload.get("paths_total"), int):
+        return int(payload["paths_total"])
+    if isinstance(payload.get("paths"), list):
+        return len(payload["paths"])
+    return None
+
+
 def _discover_scenes(tasks_dir: Path) -> list[str]:
     if not tasks_dir.is_dir():
         return []
@@ -249,14 +289,26 @@ def main() -> int:
         if snippet:
             extra_args.extend(shlex.split(snippet))
 
-    total = len(jobs)
-    completed = 0
+    # Planned label counts per job/scene to report progress.
+    scene_planned: dict[str, int] = {}
+    total_planned = 0
+    for job in jobs:
+        planned = _count_planned_labels(args.tasks_dir, job["scene"], job.get("labels"))
+        job["planned_labels"] = planned
+        if planned is not None:
+            scene_planned[job["scene"]] = scene_planned.get(job["scene"], 0) + planned
+            total_planned += planned
+
+    total_jobs = len(jobs)
+    completed_jobs = 0
+    scene_done: dict[str, int] = {}
+    total_done = 0
     results: list[dict] = []
 
     def _update_progress(last_scene: str | None = None) -> None:
         payload = {
-            "total": total,
-            "completed": completed,
+            "total": total_jobs,
+            "completed": min(completed_jobs, total_jobs),
             "last_scene": last_scene,
             "timestamp": time.time(),
         }
@@ -275,12 +327,47 @@ def main() -> int:
 
     procs: list[subprocess.Popen] = []
 
+    def _print_plans() -> None:
+        if not scene_planned:
+            return
+        print("[PLAN] Planned labels per scene:")
+        for scene_id, planned in sorted(scene_planned.items()):
+            print(f"  - {scene_id}: {planned} planned")
+        if total_planned > 0:
+            print(f"[PLAN] Overall planned labels: {total_planned}")
+
+    def _note_completion(
+        scene_id: str,
+        metrics_path: Path | None,
+        planned_labels: int | None,
+        *,
+        count_job: bool = True,
+    ) -> None:
+        nonlocal completed_jobs, total_done
+        if count_job:
+            completed_jobs += 1
+        rendered = _extract_rendered_labels(metrics_path)
+        if rendered is None:
+            rendered = planned_labels if planned_labels is not None else 0
+        scene_done[scene_id] = scene_done.get(scene_id, 0) + rendered
+        total_done += rendered
+        scene_total = scene_planned.get(scene_id)
+        scene_progress = (
+            f"{scene_done[scene_id]}/{scene_total}" if scene_total not in (None, 0) else f"{scene_done[scene_id]}"
+        )
+        overall_progress = (
+            f"{total_done}/{total_planned}" if total_planned not in (None, 0) else f"{total_done}"
+        )
+        print(f"[PROGRESS] Scene {scene_id}: {scene_progress} | Overall: {overall_progress}")
+        _update_progress(scene_id)
+
     def _handle_terminate(_signum: int, _frame: object | None) -> None:
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _handle_terminate)
     signal.signal(signal.SIGTERM, _handle_terminate)
     try:
+        _print_plans()
         with ThreadPoolExecutor(max_workers=max(1, int(args.workers))) as executor:
             futures = {}
             for job in jobs:
@@ -313,12 +400,12 @@ def main() -> int:
                     "scene": scene_id,
                     "cmd": cmd,
                     "metrics_path": metrics_path,
+                    "planned_labels": job.get("planned_labels"),
                 }
 
             for future in as_completed(futures):
                 info = futures[future]
                 returncode = future.result()
-                completed += 1
                 results.append(
                     {
                         "scene": info["scene"],
@@ -326,7 +413,7 @@ def main() -> int:
                         "cmd": info["cmd"],
                     }
                 )
-                _update_progress(info["scene"])
+                _note_completion(info["scene"], info.get("metrics_path"), info.get("planned_labels"))
                 _update_status_from_metrics(info.get("metrics_path"))
     except KeyboardInterrupt:
         _terminate_processes(procs)
@@ -385,12 +472,19 @@ def main() -> int:
                             "scene": scene_id,
                             "cmd": cmd,
                             "metrics_path": metrics_path,
+                            "planned_labels": job.get("planned_labels"),
                         }
                     for future in as_completed(futures):
                         info = futures[future]
                         returncode = future.result()
                         retry_results.append(
                             {"scene": info["scene"], "returncode": returncode, "cmd": info["cmd"]}
+                        )
+                        _note_completion(
+                            info["scene"],
+                            info.get("metrics_path"),
+                            info.get("planned_labels"),
+                            count_job=False,
                         )
                         _update_status_from_metrics(info.get("metrics_path"))
                 results.extend(retry_results)
