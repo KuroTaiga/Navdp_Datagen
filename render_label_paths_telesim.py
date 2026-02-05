@@ -1319,10 +1319,6 @@ def main() -> int:
         gaussian_model = candidates[0]
         LOGGER.warning("gaussian_model not found; using %s", gaussian_model.name)
 
-    meta = load_occupancy_metadata(scene_dir)
-    asset = build_scene_asset(scene_dir, gaussian_model, meta)
-    renderer = build_renderer(asset, args)
-
     label_paths = collect_labels(label_dir, args.label_id, args.max_labels, args.exclude_detailed_labels)
     completed_labels: set[str] = set()
     if args.skip_completed_log is not None and args.skip_completed_log.is_file():
@@ -1428,6 +1424,84 @@ def main() -> int:
                 extra,
             )
 
+    # Pre-check which paths we will actually run BEFORE loading the scene into GPU memory.
+    # This makes resume runs much faster when most outputs already exist.
+    pending_label_paths: list[Path] = []
+    pre_skipped_completed_log = 0
+    pre_skipped_outputs_exist = 0
+    for path_file in label_paths:
+        label_id = path_file.stem
+        if label_id in completed_labels:
+            record_path_status(label_id, STATUS_DONE, error="skipped_completed_log")
+            paths_skipped += 1
+            paths_done += 1
+            pre_skipped_completed_log += 1
+            continue
+        if args.resume and _label_already_rendered(args.output_dir, scene_id, label_id):
+            record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
+            paths_skipped += 1
+            paths_done += 1
+            pre_skipped_outputs_exist += 1
+            continue
+        pending_label_paths.append(path_file)
+
+    if args.path_progress:
+        LOGGER.info(
+            "[PRECHECK] scene=%s planned=%d pending=%d skipped_completed_log=%d skipped_outputs_exist=%d",
+            scene_id,
+            paths_planned,
+            len(pending_label_paths),
+            pre_skipped_completed_log,
+            pre_skipped_outputs_exist,
+        )
+
+    if not pending_label_paths:
+        # Nothing to do for this scene; write metrics/status for resume accounting and exit early.
+        metrics = {
+            "paths_planned": paths_planned,
+            "paths_done": paths_done,
+            "paths_ok": paths_ok,
+            "paths_skipped": paths_skipped,
+            "paths_fatal": paths_fatal,
+            "paths_oom": paths_oom,
+            "paths_attempted": paths_attempted,
+            "paths_total": len(paths_payload),
+            "frames_total": total_frames,
+            "duration_total_sec": total_duration,
+            "time_per_frame_sec": None,
+            "h264_encode_total_sec": total_encode,
+            "h264_encode_sec_per_frame": None,
+            "h264_encode_fps": None,
+            "h264_mux_total_sec": 0.0,
+            "h264_mux_sec_per_frame": 0.0,
+            "h264_mux_sec_per_path": (0.0 if not paths_payload else 0.0),
+            "vram_peak_max_bytes": 0.0,
+            "vram_avg_max_worker_bytes": 0.0,
+            "paths": paths_payload,
+            "path_statuses": list(path_statuses.values()),
+        }
+        if args.metrics_json is not None:
+            args.metrics_json.parent.mkdir(parents=True, exist_ok=True)
+            args.metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+        outputs_dir = args.output_dir / scene_id
+        LOGGER.info(
+            "Done scene=%s planned=%d done=%d ok=%d skip=%d fatal=%d oom=%d outputs=%s",
+            scene_id,
+            paths_planned,
+            paths_done,
+            paths_ok,
+            paths_skipped,
+            paths_fatal,
+            paths_oom,
+            outputs_dir,
+        )
+        return 0
+
+    # From here on we have pending work; now load metadata + scene assets.
+    meta = load_occupancy_metadata(scene_dir)
+    asset = build_scene_asset(scene_dir, gaussian_model, meta)
+    renderer = build_renderer(asset, args)
+
     actor_runtime: ActorRuntime | None = None
     if args.actor_seq_dir is not None:
         actor_options = ActorOptions(
@@ -1451,24 +1525,8 @@ def main() -> int:
         actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
         actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
 
-    for path_file in label_paths:
+    for path_file in pending_label_paths:
         label_id = path_file.stem
-        if label_id in completed_labels:
-            if args.verbose:
-                LOGGER.info("  -> %s (skip: completed in log)", label_id)
-            record_path_status(label_id, STATUS_DONE, error="skipped_completed_log")
-            paths_skipped += 1
-            paths_done += 1
-            _log_path_progress(label_id, status="skip_completed_log")
-            continue
-        if args.resume and _label_already_rendered(args.output_dir, scene_id, label_id):
-            if args.verbose:
-                LOGGER.info("  -> %s (skip: outputs exist)", label_id)
-            record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
-            paths_skipped += 1
-            paths_done += 1
-            _log_path_progress(label_id, status="skip_outputs_exist")
-            continue
         if args.verbose:
             LOGGER.info("  -> %s", label_id)
         prepared = prepare_path_data(
