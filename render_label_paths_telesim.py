@@ -1283,6 +1283,22 @@ def main() -> int:
     else:
         args.cl_config = None
 
+    # Preflight output directory once. If a file blocks any parent component (e.g. "navdata"),
+    # mkdir will raise FileExistsError with that filename; failing fast avoids spamming per-path errors.
+    try:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+    except FileExistsError as exc:
+        LOGGER.error(
+            "Output directory cannot be created (a file exists where a directory is expected): "
+            "blocked_path=%s output_dir=%s",
+            getattr(exc, "filename", None) or str(exc),
+            args.output_dir,
+        )
+        return 2
+    except Exception as exc:  # pylint: disable=broad-except
+        LOGGER.error("Output directory cannot be created: output_dir=%s error=%s", args.output_dir, exc)
+        return 2
+
     scene_dir = resolve_scene_dir(args.scenes_dir, args.scene)
     scene_id = scene_dir.name
     args.scene = scene_id
@@ -1349,7 +1365,9 @@ def main() -> int:
         nonlocal last_space_ts, last_scene_bytes, last_free_bytes
         now = time.monotonic()
         elapsed = max(1e-6, now - progress_t0)
-        speed_paths = (paths_done / elapsed) if paths_done > 0 else None
+        # Don't count fatal errors towards throughput; they can be fast failures and skew speed/ETA.
+        completed_for_speed = paths_ok + paths_skipped
+        speed_paths = (completed_for_speed / elapsed) if completed_for_speed > 0 else None
         remaining = max(0, paths_planned - paths_done)
         eta_sec = (remaining / speed_paths) if speed_paths and speed_paths > 0 else None
 
@@ -1514,7 +1532,15 @@ def main() -> int:
                 STATUS_RETRY if is_oom else STATUS_SKIP,
                 error="cuda_oom" if is_oom else "fatal",
             )
-            LOGGER.warning("Rendering failed scene=%s label=%s error=%s", scene_id, path_file.name, exc)
+            mp4_path = args.output_dir / scene_id / f"{label_id}.mp4"
+            LOGGER.warning(
+                "Rendering failed scene=%s label=%s json=%s mp4=%s error=%s",
+                scene_id,
+                label_id,
+                path_file,
+                mp4_path,
+                exc,
+            )
             if is_oom:
                 paths_oom += 1
                 _log_path_progress(label_id, status="oom")
