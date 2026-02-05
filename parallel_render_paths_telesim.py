@@ -383,6 +383,7 @@ def main() -> int:
     start_ts = time.time()
     last_disk_ts = 0.0
     last_disk_bytes: int | None = None
+    oom_retry_passes = 0
 
     def _update_progress(last_scene: str | None = None) -> None:
         stats = _compute_stats(time.time())
@@ -524,6 +525,23 @@ def main() -> int:
             )
         _update_progress(scene_id)
 
+    def _count_running_procs() -> int:
+        return sum(1 for p in procs if p.poll() is None)
+
+    def _collect_unresolved_ooms(status_map: dict) -> dict[str, list[str]]:
+        unresolved: dict[str, list[str]] = {}
+        for scene, labels in (status_map or {}).items():
+            if not isinstance(labels, dict):
+                continue
+            for label, info in labels.items():
+                if not isinstance(info, dict):
+                    continue
+                if int(info.get("status", STATUS_NOT_RUN)) == STATUS_RETRY:
+                    unresolved.setdefault(str(scene), []).append(str(label))
+        for scene in unresolved:
+            unresolved[scene].sort()
+        return unresolved
+
     def _handle_terminate(_signum: int, _frame: object | None) -> None:
         raise KeyboardInterrupt
 
@@ -551,7 +569,7 @@ def main() -> int:
                 overall_progress = (
                     f"{total_done}/{total_planned}" if total_planned not in (None, 0) else f"{total_done}"
                 )
-                running = max(0, total_jobs - completed_jobs)
+                running = _count_running_procs()
                 if speed is not None:
                     print(
                         "[MON] "
@@ -649,6 +667,7 @@ def main() -> int:
                 if not retry_jobs:
                     break
                 retry_pass += 1
+                oom_retry_passes = retry_pass
                 if retry_delay > 0:
                     time.sleep(retry_delay)
                 retry_results: list[dict] = []
@@ -705,7 +724,17 @@ def main() -> int:
             raise
 
     if args.report_out is not None:
-        _write_json(args.report_out, {"results": results})
+        unresolved_ooms = {}
+        if args.status_json is not None and args.status_json.is_file():
+            unresolved_ooms = _collect_unresolved_ooms(_load_status_map(args.status_json))
+        _write_json(
+            args.report_out,
+            {
+                "results": results,
+                "oom_retry_passes": oom_retry_passes,
+                "oom_unresolved": unresolved_ooms,
+            },
+        )
 
     failures = [r for r in results if r.get("returncode") not in (0, None)]
     if failures and args.error_log is not None:
@@ -713,6 +742,33 @@ def main() -> int:
         with args.error_log.open("a", encoding="utf-8") as handle:
             for entry in failures:
                 handle.write(f"{entry['scene']} failed with {entry['returncode']}\n")
+
+    # Even when subprocesses return 0, TeleSim may mark some labels as RETRY (cuda_oom).
+    # Surface this explicitly after the retry loop terminates.
+    if args.status_json is not None and args.status_json.is_file():
+        unresolved_ooms = _collect_unresolved_ooms(_load_status_map(args.status_json))
+        if unresolved_ooms:
+            remaining_labels = sum(len(v) for v in unresolved_ooms.values())
+            remaining_scenes = len(unresolved_ooms)
+            max_show = 5
+            examples = []
+            for scene_id, labels in sorted(unresolved_ooms.items()):
+                examples.append(f"{scene_id}:{','.join(labels[:max_show])}{'...' if len(labels) > max_show else ''}")
+                if len(examples) >= 6:
+                    break
+            print(
+                f"[OOM][WARN] Unresolved cuda_oom after retry passes={oom_retry_passes} "
+                f"(scenes={remaining_scenes} labels={remaining_labels}). Examples: {' | '.join(examples)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            if args.error_log is not None:
+                args.error_log.parent.mkdir(parents=True, exist_ok=True)
+                with args.error_log.open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        f"[OOM] Unresolved cuda_oom after retry passes={oom_retry_passes} "
+                        f"scenes={remaining_scenes} labels={remaining_labels}\n"
+                    )
 
     monitor_stop.set()
     if monitor_thread is not None:

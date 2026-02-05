@@ -12,6 +12,8 @@ import argparse
 import json
 import logging
 import math
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -72,6 +74,58 @@ STATUS_NOT_RUN = 0
 STATUS_DONE = 1
 STATUS_RETRY = 2
 STATUS_SKIP = 3
+
+
+def _format_seconds(seconds: float | None) -> str:
+    if seconds is None:
+        return "-"
+    if seconds < 0:
+        seconds = 0.0
+    total = int(round(seconds))
+    mins, sec = divmod(total, 60)
+    hrs, mins = divmod(mins, 60)
+    days, hrs = divmod(hrs, 24)
+    if days:
+        return f"{days}d{hrs:02d}h{mins:02d}m{sec:02d}s"
+    if hrs:
+        return f"{hrs}h{mins:02d}m{sec:02d}s"
+    return f"{mins}m{sec:02d}s"
+
+
+def _format_bytes(num_bytes: int | float | None) -> str:
+    if num_bytes is None:
+        return "-"
+    try:
+        value = float(num_bytes)
+    except (TypeError, ValueError):
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB", "PB"]
+    idx = 0
+    while value >= 1024.0 and idx < len(units) - 1:
+        value /= 1024.0
+        idx += 1
+    return f"{value:.2f}{units[idx]}"
+
+
+def _dir_size_bytes(path: Path) -> int | None:
+    """Best-effort directory size (fast path via du, fallback via stat walk)."""
+    try:
+        out = subprocess.check_output(["du", "-sb", str(path)], text=True, stderr=subprocess.DEVNULL).strip()
+        if out:
+            return int(out.split()[0])
+    except Exception:
+        pass
+    try:
+        total = 0
+        for p in path.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    continue
+        return total
+    except Exception:
+        return None
 
 
 def _is_cuda_oom_error(exc: Exception) -> bool:
@@ -1084,6 +1138,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--minimal-frames", type=int, default=None)
     parser.add_argument("--view-mode", default="forward")
     parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--path-progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Print per-path progress (scene/label/done/eta/space). Default: on.",
+    )
+    parser.add_argument(
+        "--path-progress-space-interval-sec",
+        type=float,
+        default=5.0,
+        help="How often to refresh disk usage stats for per-path progress (default: 5s).",
+    )
     parser.add_argument("--video-backend", default=None)
     parser.add_argument("--video-nvenc-preset", default=None)
     parser.add_argument("--video-nvenc-bitrate", default=None)
@@ -1257,6 +1323,17 @@ def main() -> int:
     total_duration = 0.0
     total_encode = 0.0
     path_statuses: dict[tuple[str, str], dict] = {}
+    paths_planned = len(label_paths)
+    paths_done = 0  # done includes ok/skip/fatal; OOM is still pending
+    paths_ok = 0
+    paths_skipped = 0
+    paths_fatal = 0
+    paths_oom = 0
+    paths_attempted = 0
+    progress_t0 = time.monotonic()
+    last_space_ts = 0.0
+    last_scene_bytes: int | None = None
+    last_free_bytes: int | None = None
 
     def record_path_status(label_id: str, status: int, error: str | None = None) -> None:
         path_statuses[(scene_id, label_id)] = {
@@ -1265,6 +1342,73 @@ def main() -> int:
             "status": int(status),
             "error": error,
         }
+
+    def _log_path_progress(label_id: str, *, status: str, frames: int | None = None) -> None:
+        if not args.path_progress:
+            return
+        nonlocal last_space_ts, last_scene_bytes, last_free_bytes
+        now = time.monotonic()
+        elapsed = max(1e-6, now - progress_t0)
+        speed_paths = (paths_done / elapsed) if paths_done > 0 else None
+        remaining = max(0, paths_planned - paths_done)
+        eta_sec = (remaining / speed_paths) if speed_paths and speed_paths > 0 else None
+
+        space_interval = float(getattr(args, "path_progress_space_interval_sec", 5.0) or 0.0)
+        if space_interval <= 0:
+            space_interval = 0.0
+        if last_space_ts <= 0.0 or (space_interval > 0.0 and (now - last_space_ts) >= space_interval):
+            scene_out_dir = args.output_dir / scene_id
+            last_scene_bytes = _dir_size_bytes(scene_out_dir) if scene_out_dir.exists() else 0
+            try:
+                last_free_bytes = int(shutil.disk_usage(str(args.output_dir)).free)
+            except Exception:
+                last_free_bytes = None
+            last_space_ts = now
+
+        est_total = None
+        if last_scene_bytes is not None and paths_done > 0:
+            est_total = int((float(last_scene_bytes) / float(paths_done)) * float(paths_planned))
+
+        extra = f" frames={frames}" if frames is not None else ""
+        if speed_paths is not None:
+            LOGGER.info(
+                "[PATH] scene=%s label=%s status=%s done=%d/%d ok=%d skip=%d fatal=%d oom=%d "
+                "speed=%.3f paths/s eta=%s space=%s free=%s est_total=%s%s",
+                scene_id,
+                label_id,
+                status,
+                paths_done,
+                paths_planned,
+                paths_ok,
+                paths_skipped,
+                paths_fatal,
+                paths_oom,
+                speed_paths,
+                _format_seconds(eta_sec),
+                _format_bytes(last_scene_bytes),
+                _format_bytes(last_free_bytes),
+                _format_bytes(est_total),
+                extra,
+            )
+        else:
+            LOGGER.info(
+                "[PATH] scene=%s label=%s status=%s done=%d/%d ok=%d skip=%d fatal=%d oom=%d "
+                "eta=%s space=%s free=%s est_total=%s%s",
+                scene_id,
+                label_id,
+                status,
+                paths_done,
+                paths_planned,
+                paths_ok,
+                paths_skipped,
+                paths_fatal,
+                paths_oom,
+                _format_seconds(eta_sec),
+                _format_bytes(last_scene_bytes),
+                _format_bytes(last_free_bytes),
+                _format_bytes(est_total),
+                extra,
+            )
 
     actor_runtime: ActorRuntime | None = None
     if args.actor_seq_dir is not None:
@@ -1294,10 +1438,18 @@ def main() -> int:
         if label_id in completed_labels:
             if args.verbose:
                 LOGGER.info("  -> %s (skip: completed in log)", label_id)
+            record_path_status(label_id, STATUS_DONE, error="skipped_completed_log")
+            paths_skipped += 1
+            paths_done += 1
+            _log_path_progress(label_id, status="skip_completed_log")
             continue
         if args.resume and _label_already_rendered(args.output_dir, scene_id, label_id):
             if args.verbose:
                 LOGGER.info("  -> %s (skip: outputs exist)", label_id)
+            record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
+            paths_skipped += 1
+            paths_done += 1
+            _log_path_progress(label_id, status="skip_outputs_exist")
             continue
         if args.verbose:
             LOGGER.info("  -> %s", label_id)
@@ -1312,6 +1464,7 @@ def main() -> int:
             negate_xy=args.negate_xy,
         )
         try:
+            paths_attempted += 1
             record_path_status(label_id, STATUS_RETRY, error="started")
             if actor_runtime is not None:
                 path_metrics = render_label_with_actor(
@@ -1332,10 +1485,13 @@ def main() -> int:
                 )
             record_path_status(label_id, STATUS_DONE, error=None)
             paths_payload.append(path_metrics)
+            paths_ok += 1
+            paths_done += 1
             total_frames += int(path_metrics.get("frames", 0))
             total_duration += float(path_metrics.get("duration_sec", 0.0))
             stage = path_metrics.get("stage_seconds") or {}
             total_encode += float(stage.get("encode", 0.0))
+            _log_path_progress(label_id, status="ok", frames=int(path_metrics.get("frames", 0) or 0))
 
             if args.save_follow_metadata:
                 cam_seq = _camera_xy_sequence(prepared, args, actor_runtime)
@@ -1353,8 +1509,19 @@ def main() -> int:
                 metadata_path.write_text(json.dumps(metadata_payload, indent=2), encoding="utf-8")
         except Exception as exc:  # pylint: disable=broad-except
             is_oom = _is_cuda_oom_error(exc)
-            record_path_status(label_id, STATUS_RETRY if is_oom else STATUS_SKIP, error="cuda_oom" if is_oom else "fatal")
+            record_path_status(
+                label_id,
+                STATUS_RETRY if is_oom else STATUS_SKIP,
+                error="cuda_oom" if is_oom else "fatal",
+            )
             LOGGER.warning("Rendering failed scene=%s label=%s error=%s", scene_id, path_file.name, exc)
+            if is_oom:
+                paths_oom += 1
+                _log_path_progress(label_id, status="oom")
+            else:
+                paths_fatal += 1
+                paths_done += 1
+                _log_path_progress(label_id, status="fatal")
             if args.error_log is not None:
                 args.error_log.parent.mkdir(parents=True, exist_ok=True)
                 with args.error_log.open("a", encoding="utf-8") as handle:
@@ -1363,6 +1530,13 @@ def main() -> int:
     renderer.shutdown()
 
     metrics = {
+        "paths_planned": paths_planned,
+        "paths_done": paths_done,
+        "paths_ok": paths_ok,
+        "paths_skipped": paths_skipped,
+        "paths_fatal": paths_fatal,
+        "paths_oom": paths_oom,
+        "paths_attempted": paths_attempted,
         "paths_total": len(paths_payload),
         "frames_total": total_frames,
         "duration_total_sec": total_duration,
@@ -1387,10 +1561,14 @@ def main() -> int:
     # so logging should always include scene context.
     outputs_dir = args.output_dir / scene_id
     LOGGER.info(
-        "Done scene=%s paths_ok=%d/%d outputs=%s",
+        "Done scene=%s planned=%d done=%d ok=%d skip=%d fatal=%d oom=%d outputs=%s",
         scene_id,
-        len(paths_payload),
-        len(label_paths),
+        paths_planned,
+        paths_done,
+        paths_ok,
+        paths_skipped,
+        paths_fatal,
+        paths_oom,
         outputs_dir,
     )
     return 0
