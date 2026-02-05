@@ -61,6 +61,10 @@ def _extract_rendered_labels(metrics_path: Path | None) -> int | None:
         payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    # Newer metrics include paths_done, which counts rendered + skipped (resume) + fatal.
+    # This is the right signal for "work completed" in resume runs where outputs already exist.
+    if isinstance(payload.get("paths_done"), int):
+        return int(payload["paths_done"])
     if isinstance(payload.get("paths_total"), int):
         return int(payload["paths_total"])
     if isinstance(payload.get("paths"), list):
