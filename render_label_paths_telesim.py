@@ -513,17 +513,19 @@ def _parse_resume_log(log_path: Path) -> dict[str, set[str]]:
     return completed
 
 
-def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str) -> bool:
+def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str, *, allow_frames: bool) -> bool:
     video_path = output_dir / scene_id / f"{label_id}.mp4"
     if video_path.is_file():
         return True
+    if not allow_frames:
+        return False
     frames_dir = output_dir / scene_id / label_id
     if frames_dir.is_dir() and any(frames_dir.glob("frame_*")):
         return True
     return False
 
 
-def _list_existing_mp4_labels(output_dir: Path, scene_id: str) -> set[str]:
+def _scan_existing_scene_mp4s(output_dir: Path, scene_id: str) -> tuple[dict[str, int], int]:
     """
     Fast resume helper: list already-rendered labels by scanning the output scene directory once.
 
@@ -532,21 +534,26 @@ def _list_existing_mp4_labels(output_dir: Path, scene_id: str) -> set[str]:
     """
     scene_out = output_dir / scene_id
     if not scene_out.is_dir():
-        return set()
-    labels: set[str] = set()
+        return {}, 0
+    sizes: dict[str, int] = {}
+    total = 0
     try:
         with os.scandir(scene_out) as it:
             for ent in it:
-                # We intentionally only index mp4s here. For rare "frames-only" outputs we fall back
-                # to the slower per-label probe when the mp4 isn't present.
                 if ent.is_file() and ent.name.endswith(".mp4"):
-                    labels.add(Path(ent.name).stem)
+                    label = Path(ent.name).stem
+                    try:
+                        sz = int(ent.stat().st_size)
+                    except OSError:
+                        sz = 0
+                    sizes[label] = sz
+                    total += sz
     except FileNotFoundError:
-        return set()
+        return {}, 0
     except Exception:
         # Best-effort: resume checks should never crash rendering.
-        return labels
-    return labels
+        return sizes, total
+    return sizes, total
 
 
 def build_camera_poses(
@@ -1373,6 +1380,11 @@ def main() -> int:
     last_scene_bytes: int | None = None
     last_free_bytes: int | None = None
     precheck_t0 = time.monotonic()
+    mp4_sizes: dict[str, int] = {}
+    mp4_total_bytes = 0
+    # Scanning the entire output scene directory is great for large resume runs, but can be
+    # slower than per-label checks for "quick test" jobs (e.g. 1 label per scene).
+    resume_scan_threshold = 32
 
     def record_path_status(label_id: str, status: int, error: str | None = None) -> None:
         path_statuses[(scene_id, label_id)] = {
@@ -1395,12 +1407,14 @@ def main() -> int:
         remaining = max(0, paths_planned - paths_done)
         eta_sec = (remaining / speed_paths) if speed_paths and speed_paths > 0 else None
 
+        # Space reporting: avoid `du` / directory walks on large mounts. We maintain total mp4 bytes
+        # via a one-time scene scan (resume) and per-path mp4 stats (rendered).
         space_interval = float(getattr(args, "path_progress_space_interval_sec", 5.0) or 0.0)
-        if space_interval <= 0:
+        if space_interval < 0:
             space_interval = 0.0
-        if last_space_ts <= 0.0 or (space_interval > 0.0 and (now - last_space_ts) >= space_interval):
-            scene_out_dir = args.output_dir / scene_id
-            last_scene_bytes = _dir_size_bytes(scene_out_dir) if scene_out_dir.exists() else 0
+        if space_interval == 0.0:
+            last_free_bytes = None
+        elif last_space_ts <= 0.0 or (now - last_space_ts) >= space_interval:
             try:
                 last_free_bytes = int(shutil.disk_usage(str(args.output_dir)).free)
             except Exception:
@@ -1408,8 +1422,10 @@ def main() -> int:
             last_space_ts = now
 
         est_total = None
-        if last_scene_bytes is not None and paths_done > 0:
-            est_total = int((float(last_scene_bytes) / float(paths_done)) * float(paths_planned))
+        # Prefer averaging by "have mp4 bytes" count, since fatal paths don't produce outputs.
+        have_bytes_count = max(0, len(mp4_sizes))
+        if last_scene_bytes is not None and have_bytes_count > 0:
+            est_total = int((float(last_scene_bytes) / float(have_bytes_count)) * float(paths_planned))
 
         extra = f" frames={frames}" if frames is not None else ""
         if speed_paths is not None:
@@ -1457,7 +1473,19 @@ def main() -> int:
     pending_label_paths: list[Path] = []
     pre_skipped_completed_log = 0
     pre_skipped_outputs_exist = 0
-    existing_mp4_labels = _list_existing_mp4_labels(args.output_dir, scene_id) if args.resume else set()
+    if args.resume:
+        if paths_planned > resume_scan_threshold:
+            mp4_sizes, mp4_total_bytes = _scan_existing_scene_mp4s(args.output_dir, scene_id)
+            last_scene_bytes = mp4_total_bytes
+        else:
+            mp4_sizes = {}
+            mp4_total_bytes = 0
+            last_scene_bytes = 0
+    else:
+        mp4_sizes = {}
+        mp4_total_bytes = 0
+        last_scene_bytes = 0
+    existing_mp4_labels = set(mp4_sizes.keys())
     for path_file in label_paths:
         label_id = path_file.stem
         if label_id in completed_labels:
@@ -1466,7 +1494,12 @@ def main() -> int:
             paths_done += 1
             pre_skipped_completed_log += 1
             continue
-        if args.resume and (label_id in existing_mp4_labels or _label_already_rendered(args.output_dir, scene_id, label_id)):
+        # Resume should be cheap: check only direct mp4s when --video is enabled (default).
+        # Only fall back to probing frames directories when video output is disabled.
+        if args.resume and (
+            label_id in existing_mp4_labels
+            or _label_already_rendered(args.output_dir, scene_id, label_id, allow_frames=(not bool(args.video)))
+        ):
             record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
             paths_skipped += 1
             paths_done += 1
@@ -1594,6 +1627,17 @@ def main() -> int:
             paths_payload.append(path_metrics)
             paths_ok += 1
             paths_done += 1
+            # Update output size accounting cheaply (mp4 only).
+            if bool(args.video):
+                mp4_path = args.output_dir / scene_id / f"{label_id}.mp4"
+                try:
+                    new_size = int(mp4_path.stat().st_size)
+                except OSError:
+                    new_size = 0
+                old_size = int(mp4_sizes.get(label_id, 0))
+                mp4_sizes[label_id] = new_size
+                mp4_total_bytes += (new_size - old_size)
+                last_scene_bytes = mp4_total_bytes
             total_frames += int(path_metrics.get("frames", 0))
             total_duration += float(path_metrics.get("duration_sec", 0.0))
             stage = path_metrics.get("stage_seconds") or {}
@@ -1652,6 +1696,8 @@ def main() -> int:
         "paths_fatal": paths_fatal,
         "paths_oom": paths_oom,
         "paths_attempted": paths_attempted,
+        "scene_mp4_total_bytes": mp4_total_bytes,
+        "scene_mp4_count": len(mp4_sizes),
         "paths_total": len(paths_payload),
         "frames_total": total_frames,
         "duration_total_sec": total_duration,

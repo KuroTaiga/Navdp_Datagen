@@ -466,11 +466,13 @@ def main() -> int:
     last_disk_ts = 0.0
     last_disk_bytes: int | None = None
     oom_retry_passes = 0
+    scene_output_bytes: dict[str, int] = {}
 
     # Optional resume prefilter: compute pending labels once and only spawn workers for those.
     # This avoids thousands of slow per-label existence checks on network mounts.
     if args.resume:
         prefilter_skipped = 0
+        resume_scan_threshold = 32
         for job in jobs:
             scene_id = job["scene"]
             planned_labels = job.get("labels")
@@ -484,7 +486,32 @@ def main() -> int:
                     max_labels=args.max_labels,
                 )
 
-            existing = _list_scene_output_mp4_labels(Path(args.output_dir), scene_id)
+            scene_out = Path(args.output_dir) / scene_id
+            existing = set()
+            scene_bytes = 0
+            if len(planned_ids) <= resume_scan_threshold:
+                # For quick tests (few labels), probing those exact paths is faster than scanning
+                # a directory with thousands of mp4s on some mounts.
+                for lid in planned_ids:
+                    mp4_path = scene_out / f"{lid}.mp4"
+                    if mp4_path.is_file():
+                        existing.add(lid)
+                        try:
+                            scene_bytes += int(mp4_path.stat().st_size)
+                        except OSError:
+                            continue
+            elif scene_out.is_dir():
+                try:
+                    with os.scandir(scene_out) as it:
+                        for ent in it:
+                            if ent.is_file() and ent.name.endswith(".mp4"):
+                                existing.add(Path(ent.name).stem)
+                                try:
+                                    scene_bytes += int(ent.stat().st_size)
+                                except OSError:
+                                    continue
+                except Exception:
+                    existing = _list_scene_output_mp4_labels(Path(args.output_dir), scene_id)
             pending_ids = [lid for lid in planned_ids if lid not in existing]
             skipped = max(0, len(planned_ids) - len(pending_ids))
 
@@ -492,6 +519,9 @@ def main() -> int:
             job["prefilter_pending_labels"] = len(pending_ids)
             job["prefilter_skipped_outputs_exist"] = skipped
             job["skip_job"] = (len(pending_ids) == 0)
+            job["prefilter_scene_mp4_total_bytes"] = scene_bytes
+            if scene_bytes:
+                scene_output_bytes[scene_id] = int(scene_bytes)
 
             if skipped:
                 scene_done[scene_id] = scene_done.get(scene_id, 0) + skipped
@@ -507,6 +537,9 @@ def main() -> int:
                 f"[PREFILTER] resume=true skipped_outputs_exist={prefilter_skipped} (counted as done for progress; excluded from speed)",
                 flush=True,
             )
+        if scene_output_bytes:
+            # Best-effort: used for disk estimation without expensive `du` walks.
+            last_disk_bytes = int(sum(scene_output_bytes.values()))
 
         # Run heavier jobs earlier to reduce tail idle time (still 1 scene per worker).
         jobs.sort(key=lambda j: int(j.get("prefilter_pending_labels") or 0), reverse=True)
@@ -574,12 +607,6 @@ def main() -> int:
         total_bytes = None
         est_total_bytes = None
         if args.output_dir is not None:
-            if last_disk_ts <= 0 or now_ts - last_disk_ts >= 30.0:
-                usage_bytes = _dir_size_bytes(Path(args.output_dir))
-                last_disk_bytes = usage_bytes
-                last_disk_ts = now_ts
-            else:
-                usage_bytes = last_disk_bytes
             try:
                 du = shutil.disk_usage(str(args.output_dir))
                 free_bytes = int(du.free)
@@ -587,6 +614,8 @@ def main() -> int:
             except Exception:
                 free_bytes = None
                 total_bytes = None
+            # Prefer fast, metrics-based estimate of "output bytes" when available.
+            usage_bytes = last_disk_bytes
 
         if usage_bytes is not None and total_done > 0 and total_planned > 0:
             bytes_per_path = usage_bytes / float(total_done)
@@ -612,6 +641,7 @@ def main() -> int:
         count_job: bool = True,
     ) -> None:
         nonlocal completed_jobs, total_done, total_ok
+        nonlocal last_disk_bytes, scene_output_bytes
         if count_job:
             completed_jobs += 1
         rendered = _extract_rendered_labels(metrics_path)
@@ -621,6 +651,18 @@ def main() -> int:
         if ok is None:
             # Fallback: if we can't read metrics, assume all completions were "ok".
             ok = int(rendered)
+        # Output size accounting from per-scene metrics (mp4 totals).
+        scene_bytes = None
+        if metrics_path is not None and metrics_path.is_file():
+            try:
+                payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+                if isinstance(payload.get("scene_mp4_total_bytes"), int):
+                    scene_bytes = int(payload["scene_mp4_total_bytes"])
+            except Exception:
+                scene_bytes = None
+        if scene_bytes is not None:
+            scene_output_bytes[scene_id] = int(scene_bytes)
+            last_disk_bytes = int(sum(scene_output_bytes.values()))
         scene_done[scene_id] = scene_done.get(scene_id, 0) + rendered
         total_done += rendered
         total_ok += ok
