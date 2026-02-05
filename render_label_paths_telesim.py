@@ -523,6 +523,32 @@ def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str) -> b
     return False
 
 
+def _list_existing_mp4_labels(output_dir: Path, scene_id: str) -> set[str]:
+    """
+    Fast resume helper: list already-rendered labels by scanning the output scene directory once.
+
+    This avoids doing thousands of per-label `stat()` calls against (often slow) mounts when
+    resuming and most outputs already exist.
+    """
+    scene_out = output_dir / scene_id
+    if not scene_out.is_dir():
+        return set()
+    labels: set[str] = set()
+    try:
+        with os.scandir(scene_out) as it:
+            for ent in it:
+                # We intentionally only index mp4s here. For rare "frames-only" outputs we fall back
+                # to the slower per-label probe when the mp4 isn't present.
+                if ent.is_file() and ent.name.endswith(".mp4"):
+                    labels.add(Path(ent.name).stem)
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        # Best-effort: resume checks should never crash rendering.
+        return labels
+    return labels
+
+
 def build_camera_poses(
     path_xy: Sequence[np.ndarray],
     *,
@@ -1346,6 +1372,7 @@ def main() -> int:
     last_space_ts = 0.0
     last_scene_bytes: int | None = None
     last_free_bytes: int | None = None
+    precheck_t0 = time.monotonic()
 
     def record_path_status(label_id: str, status: int, error: str | None = None) -> None:
         path_statuses[(scene_id, label_id)] = {
@@ -1361,8 +1388,9 @@ def main() -> int:
         nonlocal last_space_ts, last_scene_bytes, last_free_bytes
         now = time.monotonic()
         elapsed = max(1e-6, now - progress_t0)
-        # Don't count fatal errors towards throughput; they can be fast failures and skew speed/ETA.
-        completed_for_speed = paths_ok + paths_skipped
+        # Don't count "already done" skips (resume) or fatal errors towards throughput; they can
+        # be fast metadata checks / failures and skew speed/ETA.
+        completed_for_speed = paths_ok
         speed_paths = (completed_for_speed / elapsed) if completed_for_speed > 0 else None
         remaining = max(0, paths_planned - paths_done)
         eta_sec = (remaining / speed_paths) if speed_paths and speed_paths > 0 else None
@@ -1429,6 +1457,7 @@ def main() -> int:
     pending_label_paths: list[Path] = []
     pre_skipped_completed_log = 0
     pre_skipped_outputs_exist = 0
+    existing_mp4_labels = _list_existing_mp4_labels(args.output_dir, scene_id) if args.resume else set()
     for path_file in label_paths:
         label_id = path_file.stem
         if label_id in completed_labels:
@@ -1437,7 +1466,7 @@ def main() -> int:
             paths_done += 1
             pre_skipped_completed_log += 1
             continue
-        if args.resume and _label_already_rendered(args.output_dir, scene_id, label_id):
+        if args.resume and (label_id in existing_mp4_labels or _label_already_rendered(args.output_dir, scene_id, label_id)):
             record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
             paths_skipped += 1
             paths_done += 1
@@ -1446,13 +1475,15 @@ def main() -> int:
         pending_label_paths.append(path_file)
 
     if args.path_progress:
+        precheck_sec = max(0.0, time.monotonic() - precheck_t0)
         LOGGER.info(
-            "[PRECHECK] scene=%s planned=%d pending=%d skipped_completed_log=%d skipped_outputs_exist=%d",
+            "[PRECHECK] scene=%s planned=%d pending=%d skipped_completed_log=%d skipped_outputs_exist=%d precheck_sec=%.2f",
             scene_id,
             paths_planned,
             len(pending_label_paths),
             pre_skipped_completed_log,
             pre_skipped_outputs_exist,
+            precheck_sec,
         )
 
     if not pending_label_paths:

@@ -37,7 +37,14 @@ def _resolve_label_directory(scene_task_dir: Path) -> Path | None:
     return None
 
 
-def _count_planned_labels(tasks_dir: Path | None, scene_id: str, label_ids: list[str] | None) -> int | None:
+def _count_planned_labels(
+    tasks_dir: Path | None,
+    scene_id: str,
+    label_ids: list[str] | None,
+    *,
+    exclude_detailed: bool,
+    max_labels: int | None,
+) -> int | None:
     if label_ids:
         return len(label_ids)
     if tasks_dir is None:
@@ -49,8 +56,11 @@ def _count_planned_labels(tasks_dir: Path | None, scene_id: str, label_ids: list
     json_paths = [
         p
         for p in label_dir.glob("*.json")
-        if not p.name.endswith("_detailed.json") and p.name != "summary.json"
+        if (not exclude_detailed or not p.name.endswith("_detailed.json")) and p.name != "summary.json"
     ]
+    json_paths.sort()
+    if max_labels is not None and max_labels > 0:
+        json_paths = json_paths[:max_labels]
     return len(json_paths)
 
 
@@ -68,6 +78,21 @@ def _extract_rendered_labels(metrics_path: Path | None) -> int | None:
     if isinstance(payload.get("paths_total"), int):
         return int(payload["paths_total"])
     if isinstance(payload.get("paths"), list):
+        return len(payload["paths"])
+    return None
+
+
+def _extract_ok_labels(metrics_path: Path | None) -> int | None:
+    if metrics_path is None or not metrics_path.is_file():
+        return None
+    try:
+        payload = json.loads(metrics_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if isinstance(payload.get("paths_ok"), int):
+        return int(payload["paths_ok"])
+    if isinstance(payload.get("paths"), list):
+        # paths payload is populated only for successful renders.
         return len(payload["paths"])
     return None
 
@@ -251,6 +276,52 @@ def _format_bytes(num_bytes: int | float | None) -> str:
     return f"{value:.2f}{units[idx]}"
 
 
+def _normalize_label_id(label: str) -> str:
+    # Manifest / CLI sometimes includes "123" and sometimes "123.json".
+    p = Path(str(label))
+    return p.stem if p.suffix == ".json" else str(label)
+
+
+def _list_scene_output_mp4_labels(output_dir: Path, scene_id: str) -> set[str]:
+    scene_out = output_dir / scene_id
+    if not scene_out.is_dir():
+        return set()
+    labels: set[str] = set()
+    try:
+        with os.scandir(scene_out) as it:
+            for ent in it:
+                if ent.is_file() and ent.name.endswith(".mp4"):
+                    labels.add(Path(ent.name).stem)
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        return labels
+    return labels
+
+
+def _list_scene_task_labels(
+    tasks_dir: Path,
+    scene_id: str,
+    *,
+    exclude_detailed: bool,
+    max_labels: int | None,
+) -> list[str]:
+    scene_dir = tasks_dir / scene_id
+    label_dir = _resolve_label_directory(scene_dir)
+    if label_dir is None:
+        return []
+    labels = []
+    for p in sorted(label_dir.glob("*.json")):
+        if p.name == "summary.json":
+            continue
+        if exclude_detailed and p.name.endswith("_detailed.json"):
+            continue
+        labels.append(p.stem)
+    if max_labels is not None and max_labels > 0:
+        labels = labels[:max_labels]
+    return labels
+
+
 def _dir_size_bytes(path: Path) -> int | None:
     """
     Best-effort directory size.
@@ -372,7 +443,13 @@ def main() -> int:
     scene_planned: dict[str, int] = {}
     total_planned = 0
     for job in jobs:
-        planned = _count_planned_labels(args.tasks_dir, job["scene"], job.get("labels"))
+        planned = _count_planned_labels(
+            args.tasks_dir,
+            job["scene"],
+            job.get("labels"),
+            exclude_detailed=bool(args.exclude_detailed_labels),
+            max_labels=args.max_labels,
+        )
         job["planned_labels"] = planned
         if planned is not None:
             scene_planned[job["scene"]] = scene_planned.get(job["scene"], 0) + planned
@@ -382,12 +459,57 @@ def main() -> int:
     completed_jobs = 0
     scene_done: dict[str, int] = {}
     total_done = 0
+    total_ok = 0  # used for throughput/ETA; excludes resume skips
     results: list[dict] = []
     worker_count = max(1, int(args.workers))
     start_ts = time.time()
     last_disk_ts = 0.0
     last_disk_bytes: int | None = None
     oom_retry_passes = 0
+
+    # Optional resume prefilter: compute pending labels once and only spawn workers for those.
+    # This avoids thousands of slow per-label existence checks on network mounts.
+    if args.resume:
+        prefilter_skipped = 0
+        for job in jobs:
+            scene_id = job["scene"]
+            planned_labels = job.get("labels")
+            if planned_labels:
+                planned_ids = [_normalize_label_id(l) for l in planned_labels]
+            else:
+                planned_ids = _list_scene_task_labels(
+                    args.tasks_dir,
+                    scene_id,
+                    exclude_detailed=bool(args.exclude_detailed_labels),
+                    max_labels=args.max_labels,
+                )
+
+            existing = _list_scene_output_mp4_labels(Path(args.output_dir), scene_id)
+            pending_ids = [lid for lid in planned_ids if lid not in existing]
+            skipped = max(0, len(planned_ids) - len(pending_ids))
+
+            job["prefilter_planned_labels"] = len(planned_ids)
+            job["prefilter_pending_labels"] = len(pending_ids)
+            job["prefilter_skipped_outputs_exist"] = skipped
+            job["skip_job"] = (len(pending_ids) == 0)
+
+            if skipped:
+                scene_done[scene_id] = scene_done.get(scene_id, 0) + skipped
+                total_done += skipped
+                prefilter_skipped += skipped
+
+            # Only override labels when there is pending work; an empty list would mean "render all".
+            if pending_ids:
+                job["labels"] = pending_ids
+
+        if prefilter_skipped:
+            print(
+                f"[PREFILTER] resume=true skipped_outputs_exist={prefilter_skipped} (counted as done for progress; excluded from speed)",
+                flush=True,
+            )
+
+        # Run heavier jobs earlier to reduce tail idle time (still 1 scene per worker).
+        jobs.sort(key=lambda j: int(j.get("prefilter_pending_labels") or 0), reverse=True)
 
     def _update_progress(last_scene: str | None = None) -> None:
         stats = _compute_stats(time.time())
@@ -396,6 +518,7 @@ def main() -> int:
             "completed": min(completed_jobs, total_jobs),
             "paths_total": (total_planned if total_planned > 0 else None),
             "paths_done": total_done,
+            "paths_ok": total_ok,
             "workers": worker_count,
             "elapsed_sec": stats.get("elapsed_sec"),
             "speed_paths_per_sec": stats.get("speed_paths_per_sec"),
@@ -433,7 +556,8 @@ def main() -> int:
 
     def _compute_stats(now_ts: float) -> dict:
         elapsed = max(0.0, now_ts - start_ts)
-        speed_paths = (total_done / elapsed) if elapsed > 0 and total_done > 0 else None
+        # Throughput: use successful renders only (exclude resume skips + fatals).
+        speed_paths = (total_ok / elapsed) if elapsed > 0 and total_ok > 0 else None
         remaining = (total_planned - total_done) if total_planned > 0 else None
         eta_sec = (remaining / speed_paths) if remaining is not None and speed_paths and speed_paths > 0 else None
 
@@ -487,14 +611,19 @@ def main() -> int:
         *,
         count_job: bool = True,
     ) -> None:
-        nonlocal completed_jobs, total_done
+        nonlocal completed_jobs, total_done, total_ok
         if count_job:
             completed_jobs += 1
         rendered = _extract_rendered_labels(metrics_path)
         if rendered is None:
             rendered = planned_labels if planned_labels is not None else 0
+        ok = _extract_ok_labels(metrics_path)
+        if ok is None:
+            # Fallback: if we can't read metrics, assume all completions were "ok".
+            ok = int(rendered)
         scene_done[scene_id] = scene_done.get(scene_id, 0) + rendered
         total_done += rendered
+        total_ok += ok
         scene_total = scene_planned.get(scene_id)
         scene_progress = (
             f"{scene_done[scene_id]}/{scene_total}" if scene_total not in (None, 0) else f"{scene_done[scene_id]}"
@@ -598,6 +727,42 @@ def main() -> int:
             futures = {}
             for job in jobs:
                 scene_id = job["scene"]
+                if job.get("skip_job"):
+                    # Nothing pending for this scene based on prefilter; don't spawn a worker.
+                    completed_jobs += 1
+                    scene_total = scene_planned.get(scene_id)
+                    scene_progress = (
+                        f"{scene_done.get(scene_id, 0)}/{scene_total}"
+                        if scene_total not in (None, 0)
+                        else f"{scene_done.get(scene_id, 0)}"
+                    )
+                    overall_progress = (
+                        f"{total_done}/{total_planned}" if total_planned not in (None, 0) else f"{total_done}"
+                    )
+                    stats = _compute_stats(time.time())
+                    speed = stats.get("speed_paths_per_sec")
+                    eta_sec = stats.get("eta_sec")
+                    disk_used = stats.get("disk_usage_bytes")
+                    disk_free = stats.get("disk_free_bytes")
+                    disk_est_total = stats.get("disk_est_total_bytes")
+                    if speed is not None:
+                        print(
+                            "[PROGRESS] "
+                            f"scene={scene_id} paths={scene_progress} overall={overall_progress} workers={worker_count} "
+                            f"speed={speed:.3f} paths/s eta={_format_seconds(eta_sec)} "
+                            f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[PROGRESS] "
+                            f"scene={scene_id} paths={scene_progress} overall={overall_progress} workers={worker_count} "
+                            f"eta={_format_seconds(eta_sec)} "
+                            f"disk={_format_bytes(disk_used)}/{_format_bytes(disk_free)} est_total={_format_bytes(disk_est_total)}",
+                            flush=True,
+                        )
+                    _update_progress(scene_id)
+                    continue
                 metrics_path = None
                 if args.per_job_metrics_dir is not None:
                     metrics_path = args.per_job_metrics_dir / f"{scene_id}_{job.get('actor_id','base')}_metrics.json"
@@ -617,7 +782,7 @@ def main() -> int:
                     minimal_frames=args.minimal_frames,
                     exclude_detailed=args.exclude_detailed_labels,
                     max_labels=args.max_labels,
-                    label_ids=job.get("labels") or args.label_id,
+                    label_ids=(job.get("labels") if job.get("labels") is not None else args.label_id),
                     actor_args=actor_args,
                     skip_completed_log=args.skip_completed_log,
                     resume=bool(args.resume),
