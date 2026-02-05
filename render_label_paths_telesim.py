@@ -513,14 +513,15 @@ def _parse_resume_log(log_path: Path) -> dict[str, set[str]]:
     return completed
 
 
-def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str, *, allow_frames: bool) -> bool:
+def _label_already_rendered(output_dir: Path, scene_id: str, label_id: str) -> bool:
+    """
+    Resume check policy: ONLY check the direct `output_dir/<scene>/<label>.mp4`.
+
+    Intentionally does not probe any nested directories (e.g. `output_dir/<scene>/<label>/frame_*`)
+    to keep resume checks fast on remote / large mounts and to match the "direct area only" rule.
+    """
     video_path = output_dir / scene_id / f"{label_id}.mp4"
     if video_path.is_file():
-        return True
-    if not allow_frames:
-        return False
-    frames_dir = output_dir / scene_id / label_id
-    if frames_dir.is_dir() and any(frames_dir.glob("frame_*")):
         return True
     return False
 
@@ -1271,6 +1272,11 @@ def main() -> int:
         args.path_handedness = "left"
     if getattr(args, "negate_raster_world_xy", False):
         args.negate_xy = True
+    if bool(args.resume) and not bool(args.video):
+        LOGGER.warning(
+            "resume=true but video=false; resume checks only consider %s/<scene>/<label>.mp4 and will not scan subfolders.",
+            args.output_dir,
+        )
     if args.light_mode != "none":
         args.light_config = LightFilterConfig(
             mode=str(args.light_mode),
@@ -1494,11 +1500,9 @@ def main() -> int:
             paths_done += 1
             pre_skipped_completed_log += 1
             continue
-        # Resume should be cheap: check only direct mp4s when --video is enabled (default).
-        # Only fall back to probing frames directories when video output is disabled.
         if args.resume and (
             label_id in existing_mp4_labels
-            or _label_already_rendered(args.output_dir, scene_id, label_id, allow_frames=(not bool(args.video)))
+            or _label_already_rendered(args.output_dir, scene_id, label_id)
         ):
             record_path_status(label_id, STATUS_DONE, error="skipped_outputs_exist")
             paths_skipped += 1
