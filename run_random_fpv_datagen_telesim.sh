@@ -239,6 +239,12 @@ on_interrupt() {
 }
 trap on_interrupt INT TERM
 
+echo "[RUN] TeleSim FPV pipeline starting..." >&2
+echo "[RUN] workers=${WORKERS} resume=${RESUME_MODE} tasks_dir=${TASKS_DIR} scenes_dir=${SCENES_DIR} output_dir=${OUTPUT_DIR}" >&2
+if [ "${USE_CONDA_RUN}" = "true" ]; then
+  echo "[RUN] using conda run env=${CONDA_ENV}" >&2
+fi
+
 if command -v setsid >/dev/null 2>&1; then
   setsid "${parallel_cmd[@]}" &
 else

@@ -416,6 +416,13 @@ def main() -> int:
     if unknown:
         print(f"[WARN] Ignoring unsupported args: {' '.join(unknown)}", file=sys.stderr)
 
+    print(
+        "[START] "
+        f"workers={int(args.workers)} resume={bool(args.resume)} "
+        f"tasks_dir={args.tasks_dir} scenes_dir={args.scenes_dir} output_dir={args.output_dir}",
+        flush=True,
+    )
+
     jobs: list[dict] = []
     if args.assignment_manifest is not None and args.assignment_manifest.is_file():
         manifest = _load_assignment_manifest(args.assignment_manifest)
@@ -439,24 +446,11 @@ def main() -> int:
         if snippet:
             extra_args.extend(shlex.split(snippet))
 
-    # Planned label counts per job/scene to report progress.
-    scene_planned: dict[str, int] = {}
-    total_planned = 0
-    for job in jobs:
-        planned = _count_planned_labels(
-            args.tasks_dir,
-            job["scene"],
-            job.get("labels"),
-            exclude_detailed=bool(args.exclude_detailed_labels),
-            max_labels=args.max_labels,
-        )
-        job["planned_labels"] = planned
-        if planned is not None:
-            scene_planned[job["scene"]] = scene_planned.get(job["scene"], 0) + planned
-            total_planned += planned
-
     total_jobs = len(jobs)
     completed_jobs = 0
+    # Planned label counts per scene to report progress.
+    scene_planned: dict[str, int] = {}
+    total_planned = 0
     scene_done: dict[str, int] = {}
     total_done = 0
     total_ok = 0  # used for throughput/ETA; excludes resume skips
@@ -473,7 +467,9 @@ def main() -> int:
     if args.resume:
         prefilter_skipped = 0
         resume_scan_threshold = 32
-        for job in jobs:
+        prefilter_t0 = time.monotonic()
+        last_prefilter_note = prefilter_t0
+        for idx, job in enumerate(jobs, start=1):
             scene_id = job["scene"]
             planned_labels = job.get("labels")
             if planned_labels:
@@ -485,6 +481,12 @@ def main() -> int:
                     exclude_detailed=bool(args.exclude_detailed_labels),
                     max_labels=args.max_labels,
                 )
+
+            # Track planned counts for plan/progress reporting.
+            planned_n = len(planned_ids)
+            job["planned_labels"] = planned_n
+            scene_planned[scene_id] = scene_planned.get(scene_id, 0) + planned_n
+            total_planned += planned_n
 
             scene_out = Path(args.output_dir) / scene_id
             existing = set()
@@ -532,6 +534,18 @@ def main() -> int:
             if pending_ids:
                 job["labels"] = pending_ids
 
+            # Periodic heartbeat so `tee` users know we're alive and in prefilter IO.
+            now = time.monotonic()
+            if now - last_prefilter_note >= 5.0:
+                print(
+                    "[PREFILTER] "
+                    f"scanned_scenes~={idx}/{len(jobs)} last_scene={scene_id} "
+                    f"planned={planned_n} pending={len(pending_ids)} skipped={skipped} "
+                    f"elapsed={_format_seconds(now - prefilter_t0)}",
+                    flush=True,
+                )
+                last_prefilter_note = now
+
         if prefilter_skipped:
             print(
                 f"[PREFILTER] resume=true skipped_outputs_exist={prefilter_skipped} (counted as done for progress; excluded from speed)",
@@ -543,6 +557,20 @@ def main() -> int:
 
         # Run heavier jobs earlier to reduce tail idle time (still 1 scene per worker).
         jobs.sort(key=lambda j: int(j.get("prefilter_pending_labels") or 0), reverse=True)
+    else:
+        # Non-resume: still compute planned counts for progress display.
+        for job in jobs:
+            planned = _count_planned_labels(
+                args.tasks_dir,
+                job["scene"],
+                job.get("labels"),
+                exclude_detailed=bool(args.exclude_detailed_labels),
+                max_labels=args.max_labels,
+            )
+            job["planned_labels"] = planned
+            if planned is not None:
+                scene_planned[job["scene"]] = scene_planned.get(job["scene"], 0) + planned
+                total_planned += planned
 
     def _update_progress(last_scene: str | None = None) -> None:
         stats = _compute_stats(time.time())
