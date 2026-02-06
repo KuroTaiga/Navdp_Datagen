@@ -56,6 +56,10 @@ python lighting/build_lighting_dataset.py ./data2/0500_fpv \
   --output-json analysis/lighting_dataset_report.json
 ```
 
+Notes:
+- Default `--scan-mode stream` starts processing while MP4s are still being discovered.
+- Use `--scan-mode sorted` to match the old “scan everything first” behavior (required for `--suffix-mode luma` / base-luma computation).
+
 Parallel processing with progress:
 
 ```bash
@@ -127,6 +131,10 @@ python lighting/build_time_of_day_dataset.py ./data2/0500_fpv \
   --output-root ./data2 \
   --workers 8
 ```
+
+Notes:
+- Default `--scan-mode stream` starts processing immediately.
+- `--max-files N` now stops discovery early (useful for quick tests).
 
 Outputs are written to folders named like `./data2/0500_fpv_dawn`. Use `--preset-json` to supply
 custom tone settings.

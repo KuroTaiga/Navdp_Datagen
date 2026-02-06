@@ -8,7 +8,7 @@ import shutil
 import sys
 import time
 from argparse import BooleanOptionalAction
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
 
 import imageio.v2 as imageio
@@ -39,6 +39,16 @@ DEFAULT_PRESETS = [
 
 def _collect_mp4s(root: Path, pattern: str) -> list[Path]:
     return sorted(root.rglob(pattern))
+
+
+def _iter_mp4s(root: Path, pattern: str, *, progress_every: int = 0):
+    start = time.perf_counter()
+    for idx, path in enumerate(root.rglob(pattern), start=1):
+        yield path
+        if progress_every > 0 and idx % progress_every == 0:
+            elapsed = time.perf_counter() - start
+            rate = idx / elapsed if elapsed > 0 else 0.0
+            print(f"[SCAN] discovered {idx} files ({rate:.1f}/s)...", flush=True)
 
 
 def _load_mp4_list(list_path: Path, root: Path) -> list[Path]:
@@ -254,7 +264,8 @@ def _cleanup_latest_outputs(output_dirs: list[Path], count: int) -> list[Path]:
 def _progress_line(
     *,
     completed: int,
-    total: int,
+    total: int | None,
+    scanned: int | None,
     elapsed: float,
     frames_total: int,
     files_skipped: int,
@@ -266,18 +277,26 @@ def _progress_line(
     rate = _format_rate(completed, elapsed, "/s")
     fps = _format_rate(frames_total, elapsed, " fps")
     eta = None
-    if completed > 0:
+    if total is not None and completed > 0:
         avg_sec = elapsed / completed
         eta = avg_sec * max(total - completed, 0)
     avg_out_bytes = (
         output_bytes / files_with_outputs if files_with_outputs > 0 else None
     )
     est_remaining = (
-        avg_out_bytes * max(total - completed, 0) if avg_out_bytes is not None else None
+        avg_out_bytes * max(total - completed, 0)
+        if (avg_out_bytes is not None and total is not None)
+        else None
     )
     total_bytes, _, free_bytes = _disk_usage(output_root)
+    if total is None:
+        head = f"[PROGRESS] {completed} done"
+        if scanned is not None:
+            head += f" (scanned {scanned})"
+    else:
+        head = f"[PROGRESS] {completed}/{total} files"
     return (
-        f"[PROGRESS] {completed}/{total} files (skipped {files_skipped}) | "
+        f"{head} (skipped {files_skipped}) | "
         f"rate {rate} | eta {_format_eta(eta)} | "
         f"frames {frames_total} ({fps}) | "
         f"outputs {outputs_written} | "
@@ -700,6 +719,18 @@ def main() -> None:
         help="Print progress every N MP4s (default: 10).",
     )
     parser.add_argument(
+        "--scan-mode",
+        choices=("stream", "sorted"),
+        default="stream",
+        help="MP4 discovery mode: stream starts processing while scanning; sorted matches old behavior.",
+    )
+    parser.add_argument(
+        "--scan-progress-every",
+        type=int,
+        default=0,
+        help="Print scan progress every N discovered files (stream mode only; default: 0).",
+    )
+    parser.add_argument(
         "--max-files",
         type=int,
         default=None,
@@ -759,15 +790,35 @@ def main() -> None:
             flush=True,
         )
 
+    max_files = int(args.max_files) if args.max_files is not None else None
+    scan_mode = str(args.scan_mode)
+    total_known: int | None = None
+    mp4s: list[Path] | None = None
+
     if args.mp4_list is not None:
         mp4s = _load_mp4_list(args.mp4_list, input_dir)
-    else:
-        print(f"[SCAN] collecting mp4s under {input_dir}...", flush=True)
+        if max_files is not None:
+            mp4s = mp4s[:max_files]
+        if not mp4s:
+            raise SystemExit(f"No MP4s listed in {args.mp4_list}")
+        mp4_iter = iter(mp4s)
+        total_known = len(mp4s)
+    elif scan_mode == "sorted":
+        print(f"[SCAN] collecting mp4s under {input_dir} (sorted)...", flush=True)
         mp4s = _collect_mp4s(input_dir, args.pattern)
-    if not mp4s:
-        raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
-    if args.max_files is not None:
-        mp4s = mp4s[: int(args.max_files)]
+        if not mp4s:
+            raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
+        if max_files is not None:
+            mp4s = mp4s[:max_files]
+        mp4_iter = iter(mp4s)
+        total_known = len(mp4s)
+    else:
+        print(f"[SCAN] streaming mp4 discovery under {input_dir}...", flush=True)
+        mp4_iter = _iter_mp4s(
+            input_dir,
+            args.pattern,
+            progress_every=max(0, int(args.scan_progress_every)),
+        )
 
     tone_items = [
         (
@@ -779,7 +830,8 @@ def main() -> None:
         )
         for preset in presets
     ]
-    tasks = [(str(path), str(path.relative_to(input_dir))) for path in mp4s]
+    capture_mp4s = args.other_mode == "copy"
+    mp4s_for_copy: list[Path] = []
 
     start = time.perf_counter()
     reports: list[dict] = []
@@ -791,27 +843,18 @@ def main() -> None:
     outputs_written_total = 0
     output_bytes_total = 0
     files_with_outputs = 0
+    scanned = 0
+    completed = 0
 
-    if args.workers > 1:
+    progress_every = max(1, int(args.progress_every)) if int(args.progress_every) > 0 else 0
+    if int(args.workers) > 1:
+        max_inflight = max(4, int(args.workers) * 4)
         with ProcessPoolExecutor(max_workers=int(args.workers)) as executor:
-            futures = [
-                executor.submit(
-                    _process_mp4_task,
-                    src,
-                    rel,
-                    tone_items,
-                    overwrite=args.overwrite,
-                    resume=bool(args.resume),
-                    compute_backend=str(args.compute_backend),
-                    video_backend=str(args.video_backend),
-                    video_nvenc_preset=args.video_nvenc_preset,
-                    video_nvenc_bitrate=args.video_nvenc_bitrate,
-                    max_frames=args.max_frames,
-                )
-                for src, rel in tasks
-            ]
-            for idx, future in enumerate(as_completed(futures), start=1):
-                report = future.result()
+            inflight = set()
+
+            def handle_done(done_future) -> None:
+                nonlocal completed, total_frames, files_skipped, outputs_written_total, output_bytes_total, files_with_outputs
+                report = done_future.result()
                 reports.append(report)
                 total_frames += report["frames"]
                 if report.get("skipped"):
@@ -826,12 +869,14 @@ def main() -> None:
                 output_bytes_total += int(report.get("output_bytes", 0))
                 if report.get("output_bytes", 0) > 0:
                     files_with_outputs += 1
-                if args.progress_every > 0 and idx % int(args.progress_every) == 0:
+                completed += 1
+                if progress_every and completed % progress_every == 0:
                     elapsed = time.perf_counter() - start
                     print(
                         _progress_line(
-                            completed=idx,
-                            total=len(tasks),
+                            completed=completed,
+                            total=total_known,
+                            scanned=scanned,
                             elapsed=elapsed,
                             frames_total=total_frames,
                             files_skipped=files_skipped,
@@ -842,11 +887,52 @@ def main() -> None:
                         ),
                         flush=True,
                     )
+
+            for path in mp4_iter:
+                if max_files is not None and scanned >= max_files:
+                    break
+                scanned += 1
+                if capture_mp4s:
+                    mp4s_for_copy.append(path)
+                rel = path.relative_to(input_dir)
+                inflight.add(
+                    executor.submit(
+                        _process_mp4_task,
+                        str(path),
+                        str(rel),
+                        tone_items,
+                        overwrite=args.overwrite,
+                        resume=bool(args.resume),
+                        compute_backend=str(args.compute_backend),
+                        video_backend=str(args.video_backend),
+                        video_nvenc_preset=args.video_nvenc_preset,
+                        video_nvenc_bitrate=args.video_nvenc_bitrate,
+                        max_frames=args.max_frames,
+                    )
+                )
+                if len(inflight) >= max_inflight:
+                    done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        handle_done(future)
+
+            if scanned == 0:
+                raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
+            if total_known is None:
+                total_known = scanned
+            while inflight:
+                done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    handle_done(future)
     else:
-        for idx, (src, rel) in enumerate(tasks, start=1):
+        for path in mp4_iter:
+            if max_files is not None and scanned >= max_files:
+                break
+            scanned += 1
+            if capture_mp4s:
+                mp4s_for_copy.append(path)
             report = _process_mp4_task(
-                src,
-                rel,
+                str(path),
+                str(path.relative_to(input_dir)),
                 tone_items,
                 overwrite=args.overwrite,
                 resume=bool(args.resume),
@@ -870,12 +956,14 @@ def main() -> None:
             output_bytes_total += int(report.get("output_bytes", 0))
             if report.get("output_bytes", 0) > 0:
                 files_with_outputs += 1
-            if args.progress_every > 0 and idx % int(args.progress_every) == 0:
+            completed += 1
+            if progress_every and completed % progress_every == 0:
                 elapsed = time.perf_counter() - start
                 print(
                     _progress_line(
-                        completed=idx,
-                        total=len(tasks),
+                        completed=completed,
+                        total=total_known,
+                        scanned=scanned,
                         elapsed=elapsed,
                         frames_total=total_frames,
                         files_skipped=files_skipped,
@@ -886,32 +974,35 @@ def main() -> None:
                     ),
                     flush=True,
                 )
+        if scanned == 0:
+            raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
+        if total_known is None:
+            total_known = scanned
 
-    if tasks and args.progress_every > 0:
-        progress_every = int(args.progress_every)
-        if progress_every > 0 and len(tasks) % progress_every != 0:
-            elapsed = time.perf_counter() - start
-            print(
-                _progress_line(
-                    completed=len(tasks),
-                    total=len(tasks),
-                    elapsed=elapsed,
-                    frames_total=total_frames,
-                    files_skipped=files_skipped,
-                    outputs_written=outputs_written_total,
-                    output_bytes=output_bytes_total,
-                    output_root=output_root,
-                    files_with_outputs=files_with_outputs,
-                ),
-                flush=True,
-            )
+    if completed and progress_every and completed % progress_every != 0:
+        elapsed = time.perf_counter() - start
+        print(
+            _progress_line(
+                completed=completed,
+                total=total_known,
+                scanned=scanned,
+                elapsed=elapsed,
+                frames_total=total_frames,
+                files_skipped=files_skipped,
+                outputs_written=outputs_written_total,
+                output_bytes=output_bytes_total,
+                output_root=output_root,
+                files_with_outputs=files_with_outputs,
+            ),
+            flush=True,
+        )
 
     other_copied = 0
     if args.other_mode == "copy":
         other_copied = _copy_other_files(
             input_dir,
             list(output_dirs.values()),
-            mp4s,
+            (mp4s if mp4s is not None else mp4s_for_copy),
             overwrite=args.overwrite,
         )
 
@@ -929,7 +1020,7 @@ def main() -> None:
         "video_backend": str(args.video_backend),
         "video_nvenc_preset": args.video_nvenc_preset,
         "video_nvenc_bitrate": args.video_nvenc_bitrate,
-        "files_found": len(mp4s),
+        "files_found": int(total_known or 0),
         "files_processed": len(reports),
         "files_skipped": files_skipped,
         "outputs_per_preset": outputs_per_preset,

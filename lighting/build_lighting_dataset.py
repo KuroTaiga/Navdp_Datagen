@@ -13,7 +13,7 @@ from typing import Callable
 
 import imageio.v2 as imageio
 import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BASE_DIR))
@@ -45,6 +45,26 @@ def _collect_mp4s(
             else:
                 logger(message)
     return sorted(matches)
+
+
+def _iter_mp4s(
+    root: Path,
+    pattern: str,
+    *,
+    progress_every: int = 0,
+    logger: Callable[[str], None] | None = None,
+):
+    start = time.perf_counter()
+    for idx, path in enumerate(root.rglob(pattern), start=1):
+        yield path
+        if progress_every > 0 and idx % progress_every == 0:
+            elapsed = time.perf_counter() - start
+            rate = idx / elapsed if elapsed > 0 else 0.0
+            message = f"[SCAN] discovered {idx} files ({rate:.1f}/s)..."
+            if logger is None:
+                print(message, flush=True)
+            else:
+                logger(message)
 
 
 def _format_luma(value: float) -> str:
@@ -389,6 +409,12 @@ def main() -> None:
         help="Print scan progress every N matched files while enumerating MP4s (default: 0).",
     )
     parser.add_argument(
+        "--scan-mode",
+        choices=("stream", "sorted"),
+        default="stream",
+        help="MP4 discovery mode: stream starts processing while scanning; sorted matches old behavior.",
+    )
+    parser.add_argument(
         "--progress-json",
         type=Path,
         default=None,
@@ -442,29 +468,58 @@ def main() -> None:
         f"[START] input={input_dir} pattern={args.pattern} workers={args.workers} scales={args.scales}"
     )
 
+    should_compute_base = (
+        bool(args.base_only) or bool(args.compute_base_luma) or str(args.suffix_mode) == "luma"
+    )
+    scan_mode = str(args.scan_mode)
+    if scan_mode == "stream" and should_compute_base and args.mp4_list is None:
+        log_line("[WARN] scan-mode=stream requires skipping base-luma computation; falling back to sorted scan.")
+        scan_mode = "sorted"
+
+    mp4s: list[Path] | None = None
+    mp4_iter = None
+    total_known: int | None = None
     if args.mp4_list is not None:
         mp4s = _load_mp4_list(args.mp4_list, input_dir)
-    else:
-        log_line("[SCAN] collecting mp4s...")
+        if not mp4s:
+            raise SystemExit(f"No MP4s listed in {args.mp4_list}")
+        mp4_iter = iter(mp4s)
+        total_known = len(mp4s)
+        log_line(f"[SCAN] using mp4 list: {args.mp4_list} ({total_known} files)")
+    elif scan_mode == "sorted":
+        log_line("[SCAN] collecting mp4s (sorted)...")
         mp4s = _collect_mp4s(
             input_dir,
             args.pattern,
             progress_every=int(args.scan_progress_every),
             logger=log_line,
         )
-    if not mp4s:
-        raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
-    log_line(f"[SCAN] total mp4 files: {len(mp4s)}")
+        if not mp4s:
+            raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
+        total_known = len(mp4s)
+        log_line(f"[SCAN] total mp4 files: {total_known}")
+        mp4_iter = iter(mp4s)
+    else:
+        log_line("[SCAN] streaming mp4 discovery...")
+        mp4_iter = _iter_mp4s(
+            input_dir,
+            args.pattern,
+            progress_every=int(args.scan_progress_every),
+            logger=log_line,
+        )
 
     frame_step = max(1, int(args.frame_step))
     pixel_step = max(1, int(args.pixel_step))
     max_frames = int(args.max_frames) if args.max_frames is not None else None
 
     base_report = None
-    base_files = mp4s
     base_luma = args.base_luma
-    should_compute_base = args.base_only or args.compute_base_luma or args.suffix_mode == "luma"
+    base_files = mp4s or []
+    base_files_count: int | None = None
     if base_luma is None and should_compute_base:
+        if mp4s is None:
+            raise SystemExit("Base luma computation requires scan-mode=sorted or --mp4-list.")
+        base_files = mp4s
         if args.base_sample_per_scene is not None and int(args.base_sample_per_scene) > 0:
             base_files = _sample_files_per_scene(
                 mp4s,
@@ -482,9 +537,14 @@ def main() -> None:
         base_luma = base_report.get("luma_mean")
         if base_luma is None:
             raise SystemExit("Unable to compute base luma.")
+        base_files_count = len(base_files)
     else:
         log_line("[BASE] skipping base luma computation.")
     if args.base_only:
+        if mp4s is None:
+            raise SystemExit("Base-only mode requires scan-mode=sorted or --mp4-list.")
+        if base_files_count is None:
+            base_files_count = len(base_files)
         report = {
             "input": str(input_dir),
             "pattern": args.pattern,
@@ -492,8 +552,8 @@ def main() -> None:
             "base_sample_per_scene": args.base_sample_per_scene,
             "base_sample_seed": args.base_sample_seed,
             "base_max_scenes": args.base_max_scenes,
-            "base_files": len(base_files),
-            "total_files": len(mp4s),
+            "base_files": int(base_files_count),
+            "total_files": int(len(mp4s)),
         }
         log_line(json.dumps(report, indent=2))
         if args.output_json is not None:
@@ -522,9 +582,10 @@ def main() -> None:
 
     # Process MP4s once and write to each output (parallel if requested).
     scale_items = [(scale, str(out_dir)) for scale, out_dir in scale_map.items()]
-    total = len(mp4s)
+    total = total_known
     start = time.perf_counter()
     completed = 0
+    scanned = 0
     progress_every = max(1, int(args.progress_every))
     workers = max(1, int(args.workers))
 
@@ -543,18 +604,22 @@ def main() -> None:
         frame_rate = total_frames / elapsed if elapsed > 0 else 0.0
         avg_frames = total_frames / completed if completed > 0 else 0.0
         avg_outputs = total_outputs / completed if completed > 0 else 0.0
-        eta = (total - completed) / file_rate if file_rate > 0 else 0.0
+        eta = (total - completed) / file_rate if (total is not None and file_rate > 0) else 0.0
         suffix = ""
         if last_scene or last_path or last_rel or last_pid is not None:
             suffix = (
                 f" | last_scene={last_scene or '-'} last_path={last_path or '-'} "
                 f"last_rel={last_rel or '-'} worker={last_pid or '-'}"
             )
+        if total is None:
+            head = f"[MP4] {completed} done (scanned {scanned})"
+        else:
+            head = f"[MP4] {completed}/{total} files"
         log_line(
-            f"[MP4] {completed}/{total} files | {total_frames} frames "
-            f"({avg_frames:.1f}/file) | outputs {total_outputs} "
-            f"({avg_outputs:.2f}/file) | {file_rate:.2f} files/s | "
-            f"{frame_rate:.1f} fps | ETA {_format_eta(eta)} | failures {failures}{suffix}"
+            f"{head} | {total_frames} frames ({avg_frames:.1f}/file) | "
+            f"outputs {total_outputs} ({avg_outputs:.2f}/file) | "
+            f"{file_rate:.2f} files/s | {frame_rate:.1f} fps | "
+            f"ETA {_format_eta(eta) if total is not None else '-'} | failures {failures}{suffix}"
         )
         if args.progress_json is not None:
             _write_progress_json(
@@ -562,6 +627,7 @@ def main() -> None:
                 {
                     "completed": completed,
                     "total": total,
+                    "scanned": scanned,
                     "frames": total_frames,
                     "outputs": total_outputs,
                     "failures": failures,
@@ -570,7 +636,7 @@ def main() -> None:
                     "frames_per_sec": frame_rate,
                     "avg_frames_per_file": avg_frames,
                     "avg_outputs_per_file": avg_outputs,
-                    "eta_sec": eta,
+                    "eta_sec": eta if total is not None else None,
                     "last_scene": last_scene,
                     "last_path": last_path,
                     "last_rel": last_rel,
@@ -579,7 +645,9 @@ def main() -> None:
             )
 
     if workers == 1:
-        for idx, src in enumerate(mp4s, start=1):
+        last_result = None
+        for idx, src in enumerate(mp4_iter, start=1):
+            scanned = idx
             rel = src.relative_to(input_dir)
             result = _process_mp4_task(
                 str(src),
@@ -590,22 +658,55 @@ def main() -> None:
                 task_index=idx,
                 task_total=total,
             )
+            last_result = result
             completed = idx
             total_frames += int(result.get("frames", 0))
             total_outputs += int(result.get("outputs", 0))
-            if completed % progress_every == 0 or completed == total:
+            if completed % progress_every == 0:
                 emit_progress(
                     result.get("scene"),
                     result.get("path"),
                     result.get("rel"),
                     result.get("pid"),
                 )
+        if last_result is not None and completed % progress_every != 0:
+            emit_progress(
+                last_result.get("scene"),
+                last_result.get("path"),
+                last_result.get("rel"),
+                last_result.get("pid"),
+            )
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            futures = []
-            for idx, src in enumerate(mp4s, start=1):
+            inflight = set()
+            max_inflight = max(4, workers * 4)
+            last_result = None
+
+            def handle_done(done_future) -> None:
+                nonlocal completed, total_frames, total_outputs, failures, last_result
+                try:
+                    result = done_future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    failures += 1
+                    result = None
+                    log_line(f"[WARN] MP4 worker failed: {exc}")
+                completed += 1
+                if result is not None:
+                    last_result = result
+                    total_frames += int(result.get("frames", 0))
+                    total_outputs += int(result.get("outputs", 0))
+                if completed % progress_every == 0:
+                    emit_progress(
+                        result.get("scene") if result else None,
+                        result.get("path") if result else None,
+                        result.get("rel") if result else None,
+                        result.get("pid") if result else None,
+                    )
+
+            for idx, src in enumerate(mp4_iter, start=1):
+                scanned = idx
                 rel = src.relative_to(input_dir)
-                futures.append(
+                inflight.add(
                     executor.submit(
                         _process_mp4_task,
                         str(src),
@@ -617,24 +718,31 @@ def main() -> None:
                         task_total=total,
                     )
                 )
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    failures += 1
-                    result = None
-                    log_line(f"[WARN] MP4 worker failed: {exc}")
-                completed += 1
-                if result is not None:
-                    total_frames += int(result.get("frames", 0))
-                    total_outputs += int(result.get("outputs", 0))
-                if completed % progress_every == 0 or completed == total:
-                    emit_progress(
-                        result.get("scene") if result else None,
-                        result.get("path") if result else None,
-                        result.get("rel") if result else None,
-                        result.get("pid") if result else None,
-                    )
+                if len(inflight) >= max_inflight:
+                    done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        handle_done(future)
+
+            if total is None:
+                total = scanned
+            while inflight:
+                done, inflight = wait(inflight, return_when=FIRST_COMPLETED)
+                for future in done:
+                    handle_done(future)
+            if last_result is not None and completed % progress_every != 0:
+                emit_progress(
+                    last_result.get("scene"),
+                    last_result.get("path"),
+                    last_result.get("rel"),
+                    last_result.get("pid"),
+                )
+
+    if scanned == 0:
+        raise SystemExit(f"No MP4s matched {args.pattern} under {input_dir}")
+    if total is None:
+        total = scanned
+    if base_files_count is None:
+        base_files_count = scanned
 
     if args.other_mode == "copy":
         log_line("[COPY] copying non-MP4 files...")
@@ -658,8 +766,8 @@ def main() -> None:
         "base_sample_per_scene": args.base_sample_per_scene,
         "base_sample_seed": args.base_sample_seed,
         "base_max_scenes": args.base_max_scenes,
-        "base_files": len(base_files),
-        "total_files": len(mp4s),
+        "base_files": int(base_files_count or 0),
+        "total_files": int(total or 0),
         "outputs": {
             str(scale): {"dir": str(path), "suffix": suffix_map[scale]}
             for scale, path in scale_map.items()
