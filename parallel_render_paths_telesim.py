@@ -134,7 +134,7 @@ def _build_command(
     ]
     if metrics_path is not None:
         cmd.extend(["--metrics-json", str(metrics_path)])
-    if minimal_frames is not None:
+    if minimal_frames is not None and minimal_frames > 0:
         cmd.extend(["--minimal-frames", str(minimal_frames)])
     if exclude_detailed is not None:
         cmd.append("--exclude-detailed-labels" if exclude_detailed else "--no-exclude-detailed-labels")
@@ -378,7 +378,12 @@ def main() -> int:
     parser.add_argument("--progress-json", type=Path, default=None)
     parser.add_argument("--status-json", type=Path, default=None)
     parser.add_argument("--error-log", type=Path, default=None)
-    parser.add_argument("--minimal-frames", type=int, default=None)
+    parser.add_argument(
+        "--minimal-frames",
+        type=int,
+        default=None,
+        help="If >0, truncate each rendered path to the first N frames (0/omit for full length).",
+    )
     parser.add_argument("--exclude-detailed-labels", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--max-labels", type=int, default=None)
     parser.add_argument("--label-id", action="append", default=None)

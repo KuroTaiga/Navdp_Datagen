@@ -28,7 +28,9 @@ PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/CHINGMU_0800_follow_metric
 PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_CHINGMU_follow_telesim.json}
 ERROR_LOG=${ERROR_LOG:-./CHINGMU_0800_follow_telesim.log}
 WORKERS=${WORKERS:-24}
-MINIMAL_FRAMES=${MINIMAL_FRAMES:-38}
+# NOTE: TeleSim's `--minimal-frames` currently *truncates* each path to the first N frames.
+# Set to 0 to disable truncation and render the full path length.
+MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}

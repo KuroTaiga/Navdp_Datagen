@@ -1169,7 +1169,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--video-fps", type=int, default=DEFAULT_VIDEO_FPS)
     parser.add_argument("--rgb-frames", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--save-camera-metadata", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--minimal-frames", type=int, default=None)
+    parser.add_argument(
+        "--minimal-frames",
+        type=int,
+        default=None,
+        help="If >0, truncate the render to the first N frames (0/omit for full length).",
+    )
     parser.add_argument("--view-mode", default="forward")
     parser.add_argument("--verbose", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
