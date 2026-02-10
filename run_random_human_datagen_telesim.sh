@@ -21,13 +21,13 @@ SEED=${SEED:-1}
 SCENE_ID=${SCENE_ID:-}
 SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
-OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow_flaw}
+OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/CHINGMU_0800_follow_1.json}
 STATUS_JSON=${STATUS_JSON:-./analysis/CHINGMU_0800_follow_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/CHINGMU_0800_follow_metrics_telesim}
 PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_CHINGMU_follow_telesim.json}
 ERROR_LOG=${ERROR_LOG:-./CHINGMU_0800_follow_telesim.log}
-WORKERS=${WORKERS:-24}
+WORKERS=${WORKERS:-25}
 # NOTE: TeleSim's `--minimal-frames` currently *truncates* each path to the first N frames.
 # Set to 0 to disable truncation and render the full path length.
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
@@ -36,7 +36,7 @@ ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
 ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_CHINGMU.json}
 RESUME_LOG_PATH=${RESUME_LOG_PATH:-}
-RESUME_MODE=${RESUME_MODE:-false}
+RESUME_MODE=${RESUME_MODE:-true}
 RETRY_CUDA_OOM=${RETRY_CUDA_OOM:-true}
 CUDA_OOM_RETRY_DELAY=${CUDA_OOM_RETRY_DELAY:-10}
 CUDA_OOM_MAX_RETRIES=${CUDA_OOM_MAX_RETRIES:--1}
