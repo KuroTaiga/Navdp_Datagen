@@ -3,7 +3,7 @@
 Quick smoke test for the TeleSim "following" pipeline.
 
 Default behavior (as requested):
-- sample 30 different scenes at random (seed=1)
+- sample 30 different scenes at random (seed=42)
 - pick 1 path per scene at random
 - run the TeleSim dispatcher on that small manifest
 - record:
@@ -237,12 +237,17 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Quick TeleSim following pipeline smoke test.")
     ap.add_argument("--tasks-dir", type=Path, default=REPO_ROOT / "data" / "CHINGMU_75_rescaled_0800_42_iter1")
     ap.add_argument("--scenes-dir", type=Path, default=REPO_ROOT / "data" / "CHINGMU_scenes_rescaled")
-    ap.add_argument("--output-dir", type=Path, default=REPO_ROOT / "navdata" / "following_quick_random30_seed1")
+    ap.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Where to write outputs (default: navdata/following_quick_random<N>_seed<S>).",
+    )
 
     ap.add_argument("--scene-prefix", type=str, default="", help="Optional prefix to filter scenes (default: all).")
     ap.add_argument("--num-scenes", type=int, default=30, help="How many scenes to sample (default: 30).")
     ap.add_argument("--paths-per-scene", type=int, default=1, help="How many paths per scene (default: 1).")
-    ap.add_argument("--seed", type=int, default=1, help="RNG seed for sampling (default: 1).")
+    ap.add_argument("--seed", type=int, default=42, help="RNG seed for sampling (default: 42).")
 
     ap.add_argument("--workers", type=int, default=6, help="Workers passed to the TeleSim dispatcher (default: 6).")
     ap.add_argument("--conda-env", type=str, default=os.environ.get("CONDA_ENV", "cuda121"))
@@ -276,8 +281,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--auto-generate-source-manifest",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="If no matching source manifest is found, generate one via scripts/generate_assignment_manifest.sh (default: off).",
+        default=True,
+        help="If no matching source manifest is found, generate one via scripts/generate_assignment_manifest.sh (default: on).",
     )
     ap.add_argument(
         "--actor-root",
@@ -340,6 +345,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = _parse_args()
+    if args.output_dir is None:
+        args.output_dir = (
+            REPO_ROOT
+            / "navdata"
+            / f"following_quick_random{int(args.num_scenes)}_seed{int(args.seed)}"
+        )
     if args.num_scenes <= 0:
         raise SystemExit("--num-scenes must be > 0")
     if args.paths_per_scene <= 0:

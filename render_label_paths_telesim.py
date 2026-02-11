@@ -1137,7 +1137,7 @@ def render_label_with_actor(
         )
 
     def _render_frames(writer=None):
-        nonlocal render_time, frames_rendered, combined_model, combined_actor_size
+        nonlocal render_time, encode_time, frames_rendered, combined_model, combined_actor_size
         for idx, ((pose, _), transform, actor_idx) in enumerate(
             zip(poses, actor_transforms, actor_indices)
         ):
