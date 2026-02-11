@@ -259,6 +259,18 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Exclude *_detailed.json (default: on).",
     )
+    ap.add_argument(
+        "--video-backend",
+        default="nvenc",
+        choices=["cpu", "nvenc", "gpu"],
+        help="Video backend: cpu (libx264), nvenc (ffmpeg h264_nvenc), gpu (PyNvVideoCodec/pynvcodec).",
+    )
+    ap.add_argument(
+        "--ffmpeg-bin",
+        type=Path,
+        default=None,
+        help="Optional ffmpeg path to export as IMAGEIO_FFMPEG_EXE (recommended for nvenc).",
+    )
 
     ap.add_argument("--source-manifest", type=Path, default=None, help="Existing large assignment manifest to trim.")
     ap.add_argument(
@@ -410,6 +422,22 @@ def main() -> int:
         raise SystemExit(f"[ERROR] dispatcher not found: {dispatcher}")
     if not render_script.is_file():
         raise SystemExit(f"[ERROR] render script not found: {render_script}")
+    if str(args.video_backend).lower() == "gpu":
+        check_cmd: list[str] = []
+        if args.use_conda_run:
+            check_cmd.extend(
+                ["conda", "run", "--no-capture-output", "-n", str(args.conda_env), "python"]
+            )
+        else:
+            check_cmd.append("python3")
+        check_cmd.extend(["-c", "import PyNvVideoCodec as nvc; print(nvc.__name__)"])
+        try:
+            subprocess.check_output(check_cmd, text=True, stderr=subprocess.STDOUT)
+        except Exception as exc:
+            raise SystemExit(
+                "[ERROR] --video-backend gpu requires PyNvVideoCodec (pynvcodec) to be importable in the runtime env. "
+                f"Check failed: {exc}"
+            ) from exc
 
     cmd: list[str] = []
     if args.use_conda_run:
@@ -457,6 +485,8 @@ def main() -> int:
         "0.3",
         "--no-show-BEV",
         "--video",
+        "--video-backend",
+        str(args.video_backend),
         "--no-rgb-frames",
         "--no-save-depth-maps",
         "--save-camera-metadata",
@@ -517,8 +547,30 @@ def main() -> int:
                     pid_samples_mb.setdefault(pid, []).append(int(mem_mb))
             time.sleep(max(0.05, float(args.monitor_interval_sec)))
 
+    runner_env = os.environ.copy()
+    if args.ffmpeg_bin is not None:
+        runner_env["IMAGEIO_FFMPEG_EXE"] = str(args.ffmpeg_bin)
+    elif args.use_conda_run and str(args.video_backend).lower() == "nvenc":
+        try:
+            ffmpeg_path = subprocess.check_output(
+                ["conda", "run", "--no-capture-output", "-n", str(args.conda_env), "which", "ffmpeg"],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        except Exception:
+            ffmpeg_path = ""
+        if ffmpeg_path:
+            runner_env["IMAGEIO_FFMPEG_EXE"] = ffmpeg_path
+
     print(f"[RUN] {' '.join(cmd)}", flush=True)
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        env=runner_env,
+    )
     assert proc.stdout is not None
 
     sampler_thread = threading.Thread(target=_sampler, name="vram-sampler", daemon=True)

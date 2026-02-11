@@ -144,6 +144,18 @@ REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
+
+# Prefer the ffmpeg inside CONDA_ENV for NVENC, since the caller shell may be in a different env.
+if [ "$PIPELINE_MODE" = "gpu" ] && [ -z "${FFMPEG_BIN:-}" ] && command -v conda >/dev/null 2>&1; then
+  PATH_FFMPEG=$(command -v ffmpeg 2>/dev/null || true)
+  if [ -z "${IMAGEIO_FFMPEG_EXE:-}" ] || [ "${IMAGEIO_FFMPEG_EXE}" = "${PATH_FFMPEG}" ]; then
+    FFMPEG_IN_ENV=$(conda run --no-capture-output -n "$CONDA_ENV" which ffmpeg 2>/dev/null || true)
+    if [ -n "${FFMPEG_IN_ENV}" ]; then
+      export IMAGEIO_FFMPEG_EXE="${FFMPEG_IN_ENV}"
+    fi
+  fi
+fi
+
 # Optional NPC placement/debug (applies to FPV or following data). Leave values empty to skip.
 NPC_ENABLE=${NPC_ENABLE:-false}                            # true/false to append NPC args
 NPC_DENSITY_COVERAGE=${NPC_DENSITY_COVERAGE:-0.3}          # e.g., 0.2 angular coverage
@@ -185,7 +197,7 @@ if [ "$PIPELINE_MODE" = "legacy" ]; then
   : "${STRICT_GPU_BACKENDS:=false}"
 else
   : "${PLY_TRANSFORM_BACKEND:=gpu}"
-  : "${VIDEO_BACKEND:=nvenc}"
+  : "${VIDEO_BACKEND:=nvenc}" # cpu=libx264, nvenc=ffmpeg h264_nvenc, gpu=PyNvVideoCodec (pynvcodec)
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
   : "${STRICT_GPU_BACKENDS:=true}"
 fi

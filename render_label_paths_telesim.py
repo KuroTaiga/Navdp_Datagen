@@ -63,12 +63,14 @@ from utils.telesim_actor_utils import (  # type: ignore
     load_actor_sequence,
     actor_data_to_tensors,
 )
+from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 
 LOGGER = logging.getLogger("render_label_paths_telesim")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
 STABILIZE_WINDOW = 5
 FORWARD_SMOOTH_BLEND = 0.35
+GPU_VIDEO_FORMAT = "ABGR"
 EPS = 1e-6
 STATUS_NOT_RUN = 0
 STATUS_DONE = 1
@@ -705,7 +707,46 @@ def _render_custom_gaussians(
     renderer: GaussianRendererBackend,
     pose: Pose,
     gaussians,
+    *,
+    need_depth_inv: bool = True,
 ) -> tuple[np.ndarray, np.ndarray | None, object]:
+    return _render_custom_gaussians_ex(
+        renderer,
+        pose,
+        gaussians,
+        return_render_tensor=False,
+        need_depth_inv=need_depth_inv,
+    )
+
+
+def _render_tensor_to_gpu_format(render_tensor: torch.Tensor, *, gpu_format: str) -> torch.Tensor:
+    render_uint8_gpu = (render_tensor.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    render_uint8_gpu = render_uint8_gpu.permute(1, 2, 0)
+    alpha = torch.full(
+        (render_uint8_gpu.shape[0], render_uint8_gpu.shape[1], 1),
+        255,
+        device=render_uint8_gpu.device,
+        dtype=torch.uint8,
+    )
+    fmt = gpu_format.upper()
+    if fmt == "ABGR":
+        # PyNvVideoCodec expects little-endian ABGR; RGBA byte order matches that.
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    if fmt == "ARGB":
+        # PyNvVideoCodec expects little-endian ARGB; BGRA byte order matches that.
+        render_uint8_gpu = render_uint8_gpu[..., [2, 1, 0]]
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    raise ValueError(f"Unsupported GPU video format: {gpu_format}")
+
+
+def _render_custom_gaussians_ex(
+    renderer: GaussianRendererBackend,
+    pose: Pose,
+    gaussians,
+    *,
+    return_render_tensor: bool,
+    need_depth_inv: bool,
+) -> tuple[np.ndarray | torch.Tensor, np.ndarray | None, object]:
     camera = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
     with torch.no_grad():
         result = render_gaussians(
@@ -717,11 +758,14 @@ def _render_custom_gaussians(
             separate_sh=renderer._separate_sh,  # pylint: disable=protected-access
             use_trained_exp=renderer._use_trained_exposure,  # pylint: disable=protected-access
         )
-    image = result["render"].permute(1, 2, 0).detach().cpu().numpy()
-    image = np.clip(image, 0.0, 1.0)
+    render_tensor = result["render"]
     depth_inv = None
-    if result.get("depth") is not None:
+    if need_depth_inv and result.get("depth") is not None:
         depth_inv = result["depth"].detach().cpu().numpy()
+    if return_render_tensor:
+        return render_tensor, depth_inv, camera
+    image = render_tensor.permute(1, 2, 0).detach().cpu().numpy()
+    image = np.clip(image, 0.0, 1.0)
     return (image * 255.0).astype(np.uint8), depth_inv, camera
 
 
@@ -819,12 +863,7 @@ def _write_video_frames(
     fps: int,
     encode_time_accum: list[float],
 ) -> None:
-    video_path.parent.mkdir(parents=True, exist_ok=True)
-    with imageio.get_writer(str(video_path), fps=fps) as writer:
-        for frame in frames:
-            start = time.monotonic()
-            writer.append_data(frame)
-            encode_time_accum[0] += time.monotonic() - start
+    raise RuntimeError("_write_video_frames is deprecated; use make_video_writer directly.")
 
 
 def _safe_mkdir(path: Path) -> None:
@@ -872,27 +911,68 @@ def render_label(
     cl_light_world = getattr(args, "cl_light_world", None)
     light_seed_offset = getattr(args, "light_seed_offset", 0)
 
-    def _frame_iter():
-        nonlocal render_time, frames_rendered
+    video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
+    use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
+    need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
+    if use_gpu_video and (
+        (light_config is not None and light_config.enabled())
+        or (cl_config is not None and cl_config.active())
+    ):
+        raise RuntimeError(
+            "video-backend=gpu does not support light filters / camera light shading; "
+            "use --video-backend nvenc|cpu or disable --light-mode / --cl-enable."
+        )
+
+    def _render_frames(writer=None):
+        nonlocal render_time, encode_time, frames_rendered
         for idx, (pose, _) in enumerate(poses):
             start = time.monotonic()
-            rgb, depth_inv, camera = _render_custom_gaussians(renderer, pose, renderer._gaussians)  # pylint: disable=protected-access
+            if use_gpu_video:
+                render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
+                    renderer,
+                    pose,
+                    renderer._gaussians,  # pylint: disable=protected-access
+                    return_render_tensor=True,
+                    need_depth_inv=need_depth_inv,
+                )
+                rgb = None
+                if args.rgb_frames:
+                    rgb = (
+                        (render_tensor.clamp(0.0, 1.0) * 255.0)
+                        .to(torch.uint8)
+                        .permute(1, 2, 0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+            else:
+                rgb, depth_inv, camera = _render_custom_gaussians(
+                    renderer,
+                    pose,
+                    renderer._gaussians,  # pylint: disable=protected-access
+                    need_depth_inv=need_depth_inv,
+                )
             render_time += time.monotonic() - start
-            rgb = _apply_light_filter_if_enabled(
-                rgb,
-                light_config,
-                frame_index=idx,
-                seed_offset=light_seed_offset,
-            )
-            rgb = _apply_camera_light_if_enabled(
-                rgb,
-                depth_inv,
-                camera,
-                cl_config,
-                cl_light_world=cl_light_world,
-            )
+            if not use_gpu_video:
+                rgb = _apply_light_filter_if_enabled(
+                    rgb,
+                    light_config,
+                    frame_index=idx,
+                    seed_offset=light_seed_offset,
+                )
+                rgb = _apply_camera_light_if_enabled(
+                    rgb,
+                    depth_inv,
+                    camera,
+                    cl_config,
+                    cl_light_world=cl_light_world,
+                )
             if args.rotate_180:
-                rgb = np.flipud(np.fliplr(rgb))
+                if use_gpu_video:
+                    if rgb is not None:
+                        rgb = np.flipud(np.fliplr(rgb))
+                else:
+                    rgb = np.flipud(np.fliplr(rgb))
             frames_rendered += 1
             if args.save_camera_metadata:
                 cam_payload = _serialize_camera(
@@ -917,21 +997,38 @@ def render_label(
                 )
             if args.rgb_frames:
                 frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
+                if rgb is None:
+                    raise RuntimeError("rgb frame requested but was not produced.")
                 imageio.imwrite(frame_path, rgb)
-            yield rgb
+
+            if args.video and writer is not None:
+                start = time.monotonic()
+                if use_gpu_video:
+                    frame_gpu = _render_tensor_to_gpu_format(
+                        render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                    )
+                    if args.rotate_180:
+                        frame_gpu = frame_gpu.flip((0, 1))
+                    writer.append_data(frame_gpu.contiguous())
+                else:
+                    writer.append_data(rgb)
+                encode_time += time.monotonic() - start
 
     if args.video:
-        encode_holder = [0.0]
-        _write_video_frames(
-            video_path=video_path,
-            frames=_frame_iter(),
+        w, h = int(args.resolution[0]), int(args.resolution[1])
+        with make_video_writer(
+            video_path,
             fps=args.video_fps,
-            encode_time_accum=encode_holder,
-        )
-        encode_time = encode_holder[0]
+            backend=video_backend,
+            nvenc_preset=args.video_nvenc_preset,
+            nvenc_bitrate=args.video_nvenc_bitrate,
+            width=w,
+            height=h,
+            gpu_format=GPU_VIDEO_FORMAT,
+        ) as writer:
+            _render_frames(writer=writer)
     else:
-        for _ in _frame_iter():
-            pass
+        _render_frames(writer=None)
 
     duration = render_time + encode_time
     return {
@@ -1027,7 +1124,19 @@ def render_label_with_actor(
     cl_light_world = getattr(args, "cl_light_world", None)
     light_seed_offset = getattr(args, "light_seed_offset", 0)
 
-    def _frame_iter():
+    video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
+    use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
+    need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
+    if use_gpu_video and (
+        (light_config is not None and light_config.enabled())
+        or (cl_config is not None and cl_config.active())
+    ):
+        raise RuntimeError(
+            "video-backend=gpu does not support light filters / camera light shading; "
+            "use --video-backend nvenc|cpu or disable --light-mode / --cl-enable."
+        )
+
+    def _render_frames(writer=None):
         nonlocal render_time, frames_rendered, combined_model, combined_actor_size
         for idx, ((pose, _), transform, actor_idx) in enumerate(
             zip(poses, actor_transforms, actor_indices)
@@ -1053,23 +1162,52 @@ def render_label_with_actor(
                 combined_model.update_actor(actor_render)
 
             start = time.monotonic()
-            rgb, depth_inv, camera = _render_custom_gaussians(renderer, pose, combined_model)
+            if use_gpu_video:
+                render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
+                    renderer,
+                    pose,
+                    combined_model,
+                    return_render_tensor=True,
+                    need_depth_inv=need_depth_inv,
+                )
+                rgb = None
+                if args.rgb_frames:
+                    rgb = (
+                        (render_tensor.clamp(0.0, 1.0) * 255.0)
+                        .to(torch.uint8)
+                        .permute(1, 2, 0)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+            else:
+                rgb, depth_inv, camera = _render_custom_gaussians(
+                    renderer,
+                    pose,
+                    combined_model,
+                    need_depth_inv=need_depth_inv,
+                )
             render_time += time.monotonic() - start
-            rgb = _apply_light_filter_if_enabled(
-                rgb,
-                light_config,
-                frame_index=idx,
-                seed_offset=light_seed_offset,
-            )
-            rgb = _apply_camera_light_if_enabled(
-                rgb,
-                depth_inv,
-                camera,
-                cl_config,
-                cl_light_world=cl_light_world,
-            )
+            if not use_gpu_video:
+                rgb = _apply_light_filter_if_enabled(
+                    rgb,
+                    light_config,
+                    frame_index=idx,
+                    seed_offset=light_seed_offset,
+                )
+                rgb = _apply_camera_light_if_enabled(
+                    rgb,
+                    depth_inv,
+                    camera,
+                    cl_config,
+                    cl_light_world=cl_light_world,
+                )
             if args.rotate_180:
-                rgb = np.flipud(np.fliplr(rgb))
+                if use_gpu_video:
+                    if rgb is not None:
+                        rgb = np.flipud(np.fliplr(rgb))
+                else:
+                    rgb = np.flipud(np.fliplr(rgb))
             frames_rendered += 1
             if args.save_camera_metadata:
                 cam_payload = _serialize_camera(
@@ -1094,21 +1232,38 @@ def render_label_with_actor(
                 )
             if args.rgb_frames:
                 frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
+                if rgb is None:
+                    raise RuntimeError("rgb frame requested but was not produced.")
                 imageio.imwrite(frame_path, rgb)
-            yield rgb
+
+            if args.video and writer is not None:
+                start = time.monotonic()
+                if use_gpu_video:
+                    frame_gpu = _render_tensor_to_gpu_format(
+                        render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                    )
+                    if args.rotate_180:
+                        frame_gpu = frame_gpu.flip((0, 1))
+                    writer.append_data(frame_gpu.contiguous())
+                else:
+                    writer.append_data(rgb)
+                encode_time += time.monotonic() - start
 
     if args.video:
-        encode_holder = [0.0]
-        _write_video_frames(
-            video_path=video_path,
-            frames=_frame_iter(),
+        w, h = int(args.resolution[0]), int(args.resolution[1])
+        with make_video_writer(
+            video_path,
             fps=args.video_fps,
-            encode_time_accum=encode_holder,
-        )
-        encode_time = encode_holder[0]
+            backend=video_backend,
+            nvenc_preset=args.video_nvenc_preset,
+            nvenc_bitrate=args.video_nvenc_bitrate,
+            width=w,
+            height=h,
+            gpu_format=GPU_VIDEO_FORMAT,
+        ) as writer:
+            _render_frames(writer=writer)
     else:
-        for _ in _frame_iter():
-            pass
+        _render_frames(writer=None)
 
     duration = render_time + encode_time
     return {
@@ -1189,7 +1344,12 @@ def parse_args() -> argparse.Namespace:
         default=5.0,
         help="How often to refresh disk usage stats for per-path progress (default: 5s).",
     )
-    parser.add_argument("--video-backend", default=None)
+    parser.add_argument(
+        "--video-backend",
+        choices=[backend.value for backend in VideoWriterBackend],
+        default=VideoWriterBackend.NVENC.value,
+        help="Video encoder backend: cpu (libx264), nvenc (ffmpeg h264_nvenc), gpu (PyNvVideoCodec).",
+    )
     parser.add_argument("--video-nvenc-preset", default=None)
     parser.add_argument("--video-nvenc-bitrate", default=None)
     parser.add_argument("--gpu-only", action=argparse.BooleanOptionalAction, default=False)

@@ -139,6 +139,17 @@ WORKERS=${WORKERS:-24}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 FPV_FOLLOW_DISTANCE=${FPV_FOLLOW_DISTANCE:-0}
 
+# Prefer the ffmpeg inside CONDA_ENV for NVENC, since the caller shell may be in a different env.
+if [ "$PIPELINE_MODE" = "gpu" ] && [ -z "${FFMPEG_BIN:-}" ] && command -v conda >/dev/null 2>&1; then
+  PATH_FFMPEG=$(command -v ffmpeg 2>/dev/null || true)
+  if [ -z "${IMAGEIO_FFMPEG_EXE:-}" ] || [ "${IMAGEIO_FFMPEG_EXE}" = "${PATH_FFMPEG}" ]; then
+    FFMPEG_IN_ENV=$(conda run --no-capture-output -n "$CONDA_ENV" which ffmpeg 2>/dev/null || true)
+    if [ -n "${FFMPEG_IN_ENV}" ]; then
+      export IMAGEIO_FFMPEG_EXE="${FFMPEG_IN_ENV}"
+    fi
+  fi
+fi
+
 # Robot camera stats
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3} #1.3m
 
@@ -184,11 +195,11 @@ SH_DEGREE=${SH_DEGREE:--1}
 GPU_ONLY_FLAG="--gpu-only"
 if [ "$PIPELINE_MODE" = "legacy" ]; then
   : "${PLY_TRANSFORM_BACKEND:=gpu}" # trying GPU to test if there is some performance imporvements
-  : "${VIDEO_BACKEND:=cpu}"
+  : "${VIDEO_BACKEND:=cpu}" # cpu=libx264, nvenc=ffmpeg h264_nvenc, gpu=PyNvVideoCodec (pynvcodec)
   : "${NPC_PLACEMENT_BACKEND:=cpu}" #was set to GPU but the imapct is small so CPU is fine
 else
   : "${PLY_TRANSFORM_BACKEND:=gpu}"
-  : "${VIDEO_BACKEND:=gpu}"
+  : "${VIDEO_BACKEND:=nvenc}" # cpu=libx264, nvenc=ffmpeg h264_nvenc, gpu=PyNvVideoCodec (pynvcodec)
   : "${NPC_PLACEMENT_BACKEND:=gpu}"
 fi
 
@@ -233,8 +244,8 @@ CL_SHADOW_PCF=${CL_SHADOW_PCF:-0}
 
 render_extra_args="--overwrite --stabilize ${GPU_ONLY_FLAG} --view-mode forward --height-offset ${HEIGHT_OFFSET}"
 # render_extra_args+=" --navdp-ply-per-scene  --no-validate-path-bounds"
-# render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
-# render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
+render_extra_args+=" --ply-transform-backend ${PLY_TRANSFORM_BACKEND}"
+render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 if storage_bool_true "$ENABLE_BEV_IMAGES"; then
   render_extra_args+=' --show-BEV'
 else

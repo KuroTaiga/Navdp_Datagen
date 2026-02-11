@@ -50,6 +50,8 @@ ENABLE_FOLLOW_METADATA=${ENABLE_FOLLOW_METADATA:-true}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
 VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
 VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
+VIDEO_BACKEND=${VIDEO_BACKEND:-nvenc} # cpu=libx264, nvenc=ffmpeg h264_nvenc, gpu=PyNvVideoCodec (pynvcodec)
+FFMPEG_BIN=${FFMPEG_BIN:-}
 ANTIALIASING=${ANTIALIASING:-false}
 MAX_LABELS=${MAX_LABELS:-}
 SH_DEGREE=${SH_DEGREE:--1}
@@ -91,6 +93,7 @@ else
 fi
 if [ "${ENABLE_VIDEO_OUTPUT}" = "true" ]; then
   render_extra_args+=' --video'
+  render_extra_args+=" --video-backend ${VIDEO_BACKEND}"
 else
   render_extra_args+=' --no-video'
 fi
@@ -136,6 +139,29 @@ if [ "${USE_CONDA_RUN}" = "auto" ]; then
   else
     USE_CONDA_RUN="true"
   fi
+fi
+
+if [ "${ENABLE_VIDEO_OUTPUT}" = "true" ]; then
+  if [ -n "${FFMPEG_BIN}" ]; then
+    export IMAGEIO_FFMPEG_EXE="${FFMPEG_BIN}"
+  elif [ "${USE_CONDA_RUN}" = "true" ]; then
+    FFMPEG_IN_ENV=$(conda run --no-capture-output -n "${CONDA_ENV}" which ffmpeg 2>/dev/null || true)
+    if [ -n "${FFMPEG_IN_ENV}" ]; then
+      export IMAGEIO_FFMPEG_EXE="${FFMPEG_IN_ENV}"
+    fi
+  elif command -v ffmpeg >/dev/null 2>&1; then
+    export IMAGEIO_FFMPEG_EXE
+    IMAGEIO_FFMPEG_EXE=$(command -v ffmpeg)
+  fi
+fi
+
+if [ "${VIDEO_BACKEND}" = "gpu" ]; then
+  : "${GPU_VIDEO_DISABLE_BFRAMES:=1}"
+  : "${GPU_VIDEO_CLONE:=1}"
+  : "${GPU_VIDEO_SYNC:=both}"
+  : "${GPU_VIDEO_RETAIN_FRAMES:=4}"
+  export GPU_VIDEO_DISABLE_BFRAMES GPU_VIDEO_CLONE GPU_VIDEO_SYNC GPU_VIDEO_RETAIN_FRAMES
+  echo "[VIDEO] GPU backend: bframes=${GPU_VIDEO_DISABLE_BFRAMES} clone=${GPU_VIDEO_CLONE} sync=${GPU_VIDEO_SYNC} retain=${GPU_VIDEO_RETAIN_FRAMES}" >&2
 fi
 
 if [ "${USE_CONDA_RUN}" = "true" ]; then
