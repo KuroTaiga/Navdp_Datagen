@@ -18,6 +18,7 @@ import sys
 import tempfile
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -814,13 +815,26 @@ def _serialize_camera(
 
 def _write_camera_metadata(
     *,
-    frames_dir: Path,
-    frame_prefix: str,
-    frame_idx: int,
-    payload: dict,
-) -> None:
-    cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
-    cam_json_path.write_text(json.dumps(payload, indent=2))
+    scene_dir: Path,
+    label_id: str,
+    camera_frames: Sequence[dict],
+) -> Path:
+    """
+    Persist camera metadata JSON for one label path.
+
+    New format (preferred): one file per path at the same level as the MP4:
+      <output_dir>/<scene>/<label>_camera.json
+    """
+    out_path = scene_dir / f"{label_id}_camera.json"
+    payload = {
+        "dataset_root": str(scene_dir.parent),
+        "scene": str(scene_dir.name),
+        "label": str(label_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "frames": list(camera_frames),
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 
 def _quantize_depth(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
@@ -895,7 +909,7 @@ def render_label(
     scene_dir = output_dir / args.scene
     _safe_mkdir(scene_dir)
     frames_dir = scene_dir / label_id
-    if args.save_camera_metadata:
+    if args.save_depth_maps or args.rgb_frames:
         _safe_mkdir(frames_dir)
 
     video_path = scene_dir / f"{label_id}.mp4"
@@ -914,6 +928,7 @@ def render_label(
     video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
     use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
     need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
+    camera_frames: list[dict] = []
     if use_gpu_video and (
         (light_config is not None and light_config.enabled())
         or (cl_config is not None and cl_config.active())
@@ -981,12 +996,7 @@ def render_label(
                     frame_size=tuple(args.resolution),
                     fov_y_rad=fov_y_rad,
                 )
-                _write_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=idx,
-                    payload=cam_payload,
-                )
+                camera_frames.append({"frame": int(idx), **cam_payload})
             if args.save_depth_maps and depth_inv is not None:
                 _save_depth_map(
                     depth_inv=depth_inv,
@@ -1029,6 +1039,9 @@ def render_label(
             _render_frames(writer=writer)
     else:
         _render_frames(writer=None)
+
+    if args.save_camera_metadata:
+        _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
 
     duration = render_time + encode_time
     return {
@@ -1103,7 +1116,7 @@ def render_label_with_actor(
     scene_dir = output_dir / args.scene
     _safe_mkdir(scene_dir)
     frames_dir = scene_dir / label_id
-    if args.save_camera_metadata:
+    if args.save_depth_maps or args.rgb_frames:
         _safe_mkdir(frames_dir)
 
     video_path = scene_dir / f"{label_id}.mp4"
@@ -1127,6 +1140,7 @@ def render_label_with_actor(
     video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
     use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
     need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
+    camera_frames: list[dict] = []
     if use_gpu_video and (
         (light_config is not None and light_config.enabled())
         or (cl_config is not None and cl_config.active())
@@ -1216,12 +1230,7 @@ def render_label_with_actor(
                     frame_size=tuple(args.resolution),
                     fov_y_rad=fov_y_rad,
                 )
-                _write_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=idx,
-                    payload=cam_payload,
-                )
+                camera_frames.append({"frame": int(idx), **cam_payload})
             if args.save_depth_maps and depth_inv is not None:
                 _save_depth_map(
                     depth_inv=depth_inv,
@@ -1264,6 +1273,9 @@ def render_label_with_actor(
             _render_frames(writer=writer)
     else:
         _render_frames(writer=None)
+
+    if args.save_camera_metadata:
+        _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
 
     duration = render_time + encode_time
     return {

@@ -62,11 +62,6 @@ def _extract_pose_from_payload(payload: dict) -> tuple[np.ndarray, np.ndarray] |
     return center, rot
 
 
-def _extract_pose(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
-    payload = _load_camera_payload(path)
-    return _extract_pose_from_payload(payload)
-
-
 def _extract_extrinsics(payload: dict) -> dict:
     return {
         "camera_center_world": payload.get("camera_center_world"),
@@ -93,13 +88,35 @@ def _position_error(cand_center: np.ndarray, gold_center: np.ndarray) -> float:
     return float(np.linalg.norm(delta))
 
 
-def _gather_frame_map(path_dir: Path) -> dict[int, Path]:
-    mapping: dict[int, Path] = {}
-    for candidate in path_dir.glob("frame_*_camera.json"):
-        idx = _parse_frame_index(candidate)
-        if idx is None:
-            continue
-        mapping[idx] = candidate
+def _gather_frame_payload_map(path_source: Path) -> dict[int, dict]:
+    """
+    Return per-frame payloads for a path source.
+
+    Supported formats:
+      - New: <scene>/{label}_camera.json, with {"frames": [{"frame": i, ...camera fields...}, ...]}
+      - Legacy: <scene>/<label>/frame_XXXX_camera.json per frame
+    """
+    mapping: dict[int, dict] = {}
+    if path_source.is_file() and path_source.name.endswith("_camera.json"):
+        payload = _load_camera_payload(path_source)
+        frames = payload.get("frames") or []
+        if isinstance(frames, list):
+            for entry in frames:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    idx = int(entry.get("frame", 0))
+                except Exception:
+                    continue
+                mapping[idx] = entry
+        return mapping
+
+    if path_source.is_dir():
+        for candidate in path_source.glob("frame_*_camera.json"):
+            idx = _parse_frame_index(candidate)
+            if idx is None:
+                continue
+            mapping[idx] = _load_camera_payload(candidate)
     return mapping
 
 
@@ -115,7 +132,30 @@ def _iter_scene_dirs(root: Path, scenes: set[str] | None) -> Iterable[Path]:
             yield scene_dir
 
 
-def _iter_path_dirs(scene_dir: Path) -> Iterable[Path]:
+def _path_id_from_source(path_source: Path) -> str:
+    if path_source.is_file() and path_source.name.endswith("_camera.json"):
+        stem = path_source.stem
+        if stem.endswith("_camera"):
+            return stem[: -len("_camera")]
+        return stem
+    return path_source.name
+
+
+def _resolve_path_source(scene_dir: Path, path_id: str) -> Path | None:
+    candidate_json = scene_dir / f"{path_id}_camera.json"
+    if candidate_json.is_file():
+        return candidate_json
+    candidate_dir = scene_dir / path_id
+    if candidate_dir.is_dir():
+        return candidate_dir
+    return None
+
+
+def _iter_path_sources(scene_dir: Path) -> Iterable[Path]:
+    camera_jsons = sorted(p for p in scene_dir.glob("*_camera.json") if p.is_file())
+    if camera_jsons:
+        yield from camera_jsons
+        return
     for entry in sorted(scene_dir.iterdir()):
         if entry.is_dir():
             yield entry
@@ -162,46 +202,32 @@ def compare_roots(
             totals["paths_missing_golden"] += 1
             continue
 
-        for path_dir in _iter_path_dirs(scene_dir):
-            path_id = path_dir.name
-            golden_path = golden_scene / path_id
-            if not golden_path.is_dir():
+        for path_source in _iter_path_sources(scene_dir):
+            path_id = _path_id_from_source(path_source)
+            golden_source = _resolve_path_source(golden_scene, path_id)
+            if golden_source is None:
                 scene_entry[path_id] = {"missing_in_golden": True}
                 totals["paths_missing_golden"] += 1
                 continue
 
-            cand_map = _gather_frame_map(path_dir)
-            gold_map = _gather_frame_map(golden_path)
-            if not cand_map:
+            cand_payloads = _gather_frame_payload_map(path_source)
+            gold_payloads = _gather_frame_payload_map(golden_source)
+            if not cand_payloads:
                 scene_entry[path_id] = {"missing_in_candidate": True, "frames_compared": 0}
                 totals["paths_missing_candidate"] += 1
                 continue
-            if not gold_map:
+            if not gold_payloads:
                 scene_entry[path_id] = {"missing_in_golden": True, "frames_compared": 0}
                 totals["paths_missing_golden"] += 1
                 continue
 
-            shared_frames = sorted(set(cand_map) & set(gold_map))
+            shared_frames = sorted(set(cand_payloads) & set(gold_payloads))
             pos_errors: list[float] = []
             rot_errors: list[float] = []
             worst_entries: list[tuple[float, int, float, float]] = []
             frames_detail: list[dict] = []
-            cand_payloads: dict[int, dict] = {}
-            gold_payloads: dict[int, dict] = {}
-            if include_frames:
-                cand_payloads = {idx: _load_camera_payload(path) for idx, path in cand_map.items()}
-                gold_payloads = {idx: _load_camera_payload(path) for idx, path in gold_map.items()}
-                cand_pose = {
-                    idx: _extract_pose_from_payload(payload)
-                    for idx, payload in cand_payloads.items()
-                }
-                gold_pose = {
-                    idx: _extract_pose_from_payload(payload)
-                    for idx, payload in gold_payloads.items()
-                }
-            else:
-                cand_pose = {idx: _extract_pose(path) for idx, path in cand_map.items()}
-                gold_pose = {idx: _extract_pose(path) for idx, path in gold_map.items()}
+            cand_pose = {idx: _extract_pose_from_payload(payload) for idx, payload in cand_payloads.items()}
+            gold_pose = {idx: _extract_pose_from_payload(payload) for idx, payload in gold_payloads.items()}
 
             for frame_idx in shared_frames:
                 cand_data = cand_pose.get(frame_idx)
@@ -231,14 +257,14 @@ def compare_roots(
             if frames_compared == 0:
                 empty_entry = {"frames_compared": 0}
                 if include_frames:
-                    all_frames = sorted(set(cand_map) | set(gold_map))
+                    all_frames = sorted(set(cand_payloads) | set(gold_payloads))
                     for frame_idx in all_frames:
                         status = "compared"
                         cand_payload = cand_payloads.get(frame_idx, {})
                         gold_payload = gold_payloads.get(frame_idx, {})
-                        if frame_idx not in cand_map:
+                        if frame_idx not in cand_payloads:
                             status = "candidate_missing"
-                        elif frame_idx not in gold_map:
+                        elif frame_idx not in gold_payloads:
                             status = "golden_missing"
                         frames_detail.append(
                             {

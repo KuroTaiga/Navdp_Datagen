@@ -66,6 +66,31 @@ def _load_camera_centers(camera_dir: Path) -> dict[int, tuple[float, float]]:
     return centers
 
 
+def _load_camera_centers_from_path_json(camera_json: Path) -> dict[int, tuple[float, float]]:
+    """
+    Load per-frame camera center XY from:
+      <camera_root>/<scene>/<label>_camera.json
+    """
+    centers: dict[int, tuple[float, float]] = {}
+    if not camera_json.is_file():
+        return centers
+    payload = _load_json(camera_json)
+    frames = payload.get("frames") or []
+    if not isinstance(frames, list):
+        return centers
+    for entry in frames:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            frame_id = int(entry.get("frame", 0))
+        except Exception:
+            continue
+        center = entry.get("camera_center_world")
+        if isinstance(center, list) and len(center) >= 2:
+            centers[frame_id] = (float(center[0]), float(center[1]))
+    return centers
+
+
 def _compute_dirs(
     frames: list[dict],
     camera_centers: dict[int, tuple[float, float]] | None,
@@ -344,8 +369,12 @@ def _process_input(
             effective_camera_root = Path(dataset_root)
 
     if effective_camera_root is not None and scene and label:
-        camera_dir = effective_camera_root / str(scene) / str(label)
-        camera_centers = _load_camera_centers(camera_dir)
+        legacy_dir = effective_camera_root / str(scene) / str(label)
+        if legacy_dir.is_dir():
+            camera_centers = _load_camera_centers(legacy_dir)
+        else:
+            camera_json = effective_camera_root / str(scene) / f"{str(label)}_camera.json"
+            camera_centers = _load_camera_centers_from_path_json(camera_json)
 
     dirs = _compute_dirs(frames, camera_centers)
     # Smooth heading using a 5-frame centered window (endpoint padded).
@@ -439,7 +468,8 @@ def main() -> int:
         "--camera-root",
         type=Path,
         default=None,
-        help="Root directory containing <scene>/<label>/frame_*_camera.json (default: dataset_root in actions).",
+        help="Root directory containing <scene>/{label}_camera.json (preferred) or legacy <scene>/<label>/frame_*_camera.json "
+        "(default: dataset_root in actions).",
     )
 
     # ✅ Default overwrite is False; pass --overwrite to enable.

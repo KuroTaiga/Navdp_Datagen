@@ -629,3 +629,97 @@ def write_camera_metadata_frame(
         return cam_json_path
     cam_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     return cam_json_path
+
+
+def camera_metadata_path_for_label(*, scene_dir: Path, label_id: str) -> Path:
+    return scene_dir / f"{str(label_id)}_camera.json"
+
+
+def write_camera_metadata_for_path(
+    *,
+    scene_dir: Path,
+    scene_id: str | None = None,
+    label_id: str,
+    camera_payloads: Sequence[dict[str, Any]],
+    dataset_root: Path | None = None,
+    overwrite: bool = True,
+) -> Path:
+    scene_dir.mkdir(parents=True, exist_ok=True)
+    out_path = camera_metadata_path_for_label(scene_dir=scene_dir, label_id=label_id)
+    if out_path.exists() and not overwrite:
+        return out_path
+    frames: list[dict[str, Any]] = []
+    for idx, payload in enumerate(camera_payloads):
+        row = {"frame": int(idx)}
+        row.update(payload)
+        frames.append(row)
+    out_payload: dict[str, Any] = {
+        "dataset_root": str(dataset_root) if dataset_root is not None else None,
+        "scene": str(scene_id) if scene_id is not None else None,
+        "label": str(label_id),
+        "generated_at": utc_now_iso(),
+        "frames": frames,
+    }
+    out_path.write_text(json.dumps(out_payload, indent=2), encoding="utf-8")
+    return out_path
+
+
+def write_tar_zst(
+    *,
+    out_path: Path,
+    root_dir: Path,
+    zstd_level: int = 3,
+) -> None:
+    """
+    Create a <root_dir.name>.tar.zst archive at out_path.
+
+    Uses system tar + zstd via a pipe for speed:
+      tar -cf - <root.name> | zstd -T0 -<level> -o out.tar.zst
+    """
+    import shutil
+    import subprocess
+
+    root_dir = Path(root_dir).resolve()
+    if not root_dir.exists():
+        raise FileNotFoundError(f"root_dir not found: {root_dir}")
+
+    zstd = shutil.which("zstd")
+    tar = shutil.which("tar")
+    if not zstd:
+        raise FileNotFoundError("zstd not found in PATH (required for .tar.zst).")
+    if not tar:
+        raise FileNotFoundError("tar not found in PATH (required for .tar.zst).")
+
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    parent = root_dir.parent
+    name = root_dir.name
+
+    tar_proc = subprocess.Popen(
+        [tar, "-cf", "-", name],
+        cwd=str(parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        zstd_proc = subprocess.Popen(
+            [zstd, "-T0", f"-{int(zstd_level)}", "-o", str(out_path)],
+            stdin=tar_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        assert tar_proc.stdout is not None
+        tar_proc.stdout.close()
+        z_out, z_err = zstd_proc.communicate()
+        tar_out, tar_err = tar_proc.communicate()
+    finally:
+        if tar_proc.poll() is None:
+            tar_proc.kill()
+        if "zstd_proc" in locals() and zstd_proc.poll() is None:
+            zstd_proc.kill()
+
+    if tar_proc.returncode != 0:
+        raise RuntimeError(f"tar failed (rc={tar_proc.returncode}): {tar_err.decode('utf-8', 'ignore')}")
+    if zstd_proc.returncode != 0:
+        raise RuntimeError(f"zstd failed (rc={zstd_proc.returncode}): {z_err.decode('utf-8', 'ignore')}")

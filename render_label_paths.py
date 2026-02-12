@@ -1877,18 +1877,37 @@ def _save_depth_map(
         imageio.imwrite(depth_png_path, depth_quant)
 
 
-def _save_camera_metadata(
+def _camera_metadata_path(scene_dir: Path, label_id: str) -> Path:
+    return scene_dir / f"{label_id}_camera.json"
+
+
+def _camera_frame_metadata(frame_idx: int, camera: MiniCam | OrthoMiniCam, *, orthographic: bool) -> dict:
+    payload = _serialize_camera(camera, orthographic=orthographic)
+    return {"frame": int(frame_idx), **payload}
+
+
+def _write_camera_metadata_for_path(
     *,
-    frames_dir: Path,
-    frame_prefix: str,
-    frame_idx: int,
-    camera: MiniCam | OrthoMiniCam,
-    orthographic: bool,
-) -> None:
-    """Persist camera metadata JSON for one frame."""
-    cam_json = _serialize_camera(camera, orthographic=orthographic)
-    cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
-    cam_json_path.write_text(json.dumps(cam_json, indent=2))
+    scene_dir: Path,
+    label_id: str,
+    camera_frames: list[dict],
+) -> Path:
+    """
+    Persist camera metadata JSON for an entire path.
+
+    New format (preferred): one file per path at the same level as the MP4:
+      <output_dir>/<scene>/<label>_camera.json
+    """
+    out_path = _camera_metadata_path(scene_dir, label_id)
+    payload = {
+        "dataset_root": str(scene_dir.parent),
+        "scene": str(scene_dir.name),
+        "label": str(label_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "frames": camera_frames,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 def _rotate_180_xy(xy: np.ndarray) -> np.ndarray:
     """Rotate 2D points by 180 degrees around origin."""
@@ -2928,6 +2947,7 @@ def render_actor_camera_only_sequence(
     direction_window = STABILIZE_WINDOW if stabilize else 1
     prev_forward: np.ndarray | None = None
     frame_counter = 0
+    camera_frames: list[dict] = []
 
     if metrics:
         metrics.sample_vram()
@@ -3074,13 +3094,7 @@ def render_actor_camera_only_sequence(
                 print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
         if save_camera_metadata:
             try:
-                _save_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=frame_counter,
-                    camera=camera,
-                    orthographic=False,
-                )
+                camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
             except Exception as e:
                 print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
 
@@ -3115,6 +3129,11 @@ def render_actor_camera_only_sequence(
             )
 
     camera_xy_seq = [pos[:2].copy() for pos in camera_positions]
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=frames_dir.parent, label_id=label_id, camera_frames=camera_frames)
+        except Exception as e:
+            print(f"[WARN] Failed to save camera metadata for path {scene_id}/{label_id}: {e}", flush=True)
     return camera_xy_seq, actor_xy_seq_would_be
 
 def render_actor_follow_sequence(
@@ -3312,6 +3331,7 @@ def render_actor_follow_sequence(
     frame_counter = 0
     prev_forward: np.ndarray | None = None
     direction_window = STABILIZE_WINDOW if stabilize else 1
+    camera_frames: list[dict] = []
 
     if metrics:
         metrics.sample_vram()
@@ -3691,13 +3711,7 @@ def render_actor_follow_sequence(
                     print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
             if save_camera_metadata:
                 try:
-                    _save_camera_metadata(
-                        frames_dir=frames_dir,
-                        frame_prefix=frame_prefix,
-                        frame_idx=frame_counter,
-                        camera=camera,
-                        orthographic=False,
-                    )
+                    camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
                 except Exception as e:
                     print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
             
@@ -4092,13 +4106,7 @@ def render_actor_follow_sequence(
                 print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
         if save_camera_metadata:
             try:
-                _save_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=frame_counter,
-                    camera=camera,
-                    orthographic=False,
-                )
+                camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
             except Exception as e:
                 print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
         frame_counter += 1
@@ -4121,6 +4129,12 @@ def render_actor_follow_sequence(
             f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
             flush=True,
         )
+
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=frames_dir.parent, label_id=label_id, camera_frames=camera_frames)
+        except Exception as e:
+            print(f"[WARN] Failed to save camera metadata for path {scene_id}/{label_id}: {e}", flush=True)
 
     return camera_xy_seq, actor_xy_seq
 
@@ -4732,6 +4746,7 @@ def render_path_frames(
     video_dir = output_dir / scene_id
     video_path = video_dir / f"{json_path.stem}.mp4"
     npc_bev_render_dir = frames_dir / "__npc_bev_debug_render"
+    camera_frames: list[dict] = []
     
     # Always create frames_dir since per-frame outputs (camera/depth/RGB) live there.
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -5378,13 +5393,7 @@ def render_path_frames(
                             print(f"[WARN] Failed to save depth for frame {idx}: {e}", flush=True)
                     if save_camera_metadata:
                         try:
-                            _save_camera_metadata(
-                                frames_dir=frames_dir,
-                                frame_prefix="frame",
-                                frame_idx=idx,
-                                camera=camera,
-                                orthographic=orthographic,
-                            )
+                            camera_frames.append(_camera_frame_metadata(idx, camera, orthographic=orthographic))
                         except Exception as e:
                             print(f"[WARN] Failed to save camera metadata for frame {idx}: {e}", flush=True)
                     
@@ -5497,6 +5506,15 @@ def render_path_frames(
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         with metadata_path.open("w", encoding="utf-8") as meta_fh:
             json.dump(metadata_payload, meta_fh, indent=2)
+
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=video_dir, label_id=json_path.stem, camera_frames=camera_frames)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(
+                f"      WARNING: Failed to write camera metadata for {scene_id}/{json_path.stem}: {exc}",
+                flush=True,
+            )
 
     if navdp_manager is not None:
         try:

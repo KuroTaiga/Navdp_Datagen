@@ -5,7 +5,7 @@ Generate per-frame camera extrinsics + action/reverse-action JSONs for planned l
 JSON-only precompute: does NOT load Gaussian splats or initialize TeleSim renderers.
 
 Outputs are written into TWO separate dataset roots (preserving <dataset>/<scene>/...):
-  1) camera_root/<scene>/<label>/frame_0000_camera.json ...
+  1) camera_root/<scene>/{label}_camera.json (one JSON per path, includes per-frame entries)
   2) actions_root/<scene>/{label}_actions.json and {label}_reverse.json
 """
 
@@ -30,7 +30,8 @@ from utils.telesim_path_json_outputs import (
     prepare_path_data,
     reverse_action_payload_from_actions,
     utc_now_iso,
-    write_camera_metadata_frame,
+    write_camera_metadata_for_path,
+    write_tar_zst,
     write_tarball,
 )
 
@@ -194,6 +195,21 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--reverse-step-distance", type=float, default=0.05)
     ap.add_argument("--reverse-turn-threshold-deg", type=float, default=15.0)
     ap.add_argument("--tar-out", type=Path, default=None, help="If set, tar both dataset roots after generation.")
+    ap.add_argument(
+        "--tar-camera-zst",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, write <camera_root>.tar.zst for fast upload.",
+    )
+    ap.add_argument(
+        "--tar-actions-zst",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="If true, write <actions_root>.tar.zst for fast upload.",
+    )
+    ap.add_argument("--tar-camera-out", type=Path, default=None, help="Override tar output path for camera root.")
+    ap.add_argument("--tar-actions-out", type=Path, default=None, help="Override tar output path for actions root.")
+    ap.add_argument("--zstd-level", type=int, default=3, help="zstd compression level for *.tar.zst (default: 3).")
     return ap.parse_args()
 
 
@@ -291,20 +307,16 @@ def main() -> int:
                     zfar=float(args.zfar),
                 )
 
-                frames_dir = args.camera_root / scene_id / label_id
-                frames_dir.mkdir(parents=True, exist_ok=True)
-                for idx, payload in enumerate(camera_payloads):
-                    cam_path = frames_dir / f"frame_{idx:04d}_camera.json"
-                    if cam_path.exists() and not bool(args.overwrite):
-                        skipped += 1
-                        continue
-                    write_camera_metadata_frame(
-                        frames_dir=frames_dir,
-                        frame_prefix="frame",
-                        frame_idx=idx,
-                        payload=payload,
-                        overwrite=bool(args.overwrite),
-                    )
+                camera_scene_dir = args.camera_root / scene_id
+                camera_out = write_camera_metadata_for_path(
+                    scene_dir=camera_scene_dir,
+                    scene_id=scene_id,
+                    label_id=label_id,
+                    camera_payloads=camera_payloads,
+                    dataset_root=args.camera_root,
+                    overwrite=bool(args.overwrite),
+                )
+                if camera_out.exists():
                     written += 1
 
                 action_payload = action_payload_from_camera_payloads(
@@ -367,6 +379,15 @@ def main() -> int:
     if args.tar_out is not None:
         write_tarball(Path(args.tar_out), [args.camera_root, args.actions_root])
         print(f"[TAR] wrote {args.tar_out}", flush=True)
+
+    if bool(args.tar_camera_zst):
+        out_path = Path(args.tar_camera_out) if args.tar_camera_out is not None else Path(str(args.camera_root) + ".tar.zst")
+        write_tar_zst(out_path=out_path, root_dir=args.camera_root, zstd_level=int(args.zstd_level))
+        print(f"[TAR.ZST] wrote {out_path}", flush=True)
+    if bool(args.tar_actions_zst):
+        out_path = Path(args.tar_actions_out) if args.tar_actions_out is not None else Path(str(args.actions_root) + ".tar.zst")
+        write_tar_zst(out_path=out_path, root_dir=args.actions_root, zstd_level=int(args.zstd_level))
+        print(f"[TAR.ZST] wrote {out_path}", flush=True)
 
     return 0 if not all_errors else 2
 

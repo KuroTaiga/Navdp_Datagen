@@ -19,14 +19,16 @@ CONDA_ENV=${CONDA_ENV:-cuda121}
 USE_CONDA_RUN=${USE_CONDA_RUN:-auto}
 SEED=${SEED:-1}
 SCENE_ID=${SCENE_ID:-}
-SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
+SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_75_scenes}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
-OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow}
+OUTPUT_DIR=${OUTPUT_DIR:-./CHINGMU_0800_follow}
 WORKERS=${WORKERS:-25}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
 EXCLUDE_DETAILED_LABELS=${EXCLUDE_DETAILED_LABELS:-true}
 MAX_LABELS=${MAX_LABELS:-}
+TAR_ZST=${TAR_ZST:-false}
+ZSTD_LEVEL=${ZSTD_LEVEL:-3}
 
 ACTOR_ROOT=${ACTOR_ROOT:-./data/human_gs_source}
 BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
@@ -92,6 +94,13 @@ fi
 
 if [ -n "${TAR_OUT:-}" ]; then
   cmd+=(--tar-out "${TAR_OUT}")
+fi
+if [ "${TAR_ZST}" = "true" ]; then
+  TAR_CAMERA_OUT=${TAR_CAMERA_OUT:-${CAMERA_DATASET_DIR}.tar.zst}
+  TAR_ACTIONS_OUT=${TAR_ACTIONS_OUT:-${ACTIONS_DATASET_DIR}.tar.zst}
+  cmd+=(--tar-camera-zst --tar-camera-out "${TAR_CAMERA_OUT}")
+  cmd+=(--tar-actions-zst --tar-actions-out "${TAR_ACTIONS_OUT}")
+  cmd+=(--zstd-level "${ZSTD_LEVEL}")
 fi
 
 "${cmd[@]}"
