@@ -21,7 +21,7 @@ SEED=${SEED:-1}
 SCENE_ID=${SCENE_ID:-}
 SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_75_scenes}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
-OUTPUT_DIR=${OUTPUT_DIR:-./CHINGMU_0800_follow}
+OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow_additionals}
 WORKERS=${WORKERS:-25}
 MINIMAL_FRAMES=${MINIMAL_FRAMES:-0}
 HEIGHT_OFFSET=${HEIGHT_OFFSET:-0.3}
@@ -35,8 +35,8 @@ BAN_LIST=${BAN_LIST:-${ACTOR_ROOT}/BanList.txt}
 ASSIGNMENTS_OUT=${ASSIGNMENTS_OUT:-./data/actor_assignments_w_ban_CHINGMU.json}
 
 # Two separate dataset roots (preserve <dataset>/<scene>/...)
-CAMERA_DATASET_DIR=${CAMERA_DATASET_DIR:-${OUTPUT_DIR}_camera}
-ACTIONS_DATASET_DIR=${ACTIONS_DATASET_DIR:-${OUTPUT_DIR}_actions}
+CAMERA_DATASET_DIR=${CAMERA_DATASET_DIR:-${OUTPUT_DIR}/camera}
+ACTIONS_DATASET_DIR=${ACTIONS_DATASET_DIR:-${OUTPUT_DIR}/actions}
 
 generate_assignment_manifest() {
   CONDA_ENV="${CONDA_ENV}" \
