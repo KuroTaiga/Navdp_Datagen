@@ -99,6 +99,14 @@ def _polygon_centroid(xy: np.ndarray) -> np.ndarray:
     return np.array([cx, cy], dtype=np.float32)
 
 
+def _structure_room_points(room: dict) -> tuple[list, str] | tuple[None, None]:
+    if isinstance(room.get("profile"), list):
+        return room["profile"], "profile"
+    if isinstance(room.get("boundary"), list):
+        return room["boundary"], "boundary"
+    return None, None
+
+
 def _floor_z_from_occupancy(scene_dir: Path) -> float:
     occ_path = scene_dir / "occupancy.json"
     if not occ_path.is_file():
@@ -161,11 +169,13 @@ def load_room_specs(scene_dir: Path) -> list[RoomSpec]:
         floor_z = _floor_z_from_occupancy(scene_dir)
         specs: list[RoomSpec] = []
         for idx, room in enumerate(structure_rooms, start=1):
-            if not isinstance(room.get("profile"), list):
+            points, points_key = _structure_room_points(room)
+            if points is None:
                 continue
-            xy = np.array(room["profile"], dtype=np.float32)
+            xy = np.array(points, dtype=np.float32)
             if xy.ndim != 2 or xy.shape[1] < 2:
                 continue
+            related_info = {"structure_room": _json_safe(room), "structure_room_points_key": points_key}
             specs.append(
                 RoomSpec(
                     room_id=str(idx),
@@ -174,7 +184,7 @@ def load_room_specs(scene_dir: Path) -> list[RoomSpec]:
                     source="structure.json:rooms",
                     points_xy=xy[:, :2].astype(float).tolist(),
                     z_range=None,
-                    related_info={"structure_room": _json_safe(room)},
+                    related_info=related_info,
                 )
             )
         if specs:
@@ -184,9 +194,10 @@ def load_room_specs(scene_dir: Path) -> list[RoomSpec]:
 
 
 def find_ply_file(scene_dir: Path) -> Path:
-    preferred = scene_dir / "3dgs_compressed.ply"
-    if preferred.is_file():
-        return preferred
+    for name in ("3dgs_raw.ply", "3dgs_compressed.ply"):
+        preferred = scene_dir / name
+        if preferred.is_file():
+            return preferred
     candidates = sorted(scene_dir.glob("*.ply"))
     if candidates:
         return candidates[0]
