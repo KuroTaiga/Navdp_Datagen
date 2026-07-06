@@ -7,7 +7,7 @@ import json
 import math
 import re
 from argparse import ArgumentParser
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -17,6 +17,7 @@ import torch
 
 from arguments import PipelineParams
 from gaussian_renderer import render
+from safe_room_view_point import SafeRoomViewPoint, choose_safe_room_view_point
 from scene import GaussianModel
 from utils.render_utils import build_perspective_camera
 
@@ -219,11 +220,22 @@ def _room_bounds_xy(points_xy: list[list[float]]) -> dict:
     }
 
 
+def _room_metadata_key(room_id: str) -> str:
+    if re.fullmatch(r"\d+", str(room_id)):
+        return f"room_{int(room_id):02d}"
+    return str(room_id)
+
+
+def _safe_point_to_json(safe_point: SafeRoomViewPoint) -> dict:
+    return _json_safe(asdict(safe_point))
+
+
 def write_room_reference_json(
     scene_dir: Path,
     scene_output_dir: Path,
     room: RoomSpec,
     position: np.ndarray,
+    safe_point: SafeRoomViewPoint,
     view_records: list[dict],
     args,
 ) -> None:
@@ -234,6 +246,8 @@ def write_room_reference_json(
         "bev_plane": "xy",
         "vertical_axis": "z",
         "center_xy": [float(room.center_xy[0]), float(room.center_xy[1])],
+        "view_point": _safe_point_to_json(safe_point),
+        "manual_verification_required": bool(safe_point.manual_verification_required),
         "floor_z": float(room.floor_z),
         "camera_height_above_floor": float(args.camera_height),
         "camera_position_xyz": [float(position[0]), float(position[1]), float(position[2])],
@@ -280,20 +294,40 @@ def render_room_views(
     scene_output_dir.mkdir(parents=True, exist_ok=True)
     rendered = 0
     skipped = 0
+    room_view_points: dict[str, dict] = {
+        "scene_id": scene_dir.name,
+        "source": "render_room_center_views.py",
+        "rooms": {},
+    }
     for room in rooms:
+        safe_point = choose_safe_room_view_point(
+            scene_dir,
+            (float(room.center_xy[0]), float(room.center_xy[1])),
+            room_polygon=room.points_xy,
+            camera_z=float(room.floor_z) + float(args.camera_height),
+        )
+        safe_xy = safe_point.selected_xy
         position = np.array(
             [
-                float(room.center_xy[0]),
-                float(room.center_xy[1]),
+                float(safe_xy[0]),
+                float(safe_xy[1]),
                 float(room.floor_z) + float(args.camera_height),
             ],
             dtype=np.float32,
         )
         print(
-            f"  room {room.room_id}: center_xy=({position[0]:.3f}, {position[1]:.3f}) "
-            f"z={position[2]:.3f} source={room.source}",
+            f"  room {room.room_id}: center_xy=({room.center_xy[0]:.3f}, {room.center_xy[1]:.3f}) "
+            f"selected_xy=({position[0]:.3f}, {position[1]:.3f}) z={position[2]:.3f} "
+            f"safe_status={safe_point.status} source={room.source}",
             flush=True,
         )
+        room_key = _room_metadata_key(room.room_id)
+        room_view_points["rooms"][room_key] = {
+            "room_id": room_key,
+            "room_number": int(room.room_id) if re.fullmatch(r"\d+", str(room.room_id)) else None,
+            "raw_room_id": str(room.room_id),
+            **_safe_point_to_json(safe_point),
+        }
         view_records: list[dict] = []
         for idx in range(4):
             output_path = scene_output_dir / f"{room.room_id}_{idx:02d}.png"
@@ -340,9 +374,14 @@ def render_room_views(
             scene_output_dir=scene_output_dir,
             room=room,
             position=position,
+            safe_point=safe_point,
             view_records=view_records,
             args=args,
         )
+    metadata_path = scene_output_dir / "room_view_points.json"
+    with metadata_path.open("w", encoding="utf-8") as fh:
+        json.dump(_json_safe(room_view_points), fh, indent=2)
+        fh.write("\n")
     return rendered, skipped
 
 
