@@ -10,6 +10,7 @@ This repository generates navigation datasets (FPV and follow-camera) from 3D Ga
 - `scripts/quick_pipeline_test.py`: small end-to-end test + resource report.
 - `scripts/render_glb_robot_overlay.py`: optional GLB robot foreground compositor for existing rendered frames.
 - `navdp_datagen_pipeline.md`: pipeline overview and detailed usage.
+- `docs/scene_placement_orientation.md`: coordinate, floor-plane, yaw, and camera-basis reference for placing foreground objects.
 - `docs/`: design notes and scheduling plans.
 
 ## Setup

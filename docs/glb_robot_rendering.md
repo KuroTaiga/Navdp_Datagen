@@ -81,3 +81,7 @@ NavDP scenes are Z-up. GLB/glTF assets are commonly Y-up, so the overlay script
 defaults to `--glb-up-axis y` and maps the asset into the NavDP Z-up world before
 applying the per-frame robot pose. If an asset is already authored as Z-up, pass
 `--glb-up-axis z`.
+
+For the full placement contract, including floor contact, follow-camera
+distance capping, yaw/forward-axis conventions, and the NavDP camera-to-pyrender
+axis conversion, see `docs/scene_placement_orientation.md`.
