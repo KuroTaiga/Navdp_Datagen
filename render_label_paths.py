@@ -4529,6 +4529,7 @@ def render_path_frames(
     render_bev: bool,
     actor_runtime: ActorRuntime | None,
     default_follow_distance: float,
+    limit_camera_to_follow: bool,
     verbose: bool,
     hide_actor_enabled: bool = False,
     mirror_bev_x = False,
@@ -4627,9 +4628,26 @@ def render_path_frames(
         else float(default_follow_distance)
     )
 
-    positions = [
-        np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
-    ]
+    if limit_camera_to_follow and actor_runtime is None:
+        sampler_for_camera = PathSampler(path_xy)
+        total_length = sampler_for_camera.total_length
+        follow_distance_m = max(float(used_follow_distance), 0.0)
+        max_camera_distance = max(total_length - follow_distance_m, 0.0)
+        capped_xy: list[np.ndarray] = []
+        for dist in sampler_for_camera.cumulative:
+            camera_distance = min(float(dist), max_camera_distance)
+            capped_xy.append(sampler_for_camera.position_at(camera_distance))
+            if camera_distance >= max_camera_distance - 1e-6:
+                break
+        if len(capped_xy) < 2:
+            capped_xy = [np.asarray(path_xy[0], dtype=np.float32), np.asarray(path_xy[-1], dtype=np.float32)]
+        positions = [
+            np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in capped_xy
+        ]
+    else:
+        positions = [
+            np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
+        ]
     npc_has_actor = (
         npc_actor_runtime is not None
         or npc_actor_pool is not None
@@ -5500,7 +5518,7 @@ def render_path_frames(
             camera_xy_seq=cam_seq,
             meta=meta,
             follow_distance=used_follow_distance,
-            limit_to_follow=actor_runtime is not None,
+            limit_to_follow=actor_runtime is not None or bool(limit_camera_to_follow),
         )
         metadata_path = output_dir / scene_id / f"{json_path.stem}_follow_path.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5820,6 +5838,15 @@ def parse_args() -> ArgumentParser:
         action=BooleanOptionalAction,
         default=True,
         help="Write per-path follow metadata JSON (separate from per-frame camera metadata; default: on).",
+    )
+    parser.add_argument(
+        "--limit-camera-to-follow",
+        action=BooleanOptionalAction,
+        default=False,
+        help=(
+            "For actor-free renders, cap the camera path at path_length - follow_distance "
+            "so follow metadata matches the human/TeleSim actor placement convention."
+        ),
     )
     parser.add_argument(
         "--light-mode",
@@ -7243,6 +7270,7 @@ def main() -> None:
                         mirror_translation=not args.no_mirror_translation,
                         actor_runtime=actor_runtime,
                         default_follow_distance=float(args.follow_distance),
+                        limit_camera_to_follow=bool(args.limit_camera_to_follow),
                         verbose=verbose_enabled,
                         hide_actor_enabled=hide_actor_enabled,
                         render_bev=args.show_BEV,

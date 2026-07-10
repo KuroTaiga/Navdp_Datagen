@@ -11,3 +11,6 @@
 	path = submodules/diff-gaussian-rasterization
 	url = https://github.com/KuroTaiga/diff-gaussian-rasterization.git
 
+[submodule "submodules/gsplat"]
+	path = submodules/gsplat
+	url = https://github.com/KuroTaiga/gsplat.git
