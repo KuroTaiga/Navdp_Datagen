@@ -3,7 +3,7 @@ import os
 import numpy as np
 import torch
 import imageio
-from gaussian_renderer import render_or
+from gaussian_renderer import render
 from scene import GaussianModel
 from scene.cameras import MiniCam
 from utils.graphics_utils import fov2focal, focal2fov
@@ -124,7 +124,7 @@ def render_and_save(pose_matrix, save_dir="./nav_data"):
 
     parser = ArgumentParser(description="Testing script parameters")
     bg_color = torch.tensor([1.0, 1.0, 1.0], device=device)
-    img_pkg = render_or(camera, gaussians, PipelineParams(parser), bg_color=bg_color)
+    img_pkg = render(camera, gaussians, PipelineParams(parser), bg_color=bg_color)
     rendered = img_pkg["render"].detach().cpu().numpy()
     depth = img_pkg["depth"].detach().cpu().numpy()
     rgb = (rendered.clip(0, 1) * 255).astype(np.uint8).transpose(1, 2, 0)

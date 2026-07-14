@@ -19,6 +19,7 @@ from argparse import BooleanOptionalAction
 
 
 FRAME_RE = re.compile(r"^frame_(\d+)_camera\.json$")
+CAMERA_PATH_SUFFIX = "_camera.json"
 
 
 def read_png_size(path: Path) -> tuple[int, int]:
@@ -88,12 +89,54 @@ def parse_frame_index(path: Path) -> int | None:
     return int(match.group(1))
 
 
-def iter_label_dirs(scene_dir: Path, label_filter: set[str] | None) -> Iterable[Path]:
+def _label_from_camera_filename(path: Path) -> str | None:
+    if not path.name.endswith(CAMERA_PATH_SUFFIX):
+        return None
+    stem = path.stem
+    if not stem.endswith("_camera"):
+        return None
+    return stem[: -len("_camera")]
+
+
+def iter_labels(
+    scene_dir: Path,
+    label_filter: set[str] | None,
+) -> Iterable[tuple[str, str, Path]]:
+    """
+    Yield (label_id, mode, path) for one scene.
+
+    mode:
+      - "path_json": scene_dir/{label}_camera.json
+      - "legacy_dir": scene_dir/{label}/frame_XXXX_camera.json
+    """
+    camera_jsons: list[tuple[str, Path]] = []
+    for p in sorted(scene_dir.glob(f"*{CAMERA_PATH_SUFFIX}")):
+        if not p.is_file():
+            continue
+        label = _label_from_camera_filename(p)
+        if not label:
+            continue
+        if label_filter and label not in label_filter:
+            continue
+        camera_jsons.append((label, p))
+    if camera_jsons:
+        for label, p in camera_jsons:
+            yield label, "path_json", p
+        return
+
     for child in sorted(scene_dir.iterdir()):
         if child.is_dir():
             if label_filter and child.name not in label_filter:
                 continue
-            yield child
+            yield child.name, "legacy_dir", child
+
+
+def _iter_camera_payloads_from_path_json(path_json: Path) -> list[dict]:
+    payload = json.loads(path_json.read_text(encoding="utf-8"))
+    frames = payload.get("frames") or []
+    ordered = list(frames) if isinstance(frames, list) else []
+    ordered.sort(key=lambda f: int(f.get("frame", 0)))
+    return ordered
 
 
 def signed_angle_delta(a: float, b: float) -> float:
@@ -358,50 +401,62 @@ def process_scene(
     if debug_yaw or debug_bev:
         debug_root.mkdir(parents=True, exist_ok=True)
 
-    for label_dir in iter_label_dirs(scene_dir, label_filter):
+    for label_name, mode, label_path in iter_labels(scene_dir, label_filter):
         labels_seen += 1
-        output_name = output_template.replace("{label}", label_dir.name)
+        output_name = output_template.replace("{label}", label_name)
         output_path = scene_dir / output_name
         if skip_existing and not debug_clean:
             expected_paths = []
             if not skip_actions:
                 expected_paths.append(output_path)
             if debug_yaw:
-                expected_paths.append(debug_root / debug_yaw_template.replace("{label}", label_dir.name))
+                expected_paths.append(debug_root / debug_yaw_template.replace("{label}", label_name))
                 if debug_yaw_plot:
                     expected_paths.append(
-                        debug_root / debug_yaw_plot_template.replace("{label}", label_dir.name)
+                        debug_root / debug_yaw_plot_template.replace("{label}", label_name)
                     )
             if debug_bev:
-                expected_paths.append(debug_root / debug_bev_template.replace("{label}", label_dir.name))
+                expected_paths.append(debug_root / debug_bev_template.replace("{label}", label_name))
             if expected_paths and all(path.exists() for path in expected_paths):
-                log(f"[skip] {scene_id}/{label_dir.name}: outputs already exist")
+                log(f"[skip] {scene_id}/{label_name}: outputs already exist")
                 continue
         if clean:
-            legacy_json = label_dir / "frame_actions.json"
-            if legacy_json.exists():
-                legacy_json.unlink()
+            if mode == "legacy_dir":
+                legacy_json = label_path / "frame_actions.json"
+                if legacy_json.exists():
+                    legacy_json.unlink()
             if output_path.exists():
                 output_path.unlink()
 
-        camera_files = []
-        for path in label_dir.iterdir():
-            idx = parse_frame_index(path)
-            if idx is not None:
-                camera_files.append((idx, path))
-        if not camera_files:
-            log(f"[label] {scene_id}/{label_dir.name}: no camera frames found")
+        camera_payloads: list[tuple[int, dict]] = []
+        if mode == "path_json":
+            for entry in _iter_camera_payloads_from_path_json(label_path):
+                camera_payloads.append((int(entry.get("frame", 0)), entry))
+        else:
+            camera_files = []
+            for path in label_path.iterdir():
+                idx = parse_frame_index(path)
+                if idx is not None:
+                    camera_files.append((idx, path))
+            if not camera_files:
+                log(f"[label] {scene_id}/{label_name}: no camera frames found")
+                continue
+            camera_files.sort(key=lambda item: item[0])
+            for frame_idx, cam_path in camera_files:
+                with cam_path.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+                camera_payloads.append((int(frame_idx), payload))
+
+        if not camera_payloads:
+            log(f"[label] {scene_id}/{label_name}: no camera frames found")
             continue
-        camera_files.sort(key=lambda item: item[0])
 
         frames = []
-        for frame_idx, cam_path in camera_files:
-            with cam_path.open("r", encoding="utf-8") as fh:
-                payload = json.load(fh)
+        for frame_idx, payload in camera_payloads:
             cam_center = payload.get("camera_center_world")
             cam_to_world = payload.get("camera_to_world")
             if not cam_center or not cam_to_world:
-                log(f"[frame] {scene_id}/{label_dir.name}/{cam_path.name}: missing camera data")
+                log(f"[frame] {scene_id}/{label_name}/frame={frame_idx}: missing camera data")
                 continue
 
             x, y, z = map(float, cam_center[:3])
@@ -431,12 +486,12 @@ def process_scene(
             )
 
         if len(frames) < 1:
-            log(f"[label] {scene_id}/{label_dir.name}: no usable frames after parsing")
+            log(f"[label] {scene_id}/{label_name}: no usable frames after parsing")
             continue
-        log(f"[label] {scene_id}/{label_dir.name}: parsed {len(frames)} frames")
+        log(f"[label] {scene_id}/{label_name}: parsed {len(frames)} frames")
 
         if debug_yaw:
-            debug_name = debug_yaw_template.replace("{label}", label_dir.name)
+            debug_name = debug_yaw_template.replace("{label}", label_name)
             debug_path = debug_root / debug_name
             yaw_windows = {
                 str(step): compute_yaw_window_series(frames, step)
@@ -445,7 +500,7 @@ def process_scene(
             debug_payload = {
                 "dataset_root": str(scene_dir.parent),
                 "scene": scene_id,
-                "label": label_dir.name,
+                "label": label_name,
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "frames": [
                     {
@@ -464,7 +519,7 @@ def process_scene(
             outputs_written += 1
             log(f"[debug] wrote yaw report to {debug_path}")
             if debug_yaw_plot:
-                plot_name = debug_yaw_plot_template.replace("{label}", label_dir.name)
+                plot_name = debug_yaw_plot_template.replace("{label}", label_name)
                 plot_path = debug_root / plot_name
                 mpl_config_dir = debug_root / ".mplconfig"
                 render_yaw_windows_plot(yaw_windows, plot_path, mpl_config_dir)
@@ -473,13 +528,13 @@ def process_scene(
 
         if debug_bev:
             if meta is None:
-                log(f"[debug] skipping BEV overlay for {scene_id}/{label_dir.name}: missing metadata")
+                log(f"[debug] skipping BEV overlay for {scene_id}/{label_name}: missing metadata")
             else:
                 occ_png = scene_meta_dir / "occupancy.png"
                 if not occ_png.is_file():
-                    log(f"[debug] skipping BEV overlay for {scene_id}/{label_dir.name}: {occ_png} missing")
+                    log(f"[debug] skipping BEV overlay for {scene_id}/{label_name}: {occ_png} missing")
                 else:
-                    debug_name = debug_bev_template.replace("{label}", label_dir.name)
+                    debug_name = debug_bev_template.replace("{label}", label_name)
                     debug_path = debug_root / debug_name
                     render_bev_debug(
                         occ_png,
@@ -547,7 +602,7 @@ def process_scene(
         payload = {
             "dataset_root": str(scene_dir.parent),
             "scene": scene_id,
-            "label": label_dir.name,
+            "label": label_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "max_next": max_next,
             "move_threshold_deg": float(move_threshold_deg),
@@ -562,14 +617,14 @@ def process_scene(
             outputs_written += 1
             log(f"[write] {output_path}")
         else:
-            log(f"[skip] action output suppressed for {scene_id}/{label_dir.name}")
+            log(f"[skip] action output suppressed for {scene_id}/{label_name}")
 
         if plots and len(frames) > step:
             plot_name_expanded = plot_name
             if "{skip}" in plot_name_expanded:
                 plot_name_expanded = plot_name_expanded.replace("{skip}", str(skip_frames))
             plot_name_final = (
-                plot_name_expanded.replace("{label}", label_dir.name)
+                plot_name_expanded.replace("{label}", label_name)
                 if "{label}" in plot_name_expanded
                 else plot_name_expanded
             )

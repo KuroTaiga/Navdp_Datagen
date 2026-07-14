@@ -50,13 +50,22 @@ import numpy as np
 import torch
 
 from arguments import PipelineParams
-from gaussian_renderer import render_or
+from gaussian_renderer import render, render_or
 from scene import GaussianModel
 from scene.cameras import MiniCam
 from plyfile import PlyData, PlyElement, PlyElementParseError
 
 from utils import gaussian_ply_utils as ply_utils
+from utils.ply_transform_utils import (
+    apply_transform_to_frame,
+    build_transform_matrix,
+    PlyTransformBackend,
+    rotation_matrix_z_np,
+)
 from utils.general_utils import inverse_sigmoid
+from lighting.lighting_utils import LightFilterConfig, apply_light_filter, stable_hash_seed
+from lighting.shading import CameraLightConfig, apply_camera_light_shading, intrinsics_from_camera
+from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 from utils.render_utils import (
     build_look_at,
     build_perspective_camera,
@@ -70,6 +79,7 @@ from utils.render_utils import (
 from utils.npc_density import (
     CameraWedge,
     NPCDensityConfig,
+    NPCPlacementBackend,
     compute_clearance_distance,
     estimate_npc_target_count,
     load_free_space_mask,
@@ -91,6 +101,13 @@ DEFAULT_ACTOR_PATTERN = "*.ply"
 DEFAULT_ACTOR_SPEED = 1.3
 ACTOR_REGION_MARGIN = 6.0
 STABILIZE_WINDOW = 5
+PLY_TRANSFORM_BACKEND = PlyTransformBackend.GPU
+VIDEO_WRITER_BACKEND = VideoWriterBackend.NVENC
+VIDEO_NVENC_PRESET: str | None = None
+VIDEO_NVENC_BITRATE: str | None = None
+GPU_VIDEO_FORMAT = "ABGR"
+NPC_PLACEMENT_BACKEND = NPCPlacementBackend.GPU
+NPC_VERBOSE_ENABLED = False
 DEBUG_PLY_DTYPE = np.dtype(
     [
         ("x", np.float32),
@@ -106,6 +123,28 @@ DEBUG_PLY_DTYPE = np.dtype(
         ("b", np.uint8),
     ]
 )
+
+
+def _render_gaussians(
+    camera,
+    gaussians: GaussianModel,
+    pipeline: PipelineParams,
+    *,
+    bg_color: torch.Tensor,
+    orthographic: bool = False,
+    antialiasing: bool | None = None,
+) -> dict:
+    """Use render() for perspective and render_or() only when orthographic is needed."""
+    if orthographic:
+        return render_or(
+            camera,
+            gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=True,
+            antialiasing=antialiasing,
+        )
+    return render(camera, gaussians, pipeline, bg_color=bg_color)
 
 
 def ensure_output_dir_writable(path: Path) -> None:
@@ -363,8 +402,11 @@ class PathMetricRecorder:
     """Track per-path runtime metrics for downstream progress reporting."""
 
     VIDEO_STAGE = "mp4_write_sec"
+    VIDEO_ENCODE_STAGE = "h264_encode_sec"
+    VIDEO_MUX_STAGE = "h264_mux_sec"
     PNG_STAGE = "perframe_png_sec"
     DEPTH_STAGE = "perframe_depth_sec"
+    LIGHT_STAGE = "perframe_light_sec"
     PLY_STAGE = "ply_write_sec"
 
     def __init__(self, device: torch.device | None):
@@ -415,15 +457,39 @@ class PathMetricRecorder:
                 avg_bytes = None
         total_measured = sum(
             self.stage_seconds.get(stage, 0.0)
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE)
+            for stage in (
+                self.VIDEO_STAGE,
+                self.VIDEO_ENCODE_STAGE,
+                self.VIDEO_MUX_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.LIGHT_STAGE,
+                self.PLY_STAGE,
+            )
         )
         stage_ratios = {}
         if total_measured > 0.0:
             for stage, seconds in self.stage_seconds.items():
-                if stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+                if stage in (
+                    self.VIDEO_STAGE,
+                    self.VIDEO_ENCODE_STAGE,
+                    self.VIDEO_MUX_STAGE,
+                    self.PNG_STAGE,
+                    self.DEPTH_STAGE,
+                    self.LIGHT_STAGE,
+                    self.PLY_STAGE,
+                ):
                     stage_ratios[stage] = seconds / total_measured
         else:
-            for stage in (self.VIDEO_STAGE, self.PNG_STAGE, self.DEPTH_STAGE, self.PLY_STAGE):
+            for stage in (
+                self.VIDEO_STAGE,
+                self.VIDEO_ENCODE_STAGE,
+                self.VIDEO_MUX_STAGE,
+                self.PNG_STAGE,
+                self.DEPTH_STAGE,
+                self.LIGHT_STAGE,
+                self.PLY_STAGE,
+            ):
                 stage_ratios[stage] = 0.0
 
         return {
@@ -483,6 +549,162 @@ def _cuda_oom_trace(label: str, device: torch.device, verbose: bool = False):
         if verbose:
             print(f"[VERBOSE][VRAM] {diagnostics}", flush=True)
         raise RuntimeError(diagnostics) from exc
+
+
+def _apply_light_filter_if_enabled(
+    render: np.ndarray,
+    light_config: LightFilterConfig | None,
+    *,
+    frame_index: int,
+    seed_offset: int,
+    metrics: PathMetricRecorder | None,
+) -> np.ndarray:
+    if light_config is None or not light_config.enabled():
+        return render
+    timing_ctx = (
+        metrics.measure(PathMetricRecorder.LIGHT_STAGE)
+        if metrics is not None
+        else contextlib.nullcontext()
+    )
+    with timing_ctx:
+        return apply_light_filter(
+            render,
+            light_config,
+            frame_index=frame_index,
+            seed_offset=seed_offset,
+        )
+
+
+def _apply_camera_light_if_enabled(
+    render: np.ndarray,
+    img_pkg: dict,
+    camera,
+    cl_config: CameraLightConfig | None,
+    *,
+    shadow_depth_inv: np.ndarray | None,
+    shadow_intrinsics: tuple[float, float, float, float] | None,
+    cl_light_world: np.ndarray | None,
+    metrics: PathMetricRecorder | None,
+) -> np.ndarray:
+    if cl_config is None or not cl_config.active():
+        return render
+    depth_tensor = img_pkg.get("depth")
+    if depth_tensor is None:
+        return render
+    depth_inv = depth_tensor.detach().cpu().numpy()
+    timing_ctx = (
+        metrics.measure(PathMetricRecorder.LIGHT_STAGE)
+        if metrics is not None
+        else contextlib.nullcontext()
+    )
+    with timing_ctx:
+        fx, fy, cx, cy = intrinsics_from_camera(camera)
+        frame_config = cl_config
+        if cl_light_world is not None:
+            cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+            world_to_cam_rot = cam_to_world[:3, :3].T
+            cam_center = camera.camera_center.detach().cpu().numpy()
+            offset_cam = world_to_cam_rot @ (cl_light_world - cam_center)
+            frame_config = replace(
+                cl_config,
+                offset_cam=(float(offset_cam[0]), float(offset_cam[1]), float(offset_cam[2])),
+            )
+        shadow_fx = shadow_fy = shadow_cx = shadow_cy = None
+        if shadow_intrinsics is not None:
+            shadow_fx, shadow_fy, shadow_cx, shadow_cy = shadow_intrinsics
+        return apply_camera_light_shading(
+            render,
+            depth_inv,
+            config=frame_config,
+            camera_fx=fx,
+            camera_fy=fy,
+            camera_cx=cx,
+            camera_cy=cy,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_fx=shadow_fx,
+            shadow_fy=shadow_fy,
+            shadow_cx=shadow_cx,
+            shadow_cy=shadow_cy,
+        )
+
+
+def _render_tensor_to_gpu_format(render_tensor: torch.Tensor, *, gpu_format: str) -> torch.Tensor:
+    render_uint8_gpu = (render_tensor.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    render_uint8_gpu = render_uint8_gpu.permute(1, 2, 0)
+    alpha = torch.full(
+        (render_uint8_gpu.shape[0], render_uint8_gpu.shape[1], 1),
+        255,
+        device=render_uint8_gpu.device,
+        dtype=torch.uint8,
+    )
+    fmt = gpu_format.upper()
+    if fmt == "ABGR":
+        # PyNvVideoCodec expects little-endian ABGR; RGBA byte order matches that.
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    if fmt == "ARGB":
+        # PyNvVideoCodec expects little-endian ARGB; BGRA byte order matches that.
+        render_uint8_gpu = render_uint8_gpu[..., [2, 1, 0]]
+        return torch.cat([render_uint8_gpu, alpha], dim=2)
+    raise ValueError(f"Unsupported GPU video format: {gpu_format}")
+
+
+def _gpu_format_to_rgb_cpu(render_uint8_gpu: torch.Tensor, *, gpu_format: str) -> np.ndarray:
+    fmt = gpu_format.upper()
+    if fmt == "ABGR":
+        return render_uint8_gpu[..., :3].detach().cpu().numpy()
+    if fmt == "ARGB":
+        return render_uint8_gpu[..., [2, 1, 0]].detach().cpu().numpy()
+    raise ValueError(f"Unsupported GPU video format: {gpu_format}")
+
+
+def _prepare_render_uint8(
+    *,
+    img_pkg: dict,
+    camera,
+    cl_config: CameraLightConfig | None,
+    shadow_depth_inv: np.ndarray | None,
+    shadow_intrinsics: tuple[float, float, float, float] | None,
+    cl_light_world: np.ndarray | None,
+    light_config: LightFilterConfig | None,
+    frame_index: int,
+    light_seed_offset: int,
+    metrics: PathMetricRecorder | None,
+    use_gpu_video: bool,
+) -> tuple[np.ndarray | None, torch.Tensor | None]:
+    render_tensor = img_pkg["render"]
+    if use_gpu_video:
+        if (cl_config is not None and cl_config.active()) or (
+            light_config is not None and light_config.enabled()
+        ):
+            raise RuntimeError(
+                "GPU video backend does not support CPU light filters; disable "
+                "--cl-enable/--light-mode for video-backend=gpu."
+            )
+        render_uint8_gpu = _render_tensor_to_gpu_format(render_tensor, gpu_format=GPU_VIDEO_FORMAT)
+        render_uint8_gpu = render_uint8_gpu.flip((0, 1)).contiguous()
+        return None, render_uint8_gpu
+
+    render = render_tensor.detach().cpu().numpy()
+    render = _apply_camera_light_if_enabled(
+        render,
+        img_pkg,
+        camera,
+        cl_config,
+        shadow_depth_inv=shadow_depth_inv,
+        shadow_intrinsics=shadow_intrinsics,
+        cl_light_world=cl_light_world,
+        metrics=metrics,
+    )
+    render = _apply_light_filter_if_enabled(
+        render,
+        light_config,
+        frame_index=frame_index,
+        seed_offset=light_seed_offset,
+        metrics=metrics,
+    )
+    render_uint8_cpu = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
+    render_uint8_cpu = np.rot90(render_uint8_cpu, k=2)
+    return render_uint8_cpu, None
 
 
 @dataclass(frozen=True)
@@ -879,6 +1101,33 @@ class PathSampler:
         if norm < EPS:
             return np.array([0.0, 1.0], dtype=np.float32)
         return vec / norm
+
+
+def resample_path_by_distance(
+    points: Sequence[np.ndarray], step: float, eps: float = 1e-4
+) -> list[np.ndarray]:
+    """Resample a path at a fixed spatial step to reduce motion jitter."""
+
+    if step <= 0.0 or len(points) < 2:
+        return list(points)
+    sampler = PathSampler(points)
+    total = sampler.total_length
+    if total <= step:
+        return list(points)
+
+    distances: list[float] = []
+    dist = 0.0
+    while dist < total:
+        distances.append(dist)
+        dist += step
+    distances.append(total)
+
+    resampled = [sampler.position_at(float(d)) for d in distances]
+    deduped = [resampled[0]]
+    for point in resampled[1:]:
+        if np.linalg.norm(point - deduped[-1]) > eps:
+            deduped.append(point)
+    return [np.array([pt[0], pt[1]], dtype=np.float32) for pt in deduped]
 
 
 _DIGIT_PATTERN = re.compile(r"(\d+)")
@@ -1476,6 +1725,7 @@ def generate_npc_bev_debug_for_path(
             exclude_discs=exclude_discs,
             center_mask=center_mask,
             center_mask_is_bloomed=bloom_mask is not None,
+            backend=NPC_PLACEMENT_BACKEND,
         )
 
         out_path = out_dir / f"npc_bev_{frame_idx:04d}.png"
@@ -1627,18 +1877,37 @@ def _save_depth_map(
         imageio.imwrite(depth_png_path, depth_quant)
 
 
-def _save_camera_metadata(
+def _camera_metadata_path(scene_dir: Path, label_id: str) -> Path:
+    return scene_dir / f"{label_id}_camera.json"
+
+
+def _camera_frame_metadata(frame_idx: int, camera: MiniCam | OrthoMiniCam, *, orthographic: bool) -> dict:
+    payload = _serialize_camera(camera, orthographic=orthographic)
+    return {"frame": int(frame_idx), **payload}
+
+
+def _write_camera_metadata_for_path(
     *,
-    frames_dir: Path,
-    frame_prefix: str,
-    frame_idx: int,
-    camera: MiniCam | OrthoMiniCam,
-    orthographic: bool,
-) -> None:
-    """Persist camera metadata JSON for one frame."""
-    cam_json = _serialize_camera(camera, orthographic=orthographic)
-    cam_json_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_camera.json"
-    cam_json_path.write_text(json.dumps(cam_json, indent=2))
+    scene_dir: Path,
+    label_id: str,
+    camera_frames: list[dict],
+) -> Path:
+    """
+    Persist camera metadata JSON for an entire path.
+
+    New format (preferred): one file per path at the same level as the MP4:
+      <output_dir>/<scene>/<label>_camera.json
+    """
+    out_path = _camera_metadata_path(scene_dir, label_id)
+    payload = {
+        "dataset_root": str(scene_dir.parent),
+        "scene": str(scene_dir.name),
+        "label": str(label_id),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "frames": camera_frames,
+    }
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return out_path
 
 def _rotate_180_xy(xy: np.ndarray) -> np.ndarray:
     """Rotate 2D points by 180 degrees around origin."""
@@ -1974,30 +2243,6 @@ def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
         raise ValueError(f"Unable to parse actor PLY: {path}") from exc
 
 
-def rotation_matrix_z_np(theta: float) -> np.ndarray:
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    return np.array(
-        [
-            [cos_t, -sin_t, 0.0],
-            [sin_t, cos_t, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def build_transform_matrix(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
-    if rotation.shape != (3, 3):
-        raise ValueError("rotation must be 3x3")
-    if translation.shape != (3,):
-        raise ValueError("translation must be length-3 vector")
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = translation
-    return transform
-
-
 ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
     [
         [1.0, 0.0, 0.0],
@@ -2245,27 +2490,83 @@ def load_actor_frame_sequence(
     )
 
 
-def apply_transform_to_frame(
-    base_frame: ActorSequenceFrame,
-    sequence: ActorSequence,
-    transform: np.ndarray,
-) -> np.ndarray:
-    """Apply a rigid transform to a stored actor frame and return the mutated vertex array."""
+def select_random_actor_ply(ply_dir: Path, *, seed: int | None = None) -> Path:
+    ply_paths = sorted(p for p in ply_dir.rglob("*.ply") if p.is_file())
+    if not ply_paths:
+        raise FileNotFoundError(f"No .ply files found under {ply_dir}")
+    if seed is None:
+        return ply_paths[0]
+    rng = np.random.default_rng(seed)
+    return ply_paths[int(rng.integers(0, len(ply_paths)))]
 
-    data = np.array(base_frame.base_data, copy=True)
-    ply = ply_utils.GaussianPly(
-        ply=None,
-        vertex=None,
-        data=data,
-        columns=sequence.columns,
-    )
-    ply_utils.apply_transform_inplace(
-        ply,
-        transform,
-        rotate_normals=True,
-        rotate_sh=True,
-    )
-    return ply.data
+
+def dump_camera_human_plys(
+    *,
+    camera_positions: Sequence[np.ndarray],
+    scene_template: ply_utils.GaussianPly,
+    sequence: ActorSequence,
+    frames_dir: Path,
+    frame_prefix: str,
+    stride: int = 1,
+    max_frames: int | None = None,
+) -> None:
+    if not camera_positions:
+        return
+    base_frame = sequence.frames[0]
+    stride = max(1, int(stride))
+    max_frames = max_frames if max_frames is None or max_frames > 0 else None
+    written = 0
+    scene_dtype = scene_template.data.dtype
+
+    for idx, cam_pos in enumerate(camera_positions):
+        if idx % stride != 0:
+            continue
+        if max_frames is not None and written >= max_frames:
+            break
+        translation = np.array([cam_pos[0], cam_pos[1], cam_pos[2]], dtype=np.float64)
+        transform = build_transform_matrix(np.eye(3, dtype=np.float64), translation)
+        actor_data = apply_transform_to_frame(
+            base_frame,
+            sequence,
+            transform,
+            backend=PLY_TRANSFORM_BACKEND,
+        )
+        actor_aligned = ply_utils.align_dtype(actor_data, scene_dtype)
+        combined = ply_utils.concat_vertices(scene_template.data, actor_aligned)
+        out_path = frames_dir / f"{frame_prefix}_{idx:04d}_cam_human.ply"
+        scene_template.write(combined, out_path)
+        written += 1
+
+
+def validate_path_bounds(
+    *,
+    json_path: Path,
+    meta: dict,
+    path_xy: Sequence[np.ndarray],
+    raw_points: Sequence[np.ndarray],
+) -> None:
+    if not path_xy:
+        return
+    eps = 1e-3
+    left = float(meta["left"])
+    right = float(meta["right"])
+    top = float(meta["top"])
+    bottom = float(meta["bottom"])
+
+    xs = [float(pt[0]) for pt in path_xy]
+    ys = [float(pt[1]) for pt in path_xy]
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    out_x = min_x < left - eps or max_x > right + eps
+    out_y = min_y < bottom - eps or max_y > top + eps
+    if out_x or out_y:
+        msg = (
+            f"Path {json_path} outside occupancy bounds: "
+            f"x=[{min_x:.3f},{max_x:.3f}] vs [{left:.3f},{right:.3f}], "
+            f"y=[{min_y:.3f},{max_y:.3f}] vs [{bottom:.3f},{top:.3f}]"
+        )
+        raise ValueError(msg)
 
 
 def actor_data_to_tensors(
@@ -2556,6 +2857,7 @@ def render_actor_camera_only_sequence(
     camera_z: float,
     look_ahead: float,
     look_down: float,
+    reverse_forward: bool,
     gaussians: GaussianModel,
     pipeline: PipelineParams,
     device: torch.device,
@@ -2577,6 +2879,10 @@ def render_actor_camera_only_sequence(
     stabilize: bool,
     verbose: bool,
     dump: ActorDumpOptions | None = None,
+    light_config: LightFilterConfig | None = None,
+    light_seed_offset: int = 0,
+    cl_config: CameraLightConfig | None = None,
+    cl_light_world: np.ndarray | None = None,
     metrics: PathMetricRecorder | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Per-point camera walkthrough (base scene only) with actor pose preview."""
@@ -2584,6 +2890,12 @@ def render_actor_camera_only_sequence(
     options = actor_runtime.options
     sequence = actor_runtime.sequence
     follow_distance_m = max(float(options.follow_distance), 0.0)
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     sampler = PathSampler(path_xy)
     distances = list(sampler.cumulative)
@@ -2635,6 +2947,7 @@ def render_actor_camera_only_sequence(
     direction_window = STABILIZE_WINDOW if stabilize else 1
     prev_forward: np.ndarray | None = None
     frame_counter = 0
+    camera_frames: list[dict] = []
 
     if metrics:
         metrics.sample_vram()
@@ -2661,6 +2974,8 @@ def render_actor_camera_only_sequence(
             blended_norm = float(np.linalg.norm(blended))
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
+        if reverse_forward:
+            forward = -forward
         prev_forward = forward.copy()
 
         target_xy = camera_position[:2] + forward[:2] * look_ahead
@@ -2684,10 +2999,68 @@ def render_actor_camera_only_sequence(
             device,
             verbose,
         ):
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
-        render = img_pkg["render"].detach().cpu().numpy()
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-        render_uint8 = np.rot90(render_uint8, k=2)
+            img_pkg = _render_gaussians(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
+        shadow_depth_inv = None
+        shadow_intrinsics = None
+        if cl_config is not None and cl_config.shadow_enabled:
+            if cl_light_world is not None:
+                light_position = cl_light_world
+                light_target = camera_position
+            else:
+                if cl_config.light_reverse:
+                    light_target = camera_position - (target - camera_position)
+                else:
+                    light_target = target
+                offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                if np.any(offset_cam):
+                    cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                    offset_world = cam_to_world[:3, :3] @ offset_cam
+                else:
+                    offset_world = np.zeros(3, dtype=np.float32)
+                light_position = camera_position + offset_world
+                light_target = light_target + offset_world
+            light_cam = build_perspective_camera(
+                position=light_position,
+                target=light_target,
+                width=width,
+                height=height,
+                fov_deg=fov_deg,
+                znear=znear,
+                zfar=zfar,
+                device=device,
+            )
+            light_pkg = _render_gaussians(
+                light_cam,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
+            shadow_depth_inv = light_pkg.get("depth")
+            if shadow_depth_inv is not None:
+                shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                shadow_intrinsics = intrinsics_from_camera(light_cam)
+        render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+            img_pkg=img_pkg,
+            camera=camera,
+            cl_config=cl_config,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_intrinsics=shadow_intrinsics,
+            cl_light_world=cl_light_world,
+            light_config=light_config,
+            frame_index=frame_counter,
+            light_seed_offset=light_seed_offset,
+            metrics=metrics,
+            use_gpu_video=use_gpu_video,
+        )
 
         # Save requested artifacts.
         if save_rgb_frames:
@@ -2699,7 +3072,11 @@ def render_actor_camera_only_sequence(
                     else contextlib.nullcontext()
                 )
                 with timing_ctx:
-                    imageio.imwrite(frame_path, render_uint8)
+                    if render_uint8_cpu is None:
+                        render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                            render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                    imageio.imwrite(frame_path, render_uint8_cpu)
             except Exception as e:
                 print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
         if save_depth_maps:
@@ -2717,13 +3094,7 @@ def render_actor_camera_only_sequence(
                 print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
         if save_camera_metadata:
             try:
-                _save_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=frame_counter,
-                    camera=camera,
-                    orthographic=False,
-                )
+                camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
             except Exception as e:
                 print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
 
@@ -2731,12 +3102,15 @@ def render_actor_camera_only_sequence(
         if video:
             try:
                 timing_ctx = (
-                    metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                    metrics.measure(video_stage)
                     if metrics is not None
                     else contextlib.nullcontext()
                 )
                 with timing_ctx:
-                    writer.append_data(render_uint8)
+                    if use_gpu_video:
+                        writer.append_data(render_uint8_gpu)
+                    else:
+                        writer.append_data(render_uint8_cpu)
             except Exception as e:
                 print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                 raise
@@ -2755,6 +3129,11 @@ def render_actor_camera_only_sequence(
             )
 
     camera_xy_seq = [pos[:2].copy() for pos in camera_positions]
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=frames_dir.parent, label_id=label_id, camera_frames=camera_frames)
+        except Exception as e:
+            print(f"[WARN] Failed to save camera metadata for path {scene_id}/{label_id}: {e}", flush=True)
     return camera_xy_seq, actor_xy_seq_would_be
 
 def render_actor_follow_sequence(
@@ -2767,6 +3146,7 @@ def render_actor_follow_sequence(
     camera_z: float,
     look_ahead: float,
     look_down: float,
+    reverse_forward: bool,
     gaussians: GaussianModel,
     pipeline: PipelineParams,
     device: torch.device,
@@ -2806,6 +3186,10 @@ def render_actor_follow_sequence(
     npc_actor_runtime: ActorRuntime | None = None,
     npc_actor_pool: NPCActorPool | None = None,
     npc_frame_pool: NPCFramePool | None = None,
+    light_config: LightFilterConfig | None = None,
+    light_seed_offset: int = 0,
+    cl_config: CameraLightConfig | None = None,
+    cl_light_world: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], list[np.ndarray]]:
     """Render combined scene+actor frames using either CPU or GPU composition."""
 
@@ -2813,6 +3197,12 @@ def render_actor_follow_sequence(
     sequence = actor_runtime.sequence
     if not sequence.frames:
         raise ValueError("Actor sequence is empty; cannot render.")
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     sampler = PathSampler(path_xy)  
     distances = list(sampler.cumulative)
@@ -2941,6 +3331,7 @@ def render_actor_follow_sequence(
     frame_counter = 0
     prev_forward: np.ndarray | None = None
     direction_window = STABILIZE_WINDOW if stabilize else 1
+    camera_frames: list[dict] = []
 
     if metrics:
         metrics.sample_vram()
@@ -2966,11 +3357,18 @@ def render_actor_follow_sequence(
                 if blended_norm > EPS:
                     forward = (blended / blended_norm).astype(np.float32)
                     forward[2] = 0.0
+            if reverse_forward:
+                forward = -forward
             prev_forward = forward.copy()
 
             # Transform actor for this frame
             base_frame = sequence.frames[plan.base_frame_index]
-            actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+            actor_data = apply_transform_to_frame(
+                base_frame,
+                sequence,
+                plan.transform,
+                backend=PLY_TRANSFORM_BACKEND,
+            )
 
             npc_actor_frames: list[ActorRenderFrame] = []
             npc_debug_vertices: list[np.ndarray] = []
@@ -3045,6 +3443,7 @@ def render_actor_follow_sequence(
                         radii_m=npc_radii,
                         center_mask=npc_center_mask,
                         center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                        backend=NPC_PLACEMENT_BACKEND,
                     )
                     placed_radii = [
                         npc_radii[idx]
@@ -3089,7 +3488,7 @@ def render_actor_follow_sequence(
                             out_path=out_path,
                         )
                     npc_shortfall_total += shortfall
-                    if verbose and shortfall > 0:
+                    if NPC_VERBOSE_ENABLED and shortfall > 0:
                         print(
                             f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                             flush=True,
@@ -3137,7 +3536,12 @@ def render_actor_follow_sequence(
                                     max(npc_num_frames - 1, 0),
                                 )
                             base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                        npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                        npc_data = apply_transform_to_frame(
+                            base_npc_frame,
+                            npc_sequence,
+                            transform,
+                            backend=PLY_TRANSFORM_BACKEND,
+                        )
                         if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                             npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
                         npc_actor_frames.append(
@@ -3220,10 +3624,60 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}")
                 print(f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}")
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
-            render = img_pkg['render'].detach().cpu().numpy()
-            render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-            render_uint8 = np.rot90(render_uint8, k=2)
+            img_pkg = _render_gaussians(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
+            shadow_depth_inv = None
+            shadow_intrinsics = None
+            if cl_config is not None and cl_config.shadow_enabled:
+                offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                if np.any(offset_cam):
+                    cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                    offset_world = cam_to_world[:3, :3] @ offset_cam
+                else:
+                    offset_world = np.zeros(3, dtype=np.float32)
+                light_position = camera_position + offset_world
+                light_target = target + offset_world
+                light_cam = build_perspective_camera(
+                    position=light_position,
+                    target=light_target,
+                    width=width,
+                    height=height,
+                    fov_deg=fov_deg,
+                    znear=znear,
+                    zfar=zfar,
+                    device=device,
+                )
+                light_pkg = _render_gaussians(
+                    light_cam,
+                    combined_model,
+                    pipeline,
+                    bg_color=bg_color,
+                    orthographic=False,
+                    antialiasing=pipeline.antialiasing,
+                )
+                shadow_depth_inv = light_pkg.get("depth")
+                if shadow_depth_inv is not None:
+                    shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                    shadow_intrinsics = intrinsics_from_camera(light_cam)
+            render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+                img_pkg=img_pkg,
+                camera=camera,
+                cl_config=cl_config,
+                shadow_depth_inv=shadow_depth_inv,
+                shadow_intrinsics=shadow_intrinsics,
+                cl_light_world=cl_light_world,
+                light_config=light_config,
+                frame_index=frame_counter,
+                light_seed_offset=light_seed_offset,
+                metrics=metrics,
+                use_gpu_video=use_gpu_video,
+            )
 
             # Save requested artifacts without blocking rendering.
             if save_rgb_frames:
@@ -3235,7 +3689,11 @@ def render_actor_follow_sequence(
                         else contextlib.nullcontext()
                     )
                     with timing_ctx:
-                        imageio.imwrite(frame_path, render_uint8)
+                        if render_uint8_cpu is None:
+                            render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                                render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                            )
+                        imageio.imwrite(frame_path, render_uint8_cpu)
                 except Exception as e:
                     print(f"[WARN] Failed to save RGB frame {frame_counter}: {e}", flush=True)
             if save_depth_maps:
@@ -3253,13 +3711,7 @@ def render_actor_follow_sequence(
                     print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
             if save_camera_metadata:
                 try:
-                    _save_camera_metadata(
-                        frames_dir=frames_dir,
-                        frame_prefix=frame_prefix,
-                        frame_idx=frame_counter,
-                        camera=camera,
-                        orthographic=False,
-                    )
+                    camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
                 except Exception as e:
                     print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
             
@@ -3267,12 +3719,15 @@ def render_actor_follow_sequence(
             if video:
                 try:
                     timing_ctx = (
-                        metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                        metrics.measure(video_stage)
                         if metrics is not None
                         else contextlib.nullcontext()
                     )
                     with timing_ctx:
-                        writer.append_data(render_uint8)
+                        if use_gpu_video:
+                            writer.append_data(render_uint8_gpu)
+                        else:
+                            writer.append_data(render_uint8_cpu)
                 except Exception as e:
                     print(f"[ERROR] Failed to append frame {frame_counter} to video: {e}", flush=True)
                     raise  # Re-raise video errors as they're critical
@@ -3295,7 +3750,7 @@ def render_actor_follow_sequence(
                 f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
                 flush=True,
             )
-        if npc_active and verbose and npc_shortfall_total > 0:
+        if npc_active and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
             print(
                 f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
                 flush=True,
@@ -3329,10 +3784,17 @@ def render_actor_follow_sequence(
             if blended_norm > EPS:
                 forward = (blended / blended_norm).astype(np.float32)
                 forward[2] = 0.0
+        if reverse_forward:
+            forward = -forward
         prev_forward = forward.copy()
 
         base_frame = sequence.frames[plan.base_frame_index]
-        actor_data = apply_transform_to_frame(base_frame, sequence, plan.transform)
+        actor_data = apply_transform_to_frame(
+            base_frame,
+            sequence,
+            plan.transform,
+            backend=PLY_TRANSFORM_BACKEND,
+        )
 
         npc_vertex_entries: list[np.ndarray] = []
         npc_debug_vertices: list[np.ndarray] = []
@@ -3407,6 +3869,7 @@ def render_actor_follow_sequence(
                     radii_m=npc_radii,
                     center_mask=npc_center_mask,
                     center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                    backend=NPC_PLACEMENT_BACKEND,
                 )
                 placed_radii = [
                     npc_radii[idx]
@@ -3494,7 +3957,12 @@ def render_actor_follow_sequence(
                                 max(npc_num_frames - 1, 0),
                             )
                         base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                    npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                    npc_data = apply_transform_to_frame(
+                        base_npc_frame,
+                        npc_sequence,
+                        transform,
+                        backend=PLY_TRANSFORM_BACKEND,
+                    )
                     npc_vertex_entries.append(ply_utils.align_dtype(npc_data, scene_dtype))
                     if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                         npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
@@ -3538,18 +4006,79 @@ def render_actor_follow_sequence(
             device=device,
         )
 
-        img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
-        render = img_pkg['render'].detach().cpu().numpy()
-        render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-        render_uint8 = np.rot90(render_uint8, k=2)
+        img_pkg = _render_gaussians(
+            camera,
+            frame_gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=False,
+            antialiasing=pipeline.antialiasing,
+        )
+        shadow_depth_inv = None
+        shadow_intrinsics = None
+        if cl_config is not None and cl_config.shadow_enabled:
+            if cl_light_world is not None:
+                light_position = cl_light_world
+                light_target = camera_position
+            else:
+                if cl_config.light_reverse:
+                    light_target = camera_position - (target - camera_position)
+                else:
+                    light_target = target
+                offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                if np.any(offset_cam):
+                    cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                    offset_world = cam_to_world[:3, :3] @ offset_cam
+                else:
+                    offset_world = np.zeros(3, dtype=np.float32)
+                light_position = camera_position + offset_world
+                light_target = light_target + offset_world
+            light_cam = build_perspective_camera(
+                position=light_position,
+                target=light_target,
+                width=width,
+                height=height,
+                fov_deg=fov_deg,
+                znear=znear,
+                zfar=zfar,
+                device=device,
+            )
+            light_pkg = _render_gaussians(
+                light_cam,
+                frame_gaussians,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+                antialiasing=pipeline.antialiasing,
+            )
+            shadow_depth_inv = light_pkg.get("depth")
+            if shadow_depth_inv is not None:
+                shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                shadow_intrinsics = intrinsics_from_camera(light_cam)
+        render_uint8_cpu, render_uint8_gpu = _prepare_render_uint8(
+            img_pkg=img_pkg,
+            camera=camera,
+            cl_config=cl_config,
+            shadow_depth_inv=shadow_depth_inv,
+            shadow_intrinsics=shadow_intrinsics,
+            cl_light_world=cl_light_world,
+            light_config=light_config,
+            frame_index=frame_counter,
+            light_seed_offset=light_seed_offset,
+            metrics=metrics,
+            use_gpu_video=use_gpu_video,
+        )
 
         if video:
             with (
-                metrics.measure(PathMetricRecorder.VIDEO_STAGE)
+                metrics.measure(video_stage)
                 if metrics is not None
                 else contextlib.nullcontext()
             ):
-                writer.append_data(render_uint8)
+                if use_gpu_video:
+                    writer.append_data(render_uint8_gpu)
+                else:
+                    writer.append_data(render_uint8_cpu)
         elif save_rgb_frames:
             frame_path = frames_dir / f"{frame_prefix}_{frame_counter:04d}.png"
             with (
@@ -3557,7 +4086,11 @@ def render_actor_follow_sequence(
                 if metrics is not None
                 else contextlib.nullcontext()
             ):
-                imageio.imwrite(frame_path, render_uint8)
+                if render_uint8_cpu is None:
+                    render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                        render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                    )
+                imageio.imwrite(frame_path, render_uint8_cpu)
         if save_depth_maps:
             try:
                 _save_depth_map(
@@ -3573,13 +4106,7 @@ def render_actor_follow_sequence(
                 print(f"[WARN] Failed to save depth for frame {frame_counter}: {e}", flush=True)
         if save_camera_metadata:
             try:
-                _save_camera_metadata(
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=frame_counter,
-                    camera=camera,
-                    orthographic=False,
-                )
+                camera_frames.append(_camera_frame_metadata(frame_counter, camera, orthographic=False))
             except Exception as e:
                 print(f"[WARN] Failed to save camera metadata for frame {frame_counter}: {e}", flush=True)
         frame_counter += 1
@@ -3597,11 +4124,17 @@ def render_actor_follow_sequence(
             f"[VERBOSE] Scene {scene_id} / {label_id}: actor rendering complete ({frame_counter} frames).",
             flush=True,
         )
-    if npc_active and verbose and npc_shortfall_total > 0:
+    if npc_active and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
         print(
             f"[VERBOSE] Scene {scene_id} / {label_id}: NPC placement shortfall total {npc_shortfall_total}.",
             flush=True,
         )
+
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=frames_dir.parent, label_id=label_id, camera_frames=camera_frames)
+        except Exception as e:
+            print(f"[WARN] Failed to save camera metadata for path {scene_id}/{label_id}: {e}", flush=True)
 
     return camera_xy_seq, actor_xy_seq
 
@@ -3670,14 +4203,43 @@ def find_ply_file(dataset_dir: Path) -> Path:
     raise FileNotFoundError(f"No .ply file found in {dataset_dir}")
 
 
+def infer_sh_degree_from_ply(ply_path: Path) -> int:
+    """Infer spherical harmonic degree from a PLY file (compressed or raw)."""
+
+    ply = PlyData.read(str(ply_path))
+    if "sh" in ply:
+        sh_names = ply["sh"].data.dtype.names or ()
+        sh_count = len(sh_names)
+        if sh_count and sh_count % 3 == 0:
+            rest_dim = sh_count // 3
+            return int(round(math.sqrt(rest_dim + 1) - 1))
+        return 0
+
+    vertex = ply["vertex"]
+    vertex_names = vertex.data.dtype.names or ()
+    rest_names = [name for name in vertex_names if name.startswith("f_rest_")]
+    if rest_names:
+        rest_dim = len(rest_names) // 3
+        return int(round(math.sqrt(rest_dim + 1) - 1))
+    return 0
+
+
 def prepare_path_data(
     json_path: Path,
     meta: dict,
     stride: int,
     mirror_translation: bool,
     swap_xy: bool,
+    resample_step: float,
+    handedness: str = "left",
+    negate_xy: bool = False,
 ) -> PreparedPath:
-    raw_points, raster_pixels = load_raster_world_points(json_path, swap_xy=swap_xy)
+    raw_points, raster_pixels = load_raster_world_points(
+        json_path,
+        swap_xy=swap_xy,
+        handedness=handedness,
+        negate_xy=negate_xy,
+    )
     a_x, b_x, a_y, b_y = derive_affine_transform(raw_points, raster_pixels, meta)
     transformed = [
         np.array([a_x * pt[0] + b_x, a_y * pt[1] + b_y], dtype=np.float32)
@@ -3698,6 +4260,12 @@ def prepare_path_data(
         ]
     else:
         path_xy = [np.array([pt[0], pt[1]], dtype=np.float32) for pt in sampled_xy]
+
+    if resample_step > 0.0:
+        resampled = resample_path_by_distance(path_xy, resample_step)
+        if len(resampled) >= 2:
+            path_xy = resampled
+            sampled_xy = resampled
 
     return PreparedPath(
         path_xy=path_xy,
@@ -3939,6 +4507,7 @@ def render_path_frames(
     meta: dict,
     output_dir: Path,
     stride: int,
+    resample_step: float,
     height_offset: float,
     look_ahead: float,
     look_down: float,
@@ -3950,6 +4519,9 @@ def render_path_frames(
     overwrite: bool,
     view_mode: str,
     swap_xy: bool,
+    path_handedness: str,
+    negate_raster_world_xy: bool,
+    reverse_forward: bool,
     stabilize: bool,
     video: bool,
     debug: bool,
@@ -3957,6 +4529,7 @@ def render_path_frames(
     render_bev: bool,
     actor_runtime: ActorRuntime | None,
     default_follow_distance: float,
+    limit_camera_to_follow: bool,
     verbose: bool,
     hide_actor_enabled: bool = False,
     mirror_bev_x = False,
@@ -3975,6 +4548,9 @@ def render_path_frames(
     prepared_path: PreparedPath | None = None,
     navdp_manager: NavdpPlyCoordinator | None = None,
     metrics_enabled: bool = False,
+    light_config: LightFilterConfig | None = None,
+    cl_config: CameraLightConfig | None = None,
+    cl_light_world: np.ndarray | None = None,
     job_slot: int | None = None,
     job_actor_id: str | None = None,
     job_name: str | None = None,
@@ -3996,6 +4572,10 @@ def render_path_frames(
     npc_bloom_mask: np.ndarray | None = None,
     npc_bloom_radius_m: float | None = None,
     npc_bloom_radius_px: int | None = None,
+    camera_human_sequence: ActorSequence | None = None,
+    camera_human_stride: int = 1,
+    camera_human_max_frames: int | None = None,
+    validate_path_bounds_enabled: bool = True,
 ) -> dict | None:
     """Render frames for a single raster_world trajectory."""
 
@@ -4004,6 +4584,11 @@ def render_path_frames(
     metrics_recorder = PathMetricRecorder(device=device) if metrics_enabled else None
     if metrics_recorder:
         metrics_recorder.sample_vram()
+    light_seed_offset = (
+        stable_hash_seed(f"{scene_id}:{json_path.stem}")
+        if light_config is not None and light_config.enabled()
+        else 0
+    )
 
     path_data = prepared_path or prepare_path_data(
         json_path=json_path,
@@ -4011,10 +4596,26 @@ def render_path_frames(
         stride=stride,
         mirror_translation=mirror_translation,
         swap_xy=swap_xy,
+        handedness=path_handedness,
+        negate_xy=negate_raster_world_xy,
+        resample_step=resample_step,
     )
+    if validate_path_bounds_enabled:
+        validate_path_bounds(
+            json_path=json_path,
+            meta=meta,
+            path_xy=path_data.path_xy,
+            raw_points=path_data.raw_points,
+        )
     path_xy = path_data.path_xy
     if len(path_xy) < 2:
         raise ValueError(f"Need at least two distinct points in {json_path}")
+    use_gpu_video = video and VIDEO_WRITER_BACKEND == VideoWriterBackend.GPU
+    video_stage = (
+        PathMetricRecorder.VIDEO_ENCODE_STAGE
+        if use_gpu_video
+        else PathMetricRecorder.VIDEO_STAGE
+    )
 
     floor_z = path_data.floor_z
     ceiling = path_data.ceiling
@@ -4027,9 +4628,26 @@ def render_path_frames(
         else float(default_follow_distance)
     )
 
-    positions = [
-        np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
-    ]
+    if limit_camera_to_follow and actor_runtime is None:
+        sampler_for_camera = PathSampler(path_xy)
+        total_length = sampler_for_camera.total_length
+        follow_distance_m = max(float(used_follow_distance), 0.0)
+        max_camera_distance = max(total_length - follow_distance_m, 0.0)
+        capped_xy: list[np.ndarray] = []
+        for dist in sampler_for_camera.cumulative:
+            camera_distance = min(float(dist), max_camera_distance)
+            capped_xy.append(sampler_for_camera.position_at(camera_distance))
+            if camera_distance >= max_camera_distance - 1e-6:
+                break
+        if len(capped_xy) < 2:
+            capped_xy = [np.asarray(path_xy[0], dtype=np.float32), np.asarray(path_xy[-1], dtype=np.float32)]
+        positions = [
+            np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in capped_xy
+        ]
+    else:
+        positions = [
+            np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in path_xy
+        ]
     npc_has_actor = (
         npc_actor_runtime is not None
         or npc_actor_pool is not None
@@ -4057,7 +4675,7 @@ def render_path_frames(
         npc_bloom_radius_m = float(npc_config.clearance_radius)
     if npc_bloom_radius_px is None and npc_bloom_radius_m is not None and npc_meta is not None:
         npc_bloom_radius_px = max(1, _meters_to_px_ceil(npc_meta, npc_bloom_radius_m))
-    if npc_bev_render_debug and npc_bloom_mask is None and npc_free_mask is not None and verbose:
+    if npc_bev_render_debug and npc_bloom_mask is None and npc_free_mask is not None and NPC_VERBOSE_ENABLED:
         print("[WARN] npc_bev_render_debug missing bloom mask; overlay disabled.", flush=True)
     npc_use_actor_pool = npc_actor_pool is not None
     npc_use_frame_pool = npc_frame_pool is not None
@@ -4120,6 +4738,7 @@ def render_path_frames(
             f"y' = {a_y:.6f} * y + {b_y:.6f} (swap_xy={swap_xy})",
             flush=True,
         )
+        print(f"[DEBUG] Path handedness: {path_handedness}", flush=True)
         raw_preview = [tuple(map(float, pt)) for pt in path_data.raw_points[:5]]
         preview = [tuple(map(float, pts)) for pts in path_data.sampled_xy[:5]]
         print(
@@ -4145,6 +4764,7 @@ def render_path_frames(
     video_dir = output_dir / scene_id
     video_path = video_dir / f"{json_path.stem}.mp4"
     npc_bev_render_dir = frames_dir / "__npc_bev_debug_render"
+    camera_frames: list[dict] = []
     
     # Always create frames_dir since per-frame outputs (camera/depth/RGB) live there.
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -4170,10 +4790,25 @@ def render_path_frames(
         cam_seq: list[np.ndarray] = []
         act_seq: list[np.ndarray] | None = None
         writer_ctx = (
-            imageio.get_writer(
+            make_video_writer(
                 video_path,
-                mode="I",
                 fps=DEFAULT_VIDEO_FPS,
+                backend=VIDEO_WRITER_BACKEND,
+                nvenc_preset=VIDEO_NVENC_PRESET,
+                nvenc_bitrate=VIDEO_NVENC_BITRATE,
+                width=width,
+                height=height,
+                gpu_format=GPU_VIDEO_FORMAT,
+                encode_timer=(
+                    (lambda: metrics_recorder.measure(PathMetricRecorder.VIDEO_ENCODE_STAGE))
+                    if metrics_recorder is not None and use_gpu_video
+                    else None
+                ),
+                mux_timer=(
+                    (lambda: metrics_recorder.measure(PathMetricRecorder.VIDEO_MUX_STAGE))
+                    if metrics_recorder is not None and use_gpu_video
+                    else None
+                ),
             )
             if effective_video
             else contextlib.nullcontext()
@@ -4205,6 +4840,7 @@ def render_path_frames(
                         camera_z=camera_z,
                         look_ahead=look_ahead,
                         look_down=look_down,
+                        reverse_forward=reverse_forward,
                         gaussians=gaussians,
                         pipeline=pipeline,
                         device=device,
@@ -4226,6 +4862,10 @@ def render_path_frames(
                         stabilize=stabilize,
                         verbose=verbose,
                         dump=dump_options,
+                        light_config=light_config,
+                        light_seed_offset=light_seed_offset,
+                        cl_config=cl_config,
+                        cl_light_world=cl_light_world,
                         metrics=metrics_recorder,
                     )
                     frames_rendered = len(cam_seq)
@@ -4239,6 +4879,7 @@ def render_path_frames(
                         camera_z=camera_z,
                         look_ahead=look_ahead,
                         look_down=look_down,
+                        reverse_forward=reverse_forward,
                         gaussians=gaussians,
                         pipeline=pipeline,
                         device=device,
@@ -4278,6 +4919,10 @@ def render_path_frames(
                         npc_actor_runtime=npc_actor_runtime,
                         npc_actor_pool=npc_actor_pool,
                         npc_frame_pool=npc_frame_pool,
+                        light_config=light_config,
+                        light_seed_offset=light_seed_offset,
+                        cl_config=cl_config,
+                        cl_light_world=cl_light_world,
                     )
                     frames_rendered = len(cam_seq)
                 if render_bev:
@@ -4366,6 +5011,8 @@ def render_path_frames(
                             if blended_norm > EPS:
                                 forward = (blended / blended_norm).astype(np.float32)
                                 forward[2] = 0.0
+                        if reverse_forward:
+                            forward = -forward
                         prev_forward = forward.copy()
 
                     npc_actor_frames: list[ActorRenderFrame] = []
@@ -4442,6 +5089,7 @@ def render_path_frames(
                                 radii_m=npc_radii,
                                 center_mask=npc_center_mask,
                                 center_mask_is_bloomed=npc_center_mask_is_bloomed,
+                                backend=NPC_PLACEMENT_BACKEND,
                             )
                             placed_radii = [
                                 npc_radii[idx]
@@ -4486,7 +5134,7 @@ def render_path_frames(
                                     out_path=out_path,
                                 )
                             npc_shortfall_total += shortfall
-                            if verbose and shortfall > 0:
+                            if NPC_VERBOSE_ENABLED and shortfall > 0:
                                 print(
                                     f"[VERBOSE] NPC shortfall frame {idx}: {shortfall} (requested {placement.requested_count})",
                                     flush=True,
@@ -4534,7 +5182,12 @@ def render_path_frames(
                                             max(npc_num_frames - 1, 0),
                                         )
                                     base_npc_frame = npc_sequence.frames[npc_anim_idx]
-                                npc_data = apply_transform_to_frame(base_npc_frame, npc_sequence, transform)
+                                npc_data = apply_transform_to_frame(
+                                    base_npc_frame,
+                                    npc_sequence,
+                                    transform,
+                                    backend=PLY_TRANSFORM_BACKEND,
+                                )
                                 if dump_enabled and (dump_max is None or dump_count < dump_max) and (idx % dump_stride == 0):
                                     npc_debug_vertices.append(_build_actor_debug_vertices(npc_data, npc_sequence))
                                 if gpu_only:
@@ -4629,13 +5282,103 @@ def render_path_frames(
                         device,
                         verbose,
                     ):
-                        img_pkg = render_or(camera, render_gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
-                    render = img_pkg["render"].detach().cpu().numpy()
-                    render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
-                    if orthographic:
-                        render_uint8 = np.rot90(render_uint8, k=1)
+                        img_pkg = _render_gaussians(
+                            camera,
+                            render_gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=orthographic,
+                            antialiasing=pipeline.antialiasing,
+                        )
+                    shadow_depth_inv = None
+                    shadow_intrinsics = None
+                    if not orthographic and cl_config is not None and cl_config.shadow_enabled:
+                        if cl_light_world is not None:
+                            light_position = cl_light_world
+                            light_target = position
+                        else:
+                            if cl_config.light_reverse:
+                                light_target = position - (target - position)
+                            else:
+                                light_target = target
+                            offset_cam = np.array(cl_config.offset_cam, dtype=np.float32)
+                            if np.any(offset_cam):
+                                cam_to_world = torch.inverse(camera.world_view_transform).detach().cpu().numpy()
+                                offset_world = cam_to_world[:3, :3] @ offset_cam
+                            else:
+                                offset_world = np.zeros(3, dtype=np.float32)
+                            light_position = position + offset_world
+                            light_target = light_target + offset_world
+                        light_cam = build_perspective_camera(
+                            position=light_position,
+                            target=light_target,
+                            width=width,
+                            height=height,
+                            fov_deg=fov_deg,
+                            znear=znear,
+                            zfar=zfar,
+                            device=device,
+                        )
+                        light_pkg = _render_gaussians(
+                            light_cam,
+                            render_gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=False,
+                            antialiasing=pipeline.antialiasing,
+                        )
+                        shadow_depth_inv = light_pkg.get("depth")
+                        if shadow_depth_inv is not None:
+                            shadow_depth_inv = shadow_depth_inv.detach().cpu().numpy()
+                            shadow_intrinsics = intrinsics_from_camera(light_cam)
+                    render_uint8_cpu: np.ndarray | None = None
+                    render_uint8_gpu: torch.Tensor | None = None
+                    if use_gpu_video:
+                        if (cl_config is not None and cl_config.active()) or (
+                            light_config is not None and light_config.enabled()
+                        ):
+                            raise RuntimeError(
+                                "GPU video backend does not support CPU light filters; disable "
+                                "--cl-enable/--light-mode for video-backend=gpu."
+                            )
+                        render_tensor = img_pkg["render"]
+                        render_uint8_gpu = _render_tensor_to_gpu_format(
+                            render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                        if orthographic:
+                            render_uint8_gpu = torch.rot90(render_uint8_gpu, k=1, dims=(0, 1))
+                        else:
+                            render_uint8_gpu = render_uint8_gpu.flip((0, 1))
+                        render_uint8_gpu = render_uint8_gpu.contiguous()
                     else:
-                        render_uint8 = np.rot90(render_uint8, k=2)
+                        render = img_pkg["render"].detach().cpu().numpy()
+                        if not orthographic:
+                            render = _apply_camera_light_if_enabled(
+                                render,
+                                img_pkg,
+                                camera,
+                                cl_config,
+                                shadow_depth_inv=shadow_depth_inv,
+                                shadow_intrinsics=shadow_intrinsics,
+                                cl_light_world=cl_light_world,
+                                metrics=metrics_recorder,
+                            )
+                        render = _apply_light_filter_if_enabled(
+                            render,
+                            light_config,
+                            frame_index=idx,
+                            seed_offset=light_seed_offset,
+                            metrics=metrics_recorder,
+                        )
+                        render_uint8_cpu = (
+                            (np.clip(render, 0.0, 1.0) * 255.0)
+                            .astype(np.uint8)
+                            .transpose(1, 2, 0)
+                        )
+                        if orthographic:
+                            render_uint8_cpu = np.rot90(render_uint8_cpu, k=1)
+                        else:
+                            render_uint8_cpu = np.rot90(render_uint8_cpu, k=2)
 
                     if save_rgb_frames:
                         try:
@@ -4646,7 +5389,11 @@ def render_path_frames(
                                 else contextlib.nullcontext()
                             )
                             with timing_ctx:
-                                imageio.imwrite(frame_path, render_uint8)
+                                if render_uint8_cpu is None:
+                                    render_uint8_cpu = _gpu_format_to_rgb_cpu(
+                                        render_uint8_gpu, gpu_format=GPU_VIDEO_FORMAT
+                                    )
+                                imageio.imwrite(frame_path, render_uint8_cpu)
                         except Exception as e:
                             print(f"[WARN] Failed to save RGB frame {idx}: {e}", flush=True)
                     if save_depth_maps:
@@ -4664,13 +5411,7 @@ def render_path_frames(
                             print(f"[WARN] Failed to save depth for frame {idx}: {e}", flush=True)
                     if save_camera_metadata:
                         try:
-                            _save_camera_metadata(
-                                frames_dir=frames_dir,
-                                frame_prefix="frame",
-                                frame_idx=idx,
-                                camera=camera,
-                                orthographic=orthographic,
-                            )
+                            camera_frames.append(_camera_frame_metadata(idx, camera, orthographic=orthographic))
                         except Exception as e:
                             print(f"[WARN] Failed to save camera metadata for frame {idx}: {e}", flush=True)
                     
@@ -4678,12 +5419,15 @@ def render_path_frames(
                     if video:
                         try:
                             timing_ctx = (
-                                metrics_recorder.measure(PathMetricRecorder.VIDEO_STAGE)
+                                metrics_recorder.measure(video_stage)
                                 if metrics_recorder is not None
                                 else contextlib.nullcontext()
                             )
                             with timing_ctx:
-                                writer.append_data(render_uint8)
+                                if use_gpu_video:
+                                    writer.append_data(render_uint8_gpu)
+                                else:
+                                    writer.append_data(render_uint8_cpu)
                         except Exception as e:
                             print(f"[ERROR] Failed to append frame {idx} to video: {e}", flush=True)
                             raise
@@ -4700,10 +5444,35 @@ def render_path_frames(
                             flush=True,
                         )
                 frames_rendered = total_positions
-                if npc_enabled and verbose and npc_shortfall_total > 0:
+                if npc_enabled and NPC_VERBOSE_ENABLED and npc_shortfall_total > 0:
                     print(
                         f"[VERBOSE] Scene {scene_id} / {json_path.stem}: NPC placement shortfall total {npc_shortfall_total}.",
                         flush=True,
+                    )
+                if render_bev:
+                    if verbose:
+                        print(
+                            f"[VERBOSE] Scene {scene_id} / {json_path.stem}: saving BEV debug image.",
+                            flush=True,
+                        )
+                    bev_dir = output_dir / scene_id
+                    bev_dir.mkdir(parents=True, exist_ok=True)
+                    bev_path = bev_dir / f"{json_path.stem}_BEV.png"
+                    sampler_for_len = PathSampler(path_xy)
+                    save_bev_debug_image(
+                        scene_id=scene_id,
+                        label_id=json_path.stem,
+                        meta=meta,
+                        camera_xy_seq=cam_seq,
+                        actor_xy_seq=None,
+                        out_path=bev_path,
+                        look_ahead=look_ahead,
+                        follow_points=None,
+                        total_length_m=sampler_for_len.total_length,
+                        fps=DEFAULT_VIDEO_FPS,
+                        actor_path_dotted=False,
+                        mirror_bev_x=mirror_bev_x,
+                        mirror_bev_y=mirror_bev_y,
                     )
 
             if verbose:
@@ -4711,6 +5480,23 @@ def render_path_frames(
                     f"[VERBOSE] Scene {scene_id} / {json_path.stem}: render finished.",
                     flush=True,
                 )
+
+    if camera_human_sequence is not None:
+        if actor_runtime is not None:
+            camera_positions = [
+                np.array([xy[0], xy[1], camera_z], dtype=np.float32) for xy in cam_seq
+            ]
+        else:
+            camera_positions = positions
+        dump_camera_human_plys(
+            camera_positions=camera_positions,
+            scene_template=scene_template,
+            sequence=camera_human_sequence,
+            frames_dir=frames_dir,
+            frame_prefix="frame",
+            stride=camera_human_stride,
+            max_frames=camera_human_max_frames,
+        )
 
     duration = time.perf_counter() - start_time
     if frames_rendered > 0:
@@ -4732,12 +5518,21 @@ def render_path_frames(
             camera_xy_seq=cam_seq,
             meta=meta,
             follow_distance=used_follow_distance,
-            limit_to_follow=actor_runtime is not None,
+            limit_to_follow=actor_runtime is not None or bool(limit_camera_to_follow),
         )
         metadata_path = output_dir / scene_id / f"{json_path.stem}_follow_path.json"
         metadata_path.parent.mkdir(parents=True, exist_ok=True)
         with metadata_path.open("w", encoding="utf-8") as meta_fh:
             json.dump(metadata_payload, meta_fh, indent=2)
+
+    if save_camera_metadata and camera_frames:
+        try:
+            _write_camera_metadata_for_path(scene_dir=video_dir, label_id=json_path.stem, camera_frames=camera_frames)
+        except Exception as exc:  # pylint: disable=broad-except
+            print(
+                f"      WARNING: Failed to write camera metadata for {scene_id}/{json_path.stem}: {exc}",
+                flush=True,
+            )
 
     if navdp_manager is not None:
         try:
@@ -4810,6 +5605,12 @@ def parse_args() -> ArgumentParser:
         help="Scene identifier(s) present in both data/scenes and data/task_outputs_10w.",
     )
     parser.add_argument(
+        "--validate-path-bounds",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Validate that raster_world paths stay within occupancy bounds (default: on).",
+    )
+    parser.add_argument(
         "--label-id",
         action="append",
         dest="label_ids",
@@ -4821,6 +5622,24 @@ def parse_args() -> ArgumentParser:
         type=int,
         default=1,
         help="Render every Nth point along the raster_world polyline (default: 1).",
+    )
+    parser.add_argument(
+        "--path-resample-step",
+        type=float,
+        default=0.0,
+        help="Resample path points at a fixed step (meters) after stride/mirror to reduce jitter (default: 0).",
+    )
+    parser.add_argument(
+        "--sh-degree",
+        type=int,
+        default=-1,
+        help="Spherical harmonic degree cap (-1 for no limit; InteriorGS commonly used 3).",
+    )
+    parser.add_argument(
+        "--antialiasing",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable Gaussian rasterizer antialiasing (default: off).",
     )
     parser.add_argument(
         "--height-offset",
@@ -4896,6 +5715,41 @@ def parse_args() -> ArgumentParser:
         help="Limit the number of label-path JSON files processed per scene.",
     )
     parser.add_argument(
+        "--skip-summary",
+        action="store_true",
+        help="Skip summary.json files when collecting label paths.",
+    )
+    parser.add_argument(
+        "--camera-human-ply-dir",
+        type=Path,
+        default=None,
+        help="Directory of human PLYs to place at camera positions for debug dumps.",
+    )
+    parser.add_argument(
+        "--camera-human-height",
+        type=float,
+        default=1.7,
+        help="Height (meters) to normalize the camera human PLY (default: 1.7).",
+    )
+    parser.add_argument(
+        "--camera-human-seed",
+        type=int,
+        default=0,
+        help="Random seed for selecting the camera human PLY (default: 0).",
+    )
+    parser.add_argument(
+        "--camera-human-stride",
+        type=int,
+        default=1,
+        help="Stride for dumping camera human PLYs (default: 1).",
+    )
+    parser.add_argument(
+        "--camera-human-max-frames",
+        type=int,
+        default=None,
+        help="Maximum camera human PLY dumps per path (default: no limit).",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Print debug info such as currently loaded PLY file paths.",
@@ -4904,6 +5758,22 @@ def parse_args() -> ArgumentParser:
         "--swap-xy",
         action="store_true",
         help="Swap x/y when reading raster_world coordinates.",
+    )
+    parser.add_argument(
+        "--path-handedness",
+        choices=("left", "right"),
+        default="left",
+        help="Interpret raster_world coordinates as left/right-handed (right flips Y).",
+    )
+    parser.add_argument(
+        "--negate-raster-world-xy",
+        action="store_true",
+        help="Negate raster_world x/y before swap/handedness.",
+    )
+    parser.add_argument(
+        "--reverse-forward",
+        action="store_true",
+        help="Flip the forward direction to render the camera facing backward.",
     )
     parser.add_argument(
         "--stabilize",
@@ -4916,6 +5786,24 @@ def parse_args() -> ArgumentParser:
         action=BooleanOptionalAction,
         default=True,
         help="Write composited MP4 video (default). Use --no-video to keep per-frame PNGs only.",
+    )
+    parser.add_argument(
+        "--video-backend",
+        choices=[backend.value for backend in VideoWriterBackend],
+        default=VideoWriterBackend.NVENC.value,
+        help="Video writer backend (default: nvenc).",
+    )
+    parser.add_argument(
+        "--video-nvenc-preset",
+        type=str,
+        default=None,
+        help="NVENC preset to use when --video-backend=nvenc (example: p4, slow).",
+    )
+    parser.add_argument(
+        "--video-nvenc-bitrate",
+        type=str,
+        default=None,
+        help="NVENC bitrate to use when --video-backend=nvenc (example: 10M).",
     )
     parser.add_argument(
         "--rgb-frames",
@@ -4950,6 +5838,227 @@ def parse_args() -> ArgumentParser:
         action=BooleanOptionalAction,
         default=True,
         help="Write per-path follow metadata JSON (separate from per-frame camera metadata; default: on).",
+    )
+    parser.add_argument(
+        "--limit-camera-to-follow",
+        action=BooleanOptionalAction,
+        default=False,
+        help=(
+            "For actor-free renders, cap the camera path at path_length - follow_distance "
+            "so follow metadata matches the human/TeleSim actor placement convention."
+        ),
+    )
+    parser.add_argument(
+        "--light-mode",
+        choices=("none", "disk", "cl", "global"),
+        default="none",
+        help="Apply a lighting filter to RGB frames: none, disk, cl (camera light), or global.",
+    )
+    parser.add_argument(
+        "--light-strength",
+        type=float,
+        default=0.0,
+        help="Lighting strength (positive brightens, negative darkens; default: 0.0).",
+    )
+    parser.add_argument(
+        "--light-radius",
+        type=float,
+        default=0.45,
+        help="Disk/CL radius as fraction of min(width,height) (default: 0.45).",
+    )
+    parser.add_argument(
+        "--light-center",
+        type=float,
+        nargs=2,
+        metavar=("X", "Y"),
+        default=(0.5, 0.5),
+        help="Light center as normalized coordinates (default: 0.5 0.5).",
+    )
+    parser.add_argument(
+        "--light-jitter",
+        type=float,
+        default=0.0,
+        help="Randomize light center by this fraction of min(width,height) per frame (default: 0).",
+    )
+    parser.add_argument(
+        "--light-temp-k",
+        type=float,
+        default=0.0,
+        help="Color temperature in Kelvin applied to the light (0 disables, default: 0).",
+    )
+    parser.add_argument(
+        "--light-vignette",
+        type=float,
+        default=0.0,
+        help="Vignette strength applied after lighting (default: 0).",
+    )
+    parser.add_argument(
+        "--light-seed",
+        type=int,
+        default=0,
+        help="Seed for per-frame light jitter (default: 0).",
+    )
+    parser.add_argument(
+        "--cl-enable",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable camera-light shading using depth-derived normals (default: off).",
+    )
+    parser.add_argument(
+        "--cl-light-mode",
+        choices=("headlight", "bulb"),
+        default="headlight",
+        help="Light mode: headlight (camera-aligned) or bulb (point-light style).",
+    )
+    parser.add_argument(
+        "--cl-shading-model",
+        choices=("classic", "lambert"),
+        default="classic",
+        help="Shading model: classic (ambient+diffuse+specular) or lambert (ambient+diffuse).",
+    )
+    parser.add_argument(
+        "--cl-strength",
+        type=float,
+        default=1.0,
+        help="Camera light strength multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-color",
+        type=float,
+        nargs=3,
+        metavar=("R", "G", "B"),
+        default=(1.0, 1.0, 1.0),
+        help="Camera light color as RGB in 0..1 (default: 1 1 1).",
+    )
+    parser.add_argument(
+        "--cl-ambient",
+        type=float,
+        default=0.2,
+        help="Ambient term applied before camera light (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-base-scale",
+        type=float,
+        default=1.0,
+        help="Scale the base image before lighting (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-diffuse",
+        type=float,
+        default=1.0,
+        help="Diffuse term multiplier (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-specular",
+        type=float,
+        default=0.2,
+        help="Specular term multiplier (default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shininess",
+        type=float,
+        default=16.0,
+        help="Specular shininess exponent (default: 16).",
+    )
+    parser.add_argument(
+        "--cl-range",
+        type=float,
+        default=0.0,
+        help="Light falloff range in meters (0 disables attenuation).",
+    )
+    parser.add_argument(
+        "--cl-offset",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=(0.0, 0.0, 0.0),
+        help="Camera-light offset in camera coordinates (meters).",
+    )
+    parser.add_argument(
+        "--cl-light-reverse",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Rotate camera light direction 180 degrees (headlight only).",
+    )
+    parser.add_argument(
+        "--cl-light-world",
+        type=float,
+        nargs=3,
+        metavar=("X", "Y", "Z"),
+        default=None,
+        help="Fixed world-space light position; overrides camera-relative offset if set.",
+    )
+    parser.add_argument(
+        "--cl-light-center",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Place the light at the occupancy center (overrides --cl-light-world).",
+    )
+    parser.add_argument(
+        "--cl-light-center-z",
+        type=float,
+        default=2.0,
+        help="Z height (meters) used with --cl-light-center (default: 2.0).",
+    )
+    parser.add_argument(
+        "--cl-normal-smooth",
+        type=int,
+        default=0,
+        help="Box blur radius (pixels) for depth before normal recovery (default: 0).",
+    )
+    parser.add_argument(
+        "--cl-normal-filter",
+        choices=("none", "box", "bilateral"),
+        default="box",
+        help="Depth filter before normal recovery (default: box).",
+    )
+    parser.add_argument(
+        "--cl-normal-kernel",
+        type=int,
+        default=2,
+        help="Bilateral kernel radius in pixels (default: 2).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-range",
+        type=float,
+        default=0.1,
+        help="Bilateral range sigma in depth units (default: 0.1).",
+    )
+    parser.add_argument(
+        "--cl-normal-sigma-domain",
+        type=float,
+        default=1.0,
+        help="Bilateral domain sigma in pixels (default: 1.0).",
+    )
+    parser.add_argument(
+        "--cl-shadow",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable shadow mapping from the camera light (default: off).",
+    )
+    parser.add_argument(
+        "--cl-shadow-compare",
+        choices=("auto", "z", "radial"),
+        default="auto",
+        help="Shadow depth compare mode: auto, z, or radial (default: auto).",
+    )
+    parser.add_argument(
+        "--cl-shadow-bias",
+        type=float,
+        default=0.02,
+        help="Depth bias for shadow mapping (default: 0.02).",
+    )
+    parser.add_argument(
+        "--cl-shadow-strength",
+        type=float,
+        default=0.2,
+        help="Shadow strength multiplier (0=black, 1=no shadow; default: 0.2).",
+    )
+    parser.add_argument(
+        "--cl-shadow-pcf",
+        type=int,
+        default=0,
+        help="Shadow PCF radius in pixels for soft shadows (default: 0).",
     )
     parser.add_argument(
         "--no-mirror-translation",
@@ -5089,6 +6198,12 @@ def parse_args() -> ArgumentParser:
         help="Compose scene and actor entirely on GPU (no temporary PLYs, higher VRAM usage).",
     )
     parser.add_argument(
+        "--ply-transform-backend",
+        choices=[backend.value for backend in PlyTransformBackend],
+        default=PlyTransformBackend.GPU.value,
+        help="Backend for per-frame PLY transforms (default: gpu).",
+    )
+    parser.add_argument(
         "--animation-cycle-mod",
         type=int,
         default=3,
@@ -5155,6 +6270,12 @@ def parse_args() -> ArgumentParser:
         help="Write per-frame NPC BEV debug images using actual rendered placements.",
     )
     parser.add_argument(
+        "--npc-verbose",
+        action=BooleanOptionalAction,
+        default=False,
+        help="Enable verbose NPC placement logs (default: off).",
+    )
+    parser.add_argument(
         "--npc-bev-use-mask",
         action=BooleanOptionalAction,
         default=False,
@@ -5165,6 +6286,12 @@ def parse_args() -> ArgumentParser:
         action="store_true",
         default=False,
         help="Render NPCs into RGB/depth using the density planner (not just BEV overlays).",
+    )
+    parser.add_argument(
+        "--npc-placement-backend",
+        choices=[backend.value for backend in NPCPlacementBackend],
+        default=NPCPlacementBackend.GPU.value,
+        help="Backend for NPC placement sampling (default: gpu).",
     )
     parser.add_argument(
         "--npc-actor-dir",
@@ -5357,9 +6484,15 @@ def main() -> None:
     parser = parse_args()
     args = parser.parse_args()
     # Allow overriding dataset roots via CLI to keep worker commands consistent with task planning.
-    global SCENES_DIR, TASK_OUTPUT_DIR  # noqa: PLW0603
+    global SCENES_DIR, TASK_OUTPUT_DIR, PLY_TRANSFORM_BACKEND, VIDEO_WRITER_BACKEND, VIDEO_NVENC_PRESET, VIDEO_NVENC_BITRATE, NPC_PLACEMENT_BACKEND, NPC_VERBOSE_ENABLED  # noqa: PLW0603
     SCENES_DIR = args.scenes_dir
     TASK_OUTPUT_DIR = args.tasks_dir
+    PLY_TRANSFORM_BACKEND = PlyTransformBackend(str(args.ply_transform_backend))
+    VIDEO_WRITER_BACKEND = VideoWriterBackend(str(args.video_backend))
+    VIDEO_NVENC_PRESET = args.video_nvenc_preset
+    VIDEO_NVENC_BITRATE = args.video_nvenc_bitrate
+    NPC_PLACEMENT_BACKEND = NPCPlacementBackend(str(args.npc_placement_backend))
+    NPC_VERBOSE_ENABLED = bool(args.npc_verbose)
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA device required for rendering but not available.")
@@ -5374,11 +6507,25 @@ def main() -> None:
 
     pipeline_parser = ArgumentParser(description="Pipeline parameters placeholder")
     pipeline = PipelineParams(pipeline_parser)
-    pipeline.antialiasing = True
+    pipeline.antialiasing = bool(args.antialiasing)
+    print(f"[CONFIG] ANTIALIASING={pipeline.antialiasing}", flush=True)
     bg_color = torch.tensor([1.0, 1.0, 1.0], device=device)
     debug_enabled = bool(args.debug)
     verbose_enabled = bool(args.verbose)
     swap_xy_enabled = bool(args.swap_xy)
+    camera_human_sequence = None
+    if args.camera_human_ply_dir is not None:
+        ply_path = select_random_actor_ply(
+            Path(args.camera_human_ply_dir),
+            seed=int(args.camera_human_seed),
+        )
+        if debug_enabled:
+            print(f"[DEBUG] Camera human PLY: {ply_path}", flush=True)
+        camera_human_sequence = load_actor_frame_sequence(
+            ply_path,
+            height=float(args.camera_human_height),
+            debug=debug_enabled,
+        )
     stabilize_enabled = bool(args.stabilize)
     hide_actor_enabled = bool(args.hide_actor)
     video_enabled = bool(args.video)
@@ -5387,6 +6534,59 @@ def main() -> None:
     save_camera_metadata = bool(args.save_camera_metadata)
     depth_bit_depth = int(args.depth_bit_depth)
     save_follow_metadata = bool(args.save_follow_metadata)
+    light_config = None
+    if args.light_mode != "none":
+        center_x, center_y = (float(args.light_center[0]), float(args.light_center[1]))
+        light_config = LightFilterConfig(
+            mode=str(args.light_mode),
+            strength=float(args.light_strength),
+            radius_frac=float(args.light_radius),
+            center_xy=(center_x, center_y),
+            center_jitter=float(args.light_jitter),
+            temp_k=float(args.light_temp_k),
+            vignette=float(args.light_vignette),
+            seed=int(args.light_seed),
+        )
+    cl_config = None
+    if bool(args.cl_enable):
+        cl_range = float(args.cl_range)
+        cl_range = cl_range if cl_range > 0.0 else None
+        shadow_strength = max(0.0, min(float(args.cl_shadow_strength), 1.0))
+        cl_light_mode = str(args.cl_light_mode)
+        if (args.cl_light_center or args.cl_light_world is not None) and cl_light_mode == "headlight":
+            cl_light_mode = "bulb"
+        shadow_compare = str(args.cl_shadow_compare)
+        if shadow_compare == "auto":
+            shadow_compare = "radial" if cl_light_mode == "bulb" else "z"
+        cl_config = CameraLightConfig(
+            enabled=True,
+            strength=float(args.cl_strength),
+            color=(float(args.cl_color[0]), float(args.cl_color[1]), float(args.cl_color[2])),
+            ambient=float(args.cl_ambient),
+            base_scale=float(args.cl_base_scale),
+            diffuse=float(args.cl_diffuse),
+            specular=float(args.cl_specular),
+            shininess=float(args.cl_shininess),
+            range_m=cl_range,
+            offset_cam=(
+                float(args.cl_offset[0]),
+                float(args.cl_offset[1]),
+                float(args.cl_offset[2]),
+            ),
+            normal_smooth=max(0, int(args.cl_normal_smooth)),
+            shadow_enabled=bool(args.cl_shadow),
+            shadow_bias=float(args.cl_shadow_bias),
+            shadow_strength=shadow_strength,
+            shadow_pcf_radius=max(0, int(args.cl_shadow_pcf)),
+            light_mode=cl_light_mode,
+            shading_model=str(args.cl_shading_model),
+            shadow_compare=shadow_compare,
+            normal_filter=str(args.cl_normal_filter),
+            normal_kernel=max(0, int(args.cl_normal_kernel)),
+            normal_sigma_range=float(args.cl_normal_sigma_range),
+            normal_sigma_domain=float(args.cl_normal_sigma_domain),
+            light_reverse=bool(args.cl_light_reverse),
+        )
     npc_render_enabled = bool(args.npc_render)
     npc_bev_use_mask = bool(args.npc_bev_use_mask)
     npc_bloom_radius_px_override = (
@@ -5565,7 +6765,7 @@ def main() -> None:
                     height=float(args.actor_height),
                     foot_offset=float(args.actor_foot_offset),
                     debug=debug_enabled,
-                    verbose=verbose_enabled,
+                    verbose=NPC_VERBOSE_ENABLED,
                 )
                 pool_seed = _npc_pool_seed(int(args.npc_seed), args.job_slot, args.job_name)
                 npc_frame_pool.populate(np.random.default_rng(pool_seed))
@@ -5575,7 +6775,7 @@ def main() -> None:
                         flush=True,
                     )
                     npc_render_enabled = False
-                elif verbose_enabled:
+                elif NPC_VERBOSE_ENABLED:
                     print(
                         f"[VERBOSE] NPC frame pool ready: {len(npc_frame_pool.entries)} "
                         f"frame(s) from {frame_root}.",
@@ -5619,9 +6819,9 @@ def main() -> None:
                         foot_offset=float(args.actor_foot_offset),
                         animation_cycle_mod=int(args.animation_cycle_mod),
                         debug=debug_enabled,
-                        verbose=verbose_enabled,
+                        verbose=NPC_VERBOSE_ENABLED,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC actor pool ready: {len(deduped_dirs)} actor(s).",
                             flush=True,
@@ -5637,7 +6837,7 @@ def main() -> None:
                     npc_render_enabled = False
                 elif actor_runtime is not None and npc_actor_dir.resolve() == actor_runtime.options.sequence_dir.resolve():
                     npc_actor_runtime = actor_runtime
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC rendering will reuse actor sequence: {npc_actor_dir}",
                             flush=True,
@@ -5664,7 +6864,7 @@ def main() -> None:
                         debug=debug_enabled,
                     )
                     npc_actor_runtime = ActorRuntime(options=npc_actor_options, sequence=npc_actor_sequence)
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC actor sequence ready: {len(npc_actor_sequence.frames)} frames from {npc_actor_dir}.",
                             flush=True,
@@ -5767,6 +6967,19 @@ def main() -> None:
                     flush=True,
                 )
                 continue
+            cl_light_world: np.ndarray | None = None
+            if cl_config is not None:
+                if bool(args.cl_light_center):
+                    occ_center = meta.get("center") or [0.0, 0.0, 0.0]
+                    center_x = float(occ_center[0])
+                    center_y = float(occ_center[1])
+                    center_z = float(args.cl_light_center_z)
+                    cl_light_world = np.array([center_x, center_y, center_z], dtype=np.float32)
+                elif args.cl_light_world is not None:
+                    cl_light_world = np.array(
+                        [float(args.cl_light_world[0]), float(args.cl_light_world[1]), float(args.cl_light_world[2])],
+                        dtype=np.float32,
+                    )
             processed_scenes += 1
             npc_free_mask = None
             npc_occ_image = None
@@ -5788,24 +7001,24 @@ def main() -> None:
                                 white_is_inside=bool(args.npc_wall_white),
                             )
                             if wall_mask.shape != npc_free_mask.shape:
-                                if verbose_enabled:
+                                if NPC_VERBOSE_ENABLED:
                                     print(
                                         f"  [NPC] wall_mask.png shape {wall_mask.shape} does not match occupancy {npc_free_mask.shape}; ignoring wall mask.",
                                         flush=True,
                                     )
                             else:
                                 npc_free_mask = npc_free_mask & wall_mask
-                                if verbose_enabled:
+                                if NPC_VERBOSE_ENABLED:
                                     print(
                                         f"  [NPC] Wall mask applied (threshold={args.npc_wall_threshold}).",
                                         flush=True,
                                     )
                         except FileNotFoundError:
-                            if verbose_enabled:
+                            if NPC_VERBOSE_ENABLED:
                                 print("  [NPC] wall_mask.png not found; skipping wall constraint.", flush=True)
                     if npc_free_mask is not None and bool(args.npc_rotate_mask_180):
                         npc_free_mask = np.rot90(npc_free_mask, 2)
-                        if verbose_enabled:
+                        if NPC_VERBOSE_ENABLED:
                             print("  [NPC] Free-space mask rotated 180 degrees.", flush=True)
                     print(f"  [NPC] Free-space mask ready (threshold={args.npc_free_threshold}).", flush=True)
                 except Exception as exc:  # pylint: disable=broad-except
@@ -5821,7 +7034,7 @@ def main() -> None:
                     npc_bloom_radius_px = max(1, _meters_to_px_ceil(meta, npc_bloom_radius_m))
                 clearance_px = compute_clearance_distance(npc_free_mask)
                 if clearance_px is None:
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             "  [WARN] NPC bloom mask needs scipy; using numpy dilation fallback.",
                             flush=True,
@@ -5835,7 +7048,7 @@ def main() -> None:
                     npc_bloom_free_mask = npc_free_mask & (clearance_px > npc_bloom_radius_px)
             if npc_free_mask is not None and npc_bloom_free_mask is None:
                 npc_bloom_free_mask = npc_free_mask
-            if verbose_enabled and npc_bloom_radius_m is not None and npc_bloom_radius_px is not None:
+            if NPC_VERBOSE_ENABLED and npc_bloom_radius_m is not None and npc_bloom_radius_px is not None:
                 print(
                     f"  [NPC] Bloom radius (max loaded): {npc_bloom_radius_m:.3f} m "
                     f"({npc_bloom_radius_px}px).",
@@ -5859,7 +7072,13 @@ def main() -> None:
                     )
                 print(f"[DEBUG] Loading Gaussian model from: {ply_path}", flush=True)
             print(f"  Loading point cloud: {ply_path.name}", flush=True)
-            gaussians = GaussianModel(sh_degree=3)
+            requested_sh_degree = int(args.sh_degree)
+            if requested_sh_degree < 0:
+                sh_degree = infer_sh_degree_from_ply(ply_path)
+            else:
+                sh_degree = requested_sh_degree
+            print(f"[CONFIG] SH_DEGREE={sh_degree} (requested={requested_sh_degree})", flush=True)
+            gaussians = GaussianModel(sh_degree=sh_degree)
             gaussians.load_ply(str(ply_path))
             scene_template = ply_utils.GaussianPly.read(ply_path)
             if verbose_enabled:
@@ -5870,6 +7089,8 @@ def main() -> None:
                 )
 
             json_files = sorted(p for p in label_dir.glob("*.json") if not p.name.endswith("_detailed.json"))
+            if args.skip_summary:
+                json_files = [p for p in json_files if p.name != "summary.json"]
             if label_filter:
                 json_files = [path for path in json_files if path.stem in label_filter]
             if not json_files:
@@ -5891,6 +7112,9 @@ def main() -> None:
                     stride=max(1, args.stride),
                     mirror_translation=mirror_translation_flag,
                     swap_xy=swap_xy_enabled,
+                    handedness=args.path_handedness,
+                    negate_xy=bool(args.negate_raster_world_xy),
+                    resample_step=float(args.path_resample_step),
                 )
 
                 est_frames = len(prepared.path_xy)
@@ -5957,7 +7181,7 @@ def main() -> None:
                         bloom_radius_px=int(npc_bloom_radius_px),
                         out_path=bloom_path,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(f"[VERBOSE] NPC bloom debug -> {bloom_path}", flush=True)
                 if (npc_bev_enabled or npc_bev_render_debug) and npc_bloom_free_mask_debug is not None:
                     free_dir = npc_bev_output_root / scene_id / json_path.stem / "__npc_bev_bloom"
@@ -5968,7 +7192,7 @@ def main() -> None:
                         highlight_color=(255, 0, 0),
                         out_path=free_path,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(f"[VERBOSE] NPC bloom free mask -> {free_path}", flush=True)
                 if npc_bev_enabled and npc_free_mask is not None and npc_occ_image is not None:
                     npc_summary = generate_npc_bev_debug_for_path(
@@ -5993,7 +7217,7 @@ def main() -> None:
                         mirror_bev_x=args.bev_mirror_x,
                         mirror_bev_y=args.bev_mirror_y,
                     )
-                    if verbose_enabled:
+                    if NPC_VERBOSE_ENABLED:
                         print(
                             f"[VERBOSE] NPC BEV debug ({npc_summary['frames']} frames, shortfall {npc_summary['shortfall']}) -> {npc_summary['output_dir']}",
                             flush=True,
@@ -6020,6 +7244,7 @@ def main() -> None:
                         meta=meta,
                         output_dir=args.output_dir,
                         stride=max(1, args.stride),
+                        resample_step=float(args.path_resample_step),
                         height_offset=args.height_offset,
                         look_ahead=args.look_ahead,
                         look_down=args.look_down,
@@ -6031,6 +7256,9 @@ def main() -> None:
                         overwrite=args.overwrite,
                         view_mode=args.view_mode,
                         swap_xy=swap_xy_enabled,
+                        path_handedness=args.path_handedness,
+                        negate_raster_world_xy=bool(args.negate_raster_world_xy),
+                        reverse_forward=bool(args.reverse_forward),
                         stabilize=stabilize_enabled,
                         video=video_enabled,
                         save_rgb_frames=save_rgb_frames,
@@ -6042,6 +7270,7 @@ def main() -> None:
                         mirror_translation=not args.no_mirror_translation,
                         actor_runtime=actor_runtime,
                         default_follow_distance=float(args.follow_distance),
+                        limit_camera_to_follow=bool(args.limit_camera_to_follow),
                         verbose=verbose_enabled,
                         hide_actor_enabled=hide_actor_enabled,
                         render_bev=args.show_BEV,
@@ -6056,6 +7285,9 @@ def main() -> None:
                         prepared_path=prepared,
                         navdp_manager=navdp_manager,
                         metrics_enabled=metrics_enabled,
+                        light_config=light_config,
+                        cl_config=cl_config,
+                        cl_light_world=cl_light_world,
                         job_slot=args.job_slot,
                         job_actor_id=args.job_actor_id,
                         job_name=args.job_name,
@@ -6077,6 +7309,10 @@ def main() -> None:
                         npc_bloom_mask=npc_bloom_mask_debug,
                         npc_bloom_radius_m=npc_bloom_radius_m,
                         npc_bloom_radius_px=npc_bloom_radius_px,
+                        camera_human_sequence=camera_human_sequence,
+                        camera_human_stride=int(args.camera_human_stride),
+                        camera_human_max_frames=args.camera_human_max_frames,
+                        validate_path_bounds_enabled=bool(args.validate_path_bounds),
                     )
                     record_path_status(scene_id, json_path.stem, STATUS_DONE, error=None)
                     if summary is not None:

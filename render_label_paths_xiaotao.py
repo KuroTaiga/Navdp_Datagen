@@ -33,12 +33,17 @@ import numpy as np
 import torch
 
 from arguments import PipelineParams
-from gaussian_renderer import render_or
+from gaussian_renderer import render, render_or
 from scene import GaussianModel
 from scene.cameras import MiniCam
 from plyfile import PlyData, PlyElement, PlyElementParseError
 
 from utils import gaussian_ply_utils as ply_utils
+from utils.ply_transform_utils import (
+    apply_transform_to_frame,
+    build_transform_matrix,
+    rotation_matrix_z_np,
+)
 from utils.graphics_utils import getProjectionMatrix
 from utils.general_utils import inverse_sigmoid
 
@@ -71,6 +76,28 @@ DEBUG_PLY_DTYPE = np.dtype(
         ("b", np.uint8),
     ]
 )
+
+
+def _render_gaussians(
+    camera,
+    gaussians: GaussianModel,
+    pipeline: PipelineParams,
+    *,
+    bg_color: torch.Tensor,
+    orthographic: bool = False,
+    antialiasing: bool | None = None,
+) -> dict:
+    """Use render() for perspective and render_or() only when orthographic is needed."""
+    if orthographic:
+        return render_or(
+            camera,
+            gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=True,
+            antialiasing=antialiasing,
+        )
+    return render(camera, gaussians, pipeline, bg_color=bg_color)
 
 
 ###
@@ -793,30 +820,6 @@ def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
         raise ValueError(f"Unable to parse actor PLY: {path}") from exc
 
 
-def rotation_matrix_z_np(theta: float) -> np.ndarray:
-    cos_t = math.cos(theta)
-    sin_t = math.sin(theta)
-    return np.array(
-        [
-            [cos_t, -sin_t, 0.0],
-            [sin_t, cos_t, 0.0],
-            [0.0, 0.0, 1.0],
-        ],
-        dtype=np.float64,
-    )
-
-
-def build_transform_matrix(rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
-    if rotation.shape != (3, 3):
-        raise ValueError("rotation must be 3x3")
-    if translation.shape != (3,):
-        raise ValueError("translation must be length-3 vector")
-    transform = np.eye(4, dtype=np.float64)
-    transform[:3, :3] = rotation
-    transform[:3, 3] = translation
-    return transform
-
-
 ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
     [
         [1.0, 0.0, 0.0],
@@ -945,29 +948,6 @@ def load_actor_sequence(
         uniform_scale=len(scale_names) == 1,
         max_points=max(frame.base_data.shape[0] for frame in frames),
     )
-
-
-def apply_transform_to_frame(
-    base_frame: ActorSequenceFrame,
-    sequence: ActorSequence,
-    transform: np.ndarray,
-) -> np.ndarray:
-    """Apply a rigid transform to a stored actor frame and return the mutated vertex array."""
-
-    data = np.array(base_frame.base_data, copy=True)
-    ply = ply_utils.GaussianPly(
-        ply=None,
-        vertex=None,
-        data=data,
-        columns=sequence.columns,
-    )
-    ply_utils.apply_transform_inplace(
-        ply,
-        transform,
-        rotate_normals=True,
-        rotate_sh=True,
-    )
-    return ply.data
 
 
 def actor_data_to_tensors(
@@ -1357,7 +1337,13 @@ def render_actor_camera_only_sequence(
             device,
             verbose,
         ):
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = _render_gaussians(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+            )
         render = img_pkg["render"].detach().cpu().numpy()
         render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
         render_uint8 = np.rot90(render_uint8, k=2)
@@ -1585,7 +1571,13 @@ def render_actor_follow_sequence(
                     device=device,
                 )
 
-                img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+                img_pkg = _render_gaussians(
+                    camera,
+                    combined_model,
+                    pipeline,
+                    bg_color=bg_color,
+                    orthographic=False,
+                )
                 render = img_pkg['render'].detach().cpu().numpy()
                 render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
                 render_uint8 = np.rot90(render_uint8, k=2)
@@ -1698,7 +1690,13 @@ def render_actor_follow_sequence(
                 device=device,
             )
 
-            img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = _render_gaussians(
+                camera,
+                frame_gaussians,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+            )
             render = img_pkg['render'].detach().cpu().numpy()
             render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
             render_uint8 = np.rot90(render_uint8, k=2)
@@ -1934,7 +1932,13 @@ def render_actor_follow_sequence(
                 print(f"[DEBUG] Combined features_dc shape: {combined_model.get_features_dc.shape}")
                 print(f"[DEBUG] Combined features_rest shape: {combined_model.get_features_rest.shape}")
                 print(f"[DEBUG] Combined xyz shape: {combined_model.get_xyz.shape}")
-            img_pkg = render_or(camera, combined_model, pipeline, bg_color=bg_color, orthographic=False)
+            img_pkg = _render_gaussians(
+                camera,
+                combined_model,
+                pipeline,
+                bg_color=bg_color,
+                orthographic=False,
+            )
             render = img_pkg['render'].detach().cpu().numpy()
             render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
             render_uint8 = np.rot90(render_uint8, k=2)
@@ -2031,7 +2035,13 @@ def render_actor_follow_sequence(
             device=device,
         )
 
-        img_pkg = render_or(camera, frame_gaussians, pipeline, bg_color=bg_color, orthographic=False)
+        img_pkg = _render_gaussians(
+            camera,
+            frame_gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=False,
+        )
         render = img_pkg['render'].detach().cpu().numpy()
         render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
         render_uint8 = np.rot90(render_uint8, k=2)
@@ -2875,7 +2885,13 @@ def render_path_frames(
                         device,
                         verbose,
                     ):
-                        img_pkg = render_or(camera, gaussians, pipeline, bg_color=bg_color, orthographic=orthographic)
+                        img_pkg = _render_gaussians(
+                            camera,
+                            gaussians,
+                            pipeline,
+                            bg_color=bg_color,
+                            orthographic=orthographic,
+                        )
                     render = img_pkg["render"].detach().cpu().numpy()
                     render_uint8 = (np.clip(render, 0.0, 1.0) * 255.0).astype(np.uint8).transpose(1, 2, 0)
                     if orthographic:

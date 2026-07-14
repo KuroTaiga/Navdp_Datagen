@@ -14,6 +14,15 @@ from utils.graphics_utils import getProjectionMatrix
 EPS = 1e-6
 
 
+def _apply_handedness(x: float, y: float, handedness: str) -> tuple[float, float]:
+    handedness_norm = handedness.strip().lower()
+    if handedness_norm == "left":
+        return x, y
+    if handedness_norm == "right":
+        return x, -y
+    raise ValueError(f"Unknown handedness: {handedness}")
+
+
 def build_look_at(eye: np.ndarray, target: np.ndarray, up: np.ndarray) -> np.ndarray:
     """Construct a right-handed look-at view matrix (forward = target - eye)."""
 
@@ -132,6 +141,15 @@ def load_occupancy_metadata(dataset_dir: Path) -> dict:
     upper = occ.get("upper") or [max_x, max_y, max_z]
     lower_z = float(lower[2])
     upper_z = float(upper[2])
+    center = occ.get("center")
+    if center is not None and len(center) >= 2:
+        center_x = float(center[0])
+        center_y = float(center[1])
+        center_z = float(center[2]) if len(center) > 2 else 0.0
+    else:
+        center_x = 0.5 * (min_x + max_x)
+        center_y = 0.5 * (min_y + max_y)
+        center_z = 0.5 * (min_z + max_z)
 
     occ_png = dataset_dir / "occupancy.png"
     if not occ_png.is_file():
@@ -154,10 +172,17 @@ def load_occupancy_metadata(dataset_dir: Path) -> dict:
         "bottom": bottom,
         "lower_z": lower_z,
         "upper_z": upper_z,
+        "center": [center_x, center_y, center_z],
     }
 
 
-def load_raster_world_points_only(json_path: Path, *, swap_xy: bool = False) -> list[np.ndarray]:
+def load_raster_world_points_only(
+    json_path: Path,
+    *,
+    swap_xy: bool = False,
+    handedness: str = "left",
+    negate_xy: bool = False,
+) -> list[np.ndarray]:
     """Extract raster_world points as numpy arrays."""
 
     with json_path.open("r", encoding="utf-8") as fh:
@@ -176,10 +201,12 @@ def load_raster_world_points_only(json_path: Path, *, swap_xy: bool = False) -> 
             z = float(entry.get("z", 0.0))
         except (TypeError, KeyError) as exc:
             raise ValueError(f"Invalid raster_world entry #{idx} in {json_path}") from exc
+        if negate_xy:
+            x, y = -x, -y
         if swap_xy:
-            points.append(np.array([y, x, z], dtype=np.float32))
-        else:
-            points.append(np.array([x, y, z], dtype=np.float32))
+            x, y = y, x
+        x, y = _apply_handedness(x, y, handedness)
+        points.append(np.array([x, y, z], dtype=np.float32))
     return points
 
 
@@ -187,6 +214,8 @@ def load_raster_world_points(
     json_path: Path,
     *,
     swap_xy: bool = False,
+    handedness: str = "left",
+    negate_xy: bool = False,
 ) -> tuple[list[np.ndarray], list[tuple[int, int]]]:
     """Extract raster_world points and raster_pixel pairs."""
 
@@ -209,12 +238,15 @@ def load_raster_world_points(
         try:
             x = float(entry["x"])
             y = float(entry["y"])
+            z = float(entry.get("z", 0.0))
         except (TypeError, KeyError) as exc:
             raise ValueError(f"Invalid raster_world entry #{idx} in {json_path}") from exc
+        if negate_xy:
+            x, y = -x, -y
         if swap_xy:
-            points.append(np.array([y, x], dtype=np.float32))
-        else:
-            points.append(np.array([x, y], dtype=np.float32))
+            x, y = y, x
+        x, y = _apply_handedness(x, y, handedness)
+        points.append(np.array([x, y, z], dtype=np.float32))
         pixels.append((int(pix[0]), int(pix[1])))
     return points, pixels
 

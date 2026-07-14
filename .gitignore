@@ -1,3 +1,4 @@
+out/
 *.pyc
 .vscode
 output
@@ -21,3 +22,5 @@ data
 parallel_render_report.json
 ./data1
 data1
+*.mp4
+CHINGMU_ACTIONS.tar.zst

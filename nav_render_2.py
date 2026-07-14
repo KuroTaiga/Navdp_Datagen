@@ -4,7 +4,7 @@ import json
 import numpy as np
 import torch
 import imageio
-from gaussian_renderer import render_or
+from gaussian_renderer import render, render_or
 from scene import GaussianModel
 from scene.cameras import MiniCam
 from utils.graphics_utils import  fov2focal, focal2fov
@@ -13,6 +13,18 @@ from argparse import ArgumentParser
 
 
 from datetime import datetime
+
+
+def _render_gaussians(camera, gaussians, pipeline, *, bg_color, orthographic=False):
+    if orthographic:
+        return render_or(
+            camera,
+            gaussians,
+            pipeline,
+            bg_color=bg_color,
+            orthographic=True,
+        )
+    return render(camera, gaussians, pipeline, bg_color=bg_color)
 
 def ts():
     # 本地时间，精确到毫秒：20250105_173412_123
@@ -217,12 +229,12 @@ def render_and_save(pose_matrix, save_dir="./nav_data", orthographic=False):
             zfar=zfar,
         )
 
-        img_pkg = render_or(
+        img_pkg = _render_gaussians(
             camera,
             gaussians,
             pipeline,
             bg_color=bg_color,
-            orthographic=False,
+            orthographic=True,
         )
 
     else:
@@ -255,7 +267,7 @@ def render_and_save(pose_matrix, save_dir="./nav_data", orthographic=False):
             full_proj_transform=full_proj_transform
         )
 
-        img_pkg = render_or(
+        img_pkg = _render_gaussians(
             camera,
             gaussians,
             pipeline,

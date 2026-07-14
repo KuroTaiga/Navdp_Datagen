@@ -22,6 +22,9 @@ SCENE=${SCENE:-test_scene}
 CONDA_ENV=${CONDA_ENV:-cuda121}
 LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-${SCRIPT_DIR}/data/path_video_frames_Jiankun_test}
 ACTOR_SEQ_DIR=${ACTOR_SEQ_DIR:-/media/dongjk/walk_45/}
+VIDEO_BACKEND=${VIDEO_BACKEND:-gpu}
+VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
+VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
 OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/path_video_frames_Jiankun_test}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
@@ -65,7 +68,24 @@ BASE_ARGS=(
   --height-offset -0.098
   --minimal-frames 90
   --output-dir "$LOCAL_OUTPUT_DIR"
+  --video-backend "$VIDEO_BACKEND"
 )
+if [ -n "${VIDEO_NVENC_PRESET}" ]; then
+  BASE_ARGS+=(--video-nvenc-preset "$VIDEO_NVENC_PRESET")
+fi
+if [ -n "${VIDEO_NVENC_BITRATE}" ]; then
+  BASE_ARGS+=(--video-nvenc-bitrate "$VIDEO_NVENC_BITRATE")
+fi
+
+# GPU video backend tuning for PyNvVideoCodec (avoid frame reordering/jitter).
+if [ "${VIDEO_BACKEND}" = "gpu" ]; then
+  : "${GPU_VIDEO_DISABLE_BFRAMES:=1}"
+  : "${GPU_VIDEO_CLONE:=1}"
+  : "${GPU_VIDEO_SYNC:=both}"
+  : "${GPU_VIDEO_RETAIN_FRAMES:=4}"
+  export GPU_VIDEO_DISABLE_BFRAMES GPU_VIDEO_CLONE GPU_VIDEO_SYNC GPU_VIDEO_RETAIN_FRAMES
+  echo "[VIDEO] GPU backend: bframes=${GPU_VIDEO_DISABLE_BFRAMES} clone=${GPU_VIDEO_CLONE} sync=${GPU_VIDEO_SYNC} retain=${GPU_VIDEO_RETAIN_FRAMES}" >&2
+fi
 
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
   BASE_ARGS+=(--offload-nas-dir "$OFFLOAD_NAS_DIR" --offload-min-free-gb "$OFFLOAD_MIN_FREE_GB")
