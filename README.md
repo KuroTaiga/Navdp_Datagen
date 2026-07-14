@@ -58,12 +58,13 @@ python scripts/render_glb_robot_overlay.py \
   --camera-json data1/debug_render/0001_839920/100_camera.json \
   --frames-dir data1/debug_render/0001_839920/100 \
   --robot-glb assets/robots/g1_29dof_mode_16.glb \
+  --robot-urdf data/g1_description/g1_29dof_mode_16.urdf \
   --poses-json data1/debug_render/0001_839920/100_robot_poses.json \
   --output-dir data1/debug_render/0001_839920/100_robot \
   --compose-mode foreground
 ```
 
-Use `--compose-mode depth` when saved depth maps should occlude the GLB robot behind GS geometry. The pose JSON can be produced by IMO or another robot controller and should provide per-frame `position` plus `yaw_deg`/`yaw_rad`, or a full 4x4 `transform`.
+Use `--compose-mode depth` when saved depth maps should occlude the GLB robot behind GS geometry. The pose JSON can be produced by IMO/AMO or another robot controller and should provide per-frame `position` plus `yaw_deg`/`yaw_rad`, or a full 4x4 `transform`. For articulated AMO control, include `joint_positions`/`joints` dictionaries or list-valued `amo_pose`/`qpos` with `joint_names`; `--robot-urdf` enables those joints to drive the GLB mesh links.
 
 Generate a 10-path G1 robot follow-camera example from the first `0001_*` scene:
 ```bash

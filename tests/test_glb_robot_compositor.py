@@ -6,6 +6,7 @@ from utils.glb_robot_compositor import (
     camera_metadata_to_pyrender_pose,
     compose_rgba_over_rgb,
     decode_quantized_depth,
+    parse_robot_joint_poses,
     parse_robot_poses,
     validate_pose_constraints,
 )
@@ -22,6 +23,46 @@ def test_parse_robot_pose_position_and_yaw_deg():
     np.testing.assert_allclose(pose.transform[:3, 3], [1.0, 2.0, 0.75])
     np.testing.assert_allclose(pose.transform[:2, :2], [[0.0, -1.0], [1.0, 0.0]], atol=1e-6)
     assert math.isclose(pose.yaw_rad, math.pi * 0.5)
+
+
+def test_parse_robot_pose_embeds_amo_pose_with_joint_names():
+    poses = parse_robot_poses(
+        {
+            "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+            "default_joint_positions": {"torso_joint": 0.1},
+            "frames": [
+                {
+                    "frame": 2,
+                    "position": [0.0, 0.0, 0.0],
+                    "amo_pose": [0.25, -0.25],
+                }
+            ],
+        }
+    )
+
+    assert poses[2].joint_positions == {
+        "torso_joint": 0.1,
+        "left_hip_pitch_joint": 0.25,
+        "right_hip_pitch_joint": -0.25,
+    }
+
+
+def test_parse_robot_joint_poses_accepts_dict_joints():
+    joints = parse_robot_joint_poses(
+        {
+            "frames": [
+                {
+                    "frame": 4,
+                    "joints": {
+                        "left_knee_joint": 0.7,
+                        "right_knee_joint": -0.6,
+                    },
+                }
+            ]
+        }
+    )
+
+    assert joints[4] == {"left_knee_joint": 0.7, "right_knee_joint": -0.6}
 
 
 def test_pose_constraint_report_flags_speed_and_yaw():

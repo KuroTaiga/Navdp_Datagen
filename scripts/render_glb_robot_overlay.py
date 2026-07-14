@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +18,7 @@ from utils.glb_robot_compositor import (
     GlbRobotRenderer,
     compose_rgba_over_rgb,
     decode_quantized_depth,
+    parse_robot_joint_poses,
     parse_robot_poses,
     validate_pose_constraints,
 )
@@ -25,6 +27,33 @@ from utils.glb_robot_compositor import (
 def _load_json(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _load_joint_names(path: Path | None) -> list[str] | None:
+    if path is None:
+        return None
+    payload = _load_json(path)
+    if isinstance(payload, list):
+        names = payload
+    else:
+        names = (
+            payload.get("joint_names")
+            or payload.get("amo_joint_names")
+            or payload.get("dof_names")
+            or payload.get("qpos_names")
+        )
+    if not isinstance(names, list) or not all(isinstance(item, str) for item in names):
+        raise ValueError(f"{path} must contain a list of joint names")
+    return list(names)
+
+
+def _load_joint_positions(path: Path | None) -> dict[str, float] | None:
+    if path is None:
+        return None
+    payload = _load_json(path)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path} must contain a JSON object mapping joint names to values")
+    return {str(name): float(value) for name, value in payload.items()}
 
 
 def _frame_map(camera_payload: dict) -> dict[int, dict]:
@@ -55,12 +84,54 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--frames-dir", type=Path, required=True, help="Directory containing frame_XXXX.png files.")
     parser.add_argument("--robot-glb", type=Path, required=True, help="Robot GLB/GLTF asset to render.")
     parser.add_argument(
+        "--robot-urdf",
+        type=Path,
+        default=None,
+        help=(
+            "Optional URDF matching the GLB. Required for per-frame AMO/joint articulation because "
+            "the default GLB is otherwise rendered as a static mesh."
+        ),
+    )
+    parser.add_argument(
+        "--robot-package-root",
+        type=Path,
+        default=None,
+        help="Package root used to resolve package:// URDF resources for articulation.",
+    )
+    parser.add_argument(
+        "--bind-joint-positions-json",
+        type=Path,
+        default=None,
+        help=(
+            "Joint pose used when the GLB was exported. Defaults to zero joints; pass the same mapping "
+            "used by convert_urdf_visuals_to_glb.py --joint-positions-json if nonzero."
+        ),
+    )
+    parser.add_argument(
         "--poses-json",
         type=Path,
         required=True,
         help=(
             "Per-frame robot poses. Accepts {'frames':[...]} or a raw list. Each entry may contain "
-            "frame, position/translation/xyz, yaw_rad/yaw_deg/quaternion_wxyz, or transform."
+            "frame, position/translation/xyz, yaw_rad/yaw_deg/quaternion_wxyz, transform, and optional "
+            "joint_positions/joints/amo_pose/qpos."
+        ),
+    )
+    parser.add_argument(
+        "--amo-poses-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional separate per-frame AMO/joint pose JSON. Frames are merged onto --poses-json by frame id."
+        ),
+    )
+    parser.add_argument(
+        "--joint-names-json",
+        type=Path,
+        default=None,
+        help=(
+            "Joint-name list for list-valued AMO poses. Not needed when AMO poses are dictionaries or the "
+            "pose JSON contains joint_names/amo_joint_names/dof_names."
         ),
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="Directory for composited PNG frames.")
@@ -121,12 +192,35 @@ def main() -> int:
 
     camera_payload = _load_json(args.camera_json)
     camera_frames = _frame_map(camera_payload)
+    joint_names = _load_joint_names(args.joint_names_json)
     poses = parse_robot_poses(
         _load_json(args.poses_json),
         yaw_offset_rad=math.radians(float(args.yaw_offset_deg)),
         foot_offset=float(args.foot_offset),
         default_z=float(args.default_z),
+        joint_names=joint_names,
     )
+    if args.amo_poses_json is not None:
+        amo_poses = parse_robot_joint_poses(_load_json(args.amo_poses_json), joint_names=joint_names)
+        missing_pose_frames = sorted(frame for frame in amo_poses if frame not in poses)
+        if missing_pose_frames:
+            print(
+                "[WARN] AMO poses without matching robot base poses were ignored: "
+                + ", ".join(str(frame) for frame in missing_pose_frames[:10]),
+                flush=True,
+            )
+        for frame_idx, joints in amo_poses.items():
+            if frame_idx in poses:
+                merged = dict(poses[frame_idx].joint_positions or {})
+                merged.update(joints)
+                poses[frame_idx] = replace(poses[frame_idx], joint_positions=merged)
+    has_joint_poses = any(pose.joint_positions for pose in poses.values())
+    if has_joint_poses and args.robot_urdf is None:
+        print(
+            "[WARN] AMO/joint poses were provided but --robot-urdf is missing; "
+            "the GLB robot will render in its static mesh pose.",
+            flush=True,
+        )
 
     max_yaw_rate = (
         math.radians(float(args.max_yaw_rate_deg_s))
@@ -160,6 +254,9 @@ def main() -> int:
         height=int(resolution["height"]),
         target_height=args.target_height,
         up_axis=args.glb_up_axis,
+        articulation_urdf_path=args.robot_urdf,
+        articulation_package_root=args.robot_package_root,
+        bind_joint_positions=_load_joint_positions(args.bind_joint_positions_json),
         pyopengl_platform=args.pyopengl_platform,
     )
 
@@ -188,6 +285,7 @@ def main() -> int:
             mesh = renderer.render(
                 camera_frame=camera_frames[frame_idx],
                 robot_transform=poses[frame_idx].transform,
+                joint_positions=poses[frame_idx].joint_positions,
             )
             overlay = np.rot90(mesh.rgba, k=int(args.output_rotation_k))
             mesh_depth = np.rot90(mesh.depth_m, k=int(args.output_rotation_k))

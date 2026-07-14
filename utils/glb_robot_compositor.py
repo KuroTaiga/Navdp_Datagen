@@ -16,6 +16,7 @@ class RobotPose:
     frame: int
     transform: np.ndarray
     yaw_rad: float | None = None
+    joint_positions: dict[str, float] | None = None
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,15 @@ class PoseConstraintReport:
 class MeshRenderResult:
     rgba: np.ndarray
     depth_m: np.ndarray
+
+
+@dataclass(frozen=True)
+class _MeshNode:
+    mesh: Any
+    base_transform: np.ndarray
+    node_name: str
+    candidate_names: tuple[str, ...]
+    link_name: str | None = None
 
 
 def _translation_matrix(xyz: Iterable[float]) -> np.ndarray:
@@ -106,10 +116,24 @@ def parse_robot_poses(
     yaw_offset_rad: float = 0.0,
     foot_offset: float = 0.0,
     default_z: float = 0.0,
+    joint_names: list[str] | None = None,
 ) -> dict[int, RobotPose]:
-    """Parse per-frame robot poses from an IMO/controller JSON payload."""
+    """Parse per-frame robot poses from an IMO/AMO/controller JSON payload."""
 
-    entries = payload.get("frames", payload.get("poses", [])) if isinstance(payload, dict) else payload
+    if isinstance(payload, dict):
+        entries = payload.get("frames", payload.get("poses", []))
+        joint_names = _joint_names_from_payload(payload, joint_names=joint_names)
+        default_joint_positions = _joint_positions_from_payload(
+            payload.get("default_joint_positions")
+            or payload.get("default_joints")
+            or payload.get("default_amo_pose"),
+            joint_names=joint_names,
+            frame_label="default joint positions",
+            required=False,
+        )
+    else:
+        entries = payload
+        default_joint_positions = None
     poses: dict[int, RobotPose] = {}
     for idx, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -151,8 +175,108 @@ def parse_robot_poses(
                 yaw_rad = float(yaw_offset_rad)
                 rot = _yaw_matrix(yaw_offset_rad)
             transform = _translation_matrix(xyz) @ rot
-        poses[frame] = RobotPose(frame=frame, transform=transform, yaw_rad=yaw_rad)
+        frame_joint_positions = _joint_positions_from_entry(
+            entry,
+            joint_names=joint_names,
+            frame_label=f"Pose frame {frame}",
+        )
+        if default_joint_positions is not None or frame_joint_positions is not None:
+            merged_joint_positions = dict(default_joint_positions or {})
+            merged_joint_positions.update(frame_joint_positions or {})
+        else:
+            merged_joint_positions = None
+        poses[frame] = RobotPose(
+            frame=frame,
+            transform=transform,
+            yaw_rad=yaw_rad,
+            joint_positions=merged_joint_positions,
+        )
     return poses
+
+
+def parse_robot_joint_poses(
+    payload: dict[str, Any] | list[Any],
+    *,
+    joint_names: list[str] | None = None,
+) -> dict[int, dict[str, float]]:
+    """Parse per-frame AMO/joint values without requiring base robot poses."""
+
+    if isinstance(payload, dict):
+        entries = payload.get("frames", payload.get("poses", []))
+        joint_names = _joint_names_from_payload(payload, joint_names=joint_names)
+    else:
+        entries = payload
+    joint_poses: dict[int, dict[str, float]] = {}
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"AMO entry #{idx} must be an object")
+        frame = int(entry.get("frame", entry.get("id", idx)))
+        frame_joints = _joint_positions_from_entry(
+            entry,
+            joint_names=joint_names,
+            frame_label=f"AMO frame {frame}",
+        )
+        if frame_joints is None:
+            raise ValueError(f"AMO frame {frame}: missing joint_positions/joints/amo_pose/qpos")
+        joint_poses[frame] = frame_joints
+    return joint_poses
+
+
+def _joint_names_from_payload(payload: dict[str, Any], *, joint_names: list[str] | None) -> list[str] | None:
+    raw = (
+        payload.get("joint_names")
+        or payload.get("amo_joint_names")
+        or payload.get("dof_names")
+        or payload.get("qpos_names")
+    )
+    if raw is None:
+        return joint_names
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        raise ValueError("joint_names/amo_joint_names/dof_names must be a list of strings")
+    if joint_names is not None and list(joint_names) != raw:
+        raise ValueError("Joint names supplied by CLI do not match pose payload joint names")
+    return list(raw)
+
+
+def _joint_positions_from_entry(
+    entry: dict[str, Any],
+    *,
+    joint_names: list[str] | None,
+    frame_label: str,
+) -> dict[str, float] | None:
+    for key in ("joint_positions", "joints", "amo_pose", "amo", "qpos", "joint_values"):
+        if key in entry:
+            return _joint_positions_from_payload(
+                entry[key],
+                joint_names=joint_names,
+                frame_label=f"{frame_label} {key}",
+                required=True,
+            )
+    return None
+
+
+def _joint_positions_from_payload(
+    raw: Any,
+    *,
+    joint_names: list[str] | None,
+    frame_label: str,
+    required: bool,
+) -> dict[str, float] | None:
+    if raw is None:
+        if required:
+            raise ValueError(f"{frame_label}: missing joint position data")
+        return None
+    if isinstance(raw, dict):
+        return {str(name): float(value) for name, value in raw.items()}
+    if isinstance(raw, list):
+        if joint_names is None:
+            raise ValueError(f"{frame_label}: list-valued AMO pose requires joint_names")
+        if len(raw) != len(joint_names):
+            raise ValueError(
+                f"{frame_label}: expected {len(joint_names)} joint values, got {len(raw)}"
+            )
+        return {name: float(value) for name, value in zip(joint_names, raw)}
+    raise ValueError(f"{frame_label}: joint positions must be an object or list")
 
 
 def validate_pose_constraints(
@@ -262,6 +386,9 @@ class GlbRobotRenderer:
         height: int,
         target_height: float | None = None,
         up_axis: str = "y",
+        articulation_urdf_path: Path | None = None,
+        articulation_package_root: Path | None = None,
+        bind_joint_positions: dict[str, float] | None = None,
         pyopengl_platform: str = "egl",
         ambient_light: tuple[float, float, float] = (0.35, 0.35, 0.35),
     ) -> None:
@@ -282,26 +409,49 @@ class GlbRobotRenderer:
         self.ambient_light = np.asarray(ambient_light, dtype=np.float32)
         loaded = trimesh.load(str(glb_path), force="scene")
         self.mesh_nodes, self._bounds = self._load_mesh_nodes(loaded)
+        self.link_bind_transforms: dict[str, np.ndarray] | None = None
+        self.joints: list[Any] | None = None
+        self.links: set[str] | None = None
+        if articulation_urdf_path is not None:
+            self._load_articulation(
+                articulation_urdf_path,
+                package_root=articulation_package_root,
+                bind_joint_positions=bind_joint_positions,
+            )
         self.normalizer = self._build_normalizer(target_height, up_axis)
         self.renderer = pyrender.OffscreenRenderer(viewport_width=self.width, viewport_height=self.height)
 
     def close(self) -> None:
         self.renderer.delete()
 
-    def _load_mesh_nodes(self, loaded: Any) -> tuple[list[tuple[Any, np.ndarray]], np.ndarray]:
+    def _load_mesh_nodes(self, loaded: Any) -> tuple[list[_MeshNode], np.ndarray]:
         trimesh = self._trimesh
         pyrender = self._pyrender
         if isinstance(loaded, trimesh.Trimesh):
             bounds = np.asarray(loaded.bounds, dtype=np.float64)
-            return [(pyrender.Mesh.from_trimesh(loaded, smooth=True), np.eye(4, dtype=np.float64))], bounds
+            return [
+                _MeshNode(
+                    mesh=pyrender.Mesh.from_trimesh(loaded, smooth=True),
+                    base_transform=np.eye(4, dtype=np.float64),
+                    node_name="mesh",
+                    candidate_names=("mesh",),
+                )
+            ], bounds
 
-        nodes: list[tuple[Any, np.ndarray]] = []
+        nodes: list[_MeshNode] = []
         all_vertices: list[np.ndarray] = []
         for node_name in loaded.graph.nodes_geometry:
             transform, geometry_name = loaded.graph[node_name]
             geom = loaded.geometry[geometry_name]
             transform = np.asarray(transform, dtype=np.float64)
-            nodes.append((pyrender.Mesh.from_trimesh(geom, smooth=True), transform))
+            nodes.append(
+                _MeshNode(
+                    mesh=pyrender.Mesh.from_trimesh(geom, smooth=True),
+                    base_transform=transform,
+                    node_name=str(node_name),
+                    candidate_names=(str(node_name), str(geometry_name)),
+                )
+            )
             vertices = np.asarray(geom.vertices, dtype=np.float64)
             if vertices.size:
                 vertices_h = np.concatenate(
@@ -317,6 +467,66 @@ class GlbRobotRenderer:
             vertices = np.concatenate(all_vertices, axis=0)
             bounds = np.stack([vertices.min(axis=0), vertices.max(axis=0)], axis=0)
         return nodes, bounds
+
+    def _load_articulation(
+        self,
+        urdf_path: Path,
+        *,
+        package_root: Path | None,
+        bind_joint_positions: dict[str, float] | None,
+    ) -> None:
+        try:
+            from scripts.convert_urdf_visuals_to_glb import (  # pylint: disable=import-outside-toplevel
+                compute_link_transforms,
+                parse_urdf_visuals,
+            )
+        except ImportError as exc:
+            raise RuntimeError("URDF articulation requires scripts.convert_urdf_visuals_to_glb.") from exc
+
+        _, joints, links = parse_urdf_visuals(urdf_path, package_root=package_root)
+        bind_transforms = compute_link_transforms(
+            links,
+            joints,
+            joint_positions=bind_joint_positions,
+        )
+        resolved_nodes: list[_MeshNode] = []
+        unresolved: list[str] = []
+        for node in self.mesh_nodes:
+            link_name = _resolve_link_name(node.candidate_names, links)
+            if link_name is None:
+                unresolved.append(node.node_name)
+            resolved_nodes.append(
+                _MeshNode(
+                    mesh=node.mesh,
+                    base_transform=node.base_transform,
+                    node_name=node.node_name,
+                    candidate_names=node.candidate_names,
+                    link_name=link_name,
+                )
+            )
+        if unresolved:
+            preview = ", ".join(unresolved[:5])
+            raise ValueError(
+                "Cannot map GLB mesh nodes to URDF links. Expected nodes named like "
+                f"'<link>_<visual_idx>' from convert_urdf_visuals_to_glb.py; unresolved: {preview}"
+            )
+        self.mesh_nodes = resolved_nodes
+        self.link_bind_transforms = bind_transforms
+        self.joints = joints
+        self.links = links
+
+    def _link_transforms_for_joints(self, joint_positions: dict[str, float] | None) -> dict[str, np.ndarray] | None:
+        if joint_positions is None:
+            return None
+        if self.joints is None or self.links is None or self.link_bind_transforms is None:
+            return None
+        from scripts.convert_urdf_visuals_to_glb import compute_link_transforms  # pylint: disable=import-outside-toplevel
+
+        return compute_link_transforms(
+            self.links,
+            self.joints,
+            joint_positions=joint_positions,
+        )
 
     def _build_normalizer(self, target_height: float | None, up_axis: str) -> np.ndarray:
         alignment = _axis_alignment_matrix(up_axis)
@@ -343,6 +553,7 @@ class GlbRobotRenderer:
         *,
         camera_frame: dict[str, Any],
         robot_transform: np.ndarray,
+        joint_positions: dict[str, float] | None = None,
     ) -> MeshRenderResult:
         pyrender = self._pyrender
         resolution = camera_frame["resolution"]
@@ -363,7 +574,29 @@ class GlbRobotRenderer:
         light = pyrender.DirectionalLight(color=np.ones(3), intensity=2.0)
         scene.add(light, pose=camera_pose)
         root = np.asarray(robot_transform, dtype=np.float64) @ self.normalizer
-        for mesh, base_transform in self.mesh_nodes:
-            scene.add(mesh, pose=root @ base_transform)
+        posed_link_transforms = self._link_transforms_for_joints(joint_positions)
+        for node in self.mesh_nodes:
+            local_pose = node.base_transform
+            if (
+                posed_link_transforms is not None
+                and self.link_bind_transforms is not None
+                and node.link_name is not None
+            ):
+                local_pose = (
+                    posed_link_transforms[node.link_name]
+                    @ np.linalg.inv(self.link_bind_transforms[node.link_name])
+                    @ node.base_transform
+                )
+            scene.add(node.mesh, pose=root @ local_pose)
         rgba, depth = self.renderer.render(scene, flags=pyrender.RenderFlags.RGBA)
         return MeshRenderResult(rgba=rgba, depth_m=depth.astype(np.float32, copy=False))
+
+
+def _resolve_link_name(candidate_names: Iterable[str], links: set[str]) -> str | None:
+    for node_name in candidate_names:
+        if node_name in links:
+            return node_name
+        prefix, sep, suffix = node_name.rpartition("_")
+        if sep and suffix.isdigit() and prefix in links:
+            return prefix
+    return None
