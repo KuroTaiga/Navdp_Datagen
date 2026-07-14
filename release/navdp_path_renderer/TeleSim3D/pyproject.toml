@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tele-sim3d"
+version = "0.1.0"
+description = "TeleSim3D navigation and planning utilities"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{name = "TeleSim3D Team"}]
+license = {text = "MIT"}
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
+
+[project.scripts]
+prompt-to-plan = "scripts.prompt_to_plan:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["tele_sim*"]
