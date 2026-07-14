@@ -1,0 +1,10 @@
+# Runtime deps for release/navdp_path_renderer.
+# Install PyTorch separately in install.sh so the CUDA wheel can be selected.
+gsplat
+imageio
+imageio-ffmpeg
+numpy>=2.0,<2.2
+opencv-python
+pillow
+plyfile
+tqdm
