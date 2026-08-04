@@ -28,6 +28,16 @@ Defaults:
 
 The manifest supports two action-source modes.
 
+`configs/massgen/avatar_action_generation_inputs.json` is the batch input
+matrix for materializing missing avatar clips before a render run. It contains:
+
+- reusable action templates with Kimodo/STMC prompts, optional keypoints, root
+  motion policy, duration, and quality checks;
+- avatar identities with appearance prompts and canonical asset placeholders;
+- per-avatar required and nice-to-have action lists by mission family;
+- expanded `generation_requests`, one per avatar/action pair, with concrete
+  output paths under `assets/human_actions/generated/{human_resource_id}/{action_id}`.
+
 Pre-generated action assets:
 
 - `asset.pre_generated: true`

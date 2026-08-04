@@ -1,0 +1,2644 @@
+{
+  "schema_version": "massgen_avatar_action_generation_inputs/v0.1",
+  "date": "2026-08-04",
+  "description": "Inputs for generating renderer-ready avatar action clips for MassGen mission families.",
+  "source_catalog": "/Users/dongjk/ProjectFiles/Navdp_Datagen_Pathplanner/configs/benchmark/human_centric_mission_stream/human_resources/human_catalog.json",
+  "source_action_codex": "/Users/dongjk/ProjectFiles/Navdp_Datagen_Pathplanner/configs/benchmark/human_centric_mission_stream/human_resources/action_codex.json",
+  "defaults": {
+    "candidate_generators": [
+      "kimodo",
+      "stmc"
+    ],
+    "fps": 30.0,
+    "render_fps": 10.0,
+    "coordinate_frame": "avatar_local_z_up_m",
+    "output_root": "assets/human_actions/generated",
+    "output_contract_template": {
+      "manifest_path": "assets/human_actions/generated/{human_resource_id}/{action_id}/manifest.json",
+      "ply_frame_dir": "assets/human_actions/generated/{human_resource_id}/{action_id}/ply_frames",
+      "smplx_frame_dir": "assets/human_actions/generated/{human_resource_id}/{action_id}/smplx_frames"
+    },
+    "required_outputs": [
+      "manifest.json",
+      "ply_frames/*.ply",
+      "smplx_frames/*.json"
+    ]
+  },
+  "keypoint_convention": {
+    "units": "meters",
+    "time_key": "t",
+    "time_units": "seconds",
+    "frame": "avatar_local",
+    "up_axis": "z",
+    "forward_axis": "y",
+    "notes": "Keypoints are optional. Text-only actions should set keypoints to null."
+  },
+  "avatar_identities": {
+    "human_adult_blue_jacket": {
+      "appearance_id": "appearance_adult_blue_jacket",
+      "appearance_prompt": "adult wearing a blue jacket and dark pants",
+      "canonical_ply_path": "assets/humans/placeholder/adult_blue_jacket/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/adult_blue_jacket/canonical_smplx.json"
+    },
+    "human_adult_green_sweater": {
+      "appearance_id": "appearance_adult_green_sweater",
+      "appearance_prompt": "adult wearing a green sweater and light trousers",
+      "canonical_ply_path": "assets/humans/placeholder/adult_green_sweater/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/adult_green_sweater/canonical_smplx.json"
+    },
+    "human_elderly_gray_coat": {
+      "appearance_id": "appearance_elderly_gray_coat",
+      "appearance_prompt": "elderly person wearing a gray coat",
+      "canonical_ply_path": "assets/humans/placeholder/elderly_gray_coat/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/elderly_gray_coat/canonical_smplx.json"
+    },
+    "human_worker_orange_vest": {
+      "appearance_id": "appearance_worker_orange_vest",
+      "appearance_prompt": "worker wearing an orange vest",
+      "canonical_ply_path": "assets/humans/placeholder/worker_orange_vest/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/worker_orange_vest/canonical_smplx.json"
+    },
+    "human_student_red_hoodie": {
+      "appearance_id": "appearance_student_red_hoodie",
+      "appearance_prompt": "young adult student wearing a red hoodie and backpack",
+      "canonical_ply_path": "assets/humans/placeholder/student_red_hoodie/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/student_red_hoodie/canonical_smplx.json"
+    },
+    "human_pedestrian_black_coat": {
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "appearance_prompt": "pedestrian wearing a black coat",
+      "canonical_ply_path": "assets/humans/placeholder/pedestrian_black_coat/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/pedestrian_black_coat/canonical_smplx.json"
+    },
+    "human_pedestrian_yellow_shirt": {
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "appearance_prompt": "pedestrian wearing a yellow shirt",
+      "canonical_ply_path": "assets/humans/placeholder/pedestrian_yellow_shirt/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/pedestrian_yellow_shirt/canonical_smplx.json"
+    },
+    "human_pedestrian_purple_jacket": {
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "appearance_prompt": "pedestrian wearing a purple jacket",
+      "canonical_ply_path": "assets/humans/placeholder/pedestrian_purple_jacket/canonical.ply",
+      "canonical_smplx_json_path": "assets/humans/placeholder/pedestrian_purple_jacket/canonical_smplx.json"
+    }
+  },
+  "action_inputs": {
+    "stand": {
+      "render_action_id": "stand",
+      "preferred_generator": "stmc",
+      "input_style": "text",
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    "busy_idle": {
+      "render_action_id": "stand",
+      "preferred_generator": "stmc",
+      "input_style": "text",
+      "duration_s": 5.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand in place as a busy bystander who is not engaging the robot. Add subtle weight shifts and small head or hand movement, but do not wave or step away.",
+      "keypoints": null,
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "non-interactive body language",
+        "loopable idle motion"
+      ]
+    },
+    "walk": {
+      "render_action_id": "walk",
+      "preferred_generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "instruction": "Walk forward at a normal indoor pace with natural arm swing. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "root_xy": [
+            0.0,
+            0.9
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 3.0,
+          "root_xy": [
+            0.0,
+            1.8
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "quality_checks": [
+        "no foot sliding after retiming",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    "walk_slow": {
+      "render_action_id": "walk",
+      "preferred_generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "instruction": "Walk forward slowly and carefully with a shorter stride. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 2.0,
+          "root_xy": [
+            0.0,
+            0.65
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 4.0,
+          "root_xy": [
+            0.0,
+            1.3
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "quality_checks": [
+        "slow pace is visually distinct from normal walk",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    "walk_fast": {
+      "render_action_id": "walk",
+      "preferred_generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "duration_s": 2.4,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "instruction": "Walk forward briskly at a fast indoor pace without running. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.2,
+          "root_xy": [
+            0.0,
+            1.1
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 2.4,
+          "root_xy": [
+            0.0,
+            2.2
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "quality_checks": [
+        "fast pace is visually distinct from normal walk",
+        "does not look like running",
+        "root motion can be replaced by map path"
+      ]
+    },
+    "queue_wait": {
+      "render_action_id": "queue_wait",
+      "preferred_generator": "stmc",
+      "input_style": "text",
+      "duration_s": 5.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand in a queue facing forward. Keep feet nearly planted, make small patient waiting movements, and occasionally shift weight without leaving the queue position.",
+      "keypoints": null,
+      "quality_checks": [
+        "no root translation larger than 0.08m",
+        "queue posture remains forward-facing",
+        "loopable waiting motion"
+      ]
+    },
+    "receive_item": {
+      "render_action_id": "receive_item",
+      "preferred_generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "duration_s": 3.0,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand near a service robot, extend both hands slightly forward to receive a small item, bring it toward the torso, then settle back to neutral standing.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.22,
+            0.05,
+            1.05
+          ],
+          "left_hand": [
+            -0.22,
+            0.05,
+            1.05
+          ]
+        },
+        {
+          "t": 1.2,
+          "right_hand": [
+            0.16,
+            0.45,
+            1.15
+          ],
+          "left_hand": [
+            -0.16,
+            0.45,
+            1.15
+          ]
+        },
+        {
+          "t": 2.2,
+          "right_hand": [
+            0.12,
+            0.15,
+            1.1
+          ],
+          "left_hand": [
+            -0.12,
+            0.15,
+            1.1
+          ]
+        },
+        {
+          "t": 3.0,
+          "body": "neutral_stand"
+        }
+      ],
+      "quality_checks": [
+        "hands move forward before returning",
+        "feet stay planted",
+        "non-looping clip ends in neutral stance"
+      ]
+    },
+    "wave": {
+      "render_action_id": "wave",
+      "preferred_generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand in place and wave one hand at a nearby robot to get attention. Keep the gesture friendly and readable from a first-person robot camera.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        },
+        {
+          "t": 0.8,
+          "right_hand": [
+            0.35,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 1.6,
+          "right_hand": [
+            0.55,
+            0.12,
+            1.48
+          ]
+        },
+        {
+          "t": 2.4,
+          "right_hand": [
+            0.28,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 3.0,
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        }
+      ],
+      "quality_checks": [
+        "right hand clearly rises above shoulder",
+        "feet stay planted",
+        "loop boundary is smooth"
+      ]
+    },
+    "point_guidance": {
+      "render_action_id": "wave",
+      "preferred_generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "duration_s": 3.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "instruction": "Stand in place, acknowledge the robot, then point clearly toward the destination direction as if giving route guidance.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 0.8,
+          "right_hand": [
+            0.35,
+            0.12,
+            1.45
+          ]
+        },
+        {
+          "t": 1.8,
+          "right_hand": [
+            0.72,
+            0.45,
+            1.35
+          ],
+          "head_target": [
+            0.8,
+            1.0,
+            1.4
+          ]
+        },
+        {
+          "t": 3.0,
+          "right_hand": [
+            0.72,
+            0.45,
+            1.35
+          ],
+          "hold": true
+        },
+        {
+          "t": 3.5,
+          "body": "neutral_stand"
+        }
+      ],
+      "quality_checks": [
+        "pointing direction is readable",
+        "feet stay planted",
+        "non-looping clip returns to stable stance"
+      ]
+    },
+    "yield_stop": {
+      "render_action_id": "yield_stop",
+      "preferred_generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    "turn_left": {
+      "render_action_id": "turn_left",
+      "preferred_generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    "turn_right": {
+      "render_action_id": "turn_right",
+      "preferred_generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    }
+  },
+  "avatar_action_plan": {
+    "human_adult_blue_jacket": {
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "required_actions": [
+        "stand",
+        "receive_item",
+        "wave"
+      ],
+      "nice_to_have_actions": [
+        "point_guidance",
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_adult_green_sweater": {
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "required_actions": [
+        "stand",
+        "busy_idle"
+      ],
+      "nice_to_have_actions": [
+        "yield_stop",
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_elderly_gray_coat": {
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "required_actions": [
+        "stand",
+        "yield_stop"
+      ],
+      "nice_to_have_actions": [
+        "walk_slow",
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_worker_orange_vest": {
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "required_actions": [
+        "queue_wait",
+        "receive_item",
+        "stand"
+      ],
+      "nice_to_have_actions": [
+        "wave",
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_student_red_hoodie": {
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "required_actions": [
+        "queue_wait",
+        "walk",
+        "stand"
+      ],
+      "nice_to_have_actions": [
+        "yield_stop",
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_pedestrian_black_coat": {
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "required_actions": [
+        "walk",
+        "yield_stop",
+        "stand"
+      ],
+      "nice_to_have_actions": [
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_pedestrian_yellow_shirt": {
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "required_actions": [
+        "walk_fast",
+        "yield_stop",
+        "stand"
+      ],
+      "nice_to_have_actions": [
+        "turn_left",
+        "turn_right"
+      ]
+    },
+    "human_pedestrian_purple_jacket": {
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "required_actions": [
+        "walk_slow",
+        "yield_stop",
+        "stand"
+      ],
+      "nice_to_have_actions": [
+        "turn_left",
+        "turn_right"
+      ]
+    }
+  },
+  "request_expansion": {
+    "request_id_template": "{human_resource_id}__{action_id}",
+    "prompt_template": "{appearance_prompt}. {instruction}",
+    "priority_sources": [
+      "required",
+      "nice_to_have"
+    ],
+    "output_template_fields": [
+      "manifest_path",
+      "ply_frame_dir",
+      "smplx_frame_dir"
+    ]
+  },
+  "generation_requests": [
+    {
+      "request_id": "human_adult_blue_jacket__stand",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_adult_blue_jacket__receive_item",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "receive_item",
+      "render_action_id": "receive_item",
+      "priority": "required",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Stand near a service robot, extend both hands slightly forward to receive a small item, bring it toward the torso, then settle back to neutral standing.",
+      "instruction": "Stand near a service robot, extend both hands slightly forward to receive a small item, bring it toward the torso, then settle back to neutral standing.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.22,
+            0.05,
+            1.05
+          ],
+          "left_hand": [
+            -0.22,
+            0.05,
+            1.05
+          ]
+        },
+        {
+          "t": 1.2,
+          "right_hand": [
+            0.16,
+            0.45,
+            1.15
+          ],
+          "left_hand": [
+            -0.16,
+            0.45,
+            1.15
+          ]
+        },
+        {
+          "t": 2.2,
+          "right_hand": [
+            0.12,
+            0.15,
+            1.1
+          ],
+          "left_hand": [
+            -0.12,
+            0.15,
+            1.1
+          ]
+        },
+        {
+          "t": 3.0,
+          "body": "neutral_stand"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/receive_item/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/receive_item/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/receive_item/smplx_frames"
+      },
+      "quality_checks": [
+        "hands move forward before returning",
+        "feet stay planted",
+        "non-looping clip ends in neutral stance"
+      ]
+    },
+    {
+      "request_id": "human_adult_blue_jacket__wave",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "wave",
+      "render_action_id": "wave",
+      "priority": "required",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Stand in place and wave one hand at a nearby robot to get attention. Keep the gesture friendly and readable from a first-person robot camera.",
+      "instruction": "Stand in place and wave one hand at a nearby robot to get attention. Keep the gesture friendly and readable from a first-person robot camera.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        },
+        {
+          "t": 0.8,
+          "right_hand": [
+            0.35,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 1.6,
+          "right_hand": [
+            0.55,
+            0.12,
+            1.48
+          ]
+        },
+        {
+          "t": 2.4,
+          "right_hand": [
+            0.28,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 3.0,
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/wave/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/wave/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/wave/smplx_frames"
+      },
+      "quality_checks": [
+        "right hand clearly rises above shoulder",
+        "feet stay planted",
+        "loop boundary is smooth"
+      ]
+    },
+    {
+      "request_id": "human_adult_blue_jacket__point_guidance",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "point_guidance",
+      "render_action_id": "wave",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Stand in place, acknowledge the robot, then point clearly toward the destination direction as if giving route guidance.",
+      "instruction": "Stand in place, acknowledge the robot, then point clearly toward the destination direction as if giving route guidance.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 0.8,
+          "right_hand": [
+            0.35,
+            0.12,
+            1.45
+          ]
+        },
+        {
+          "t": 1.8,
+          "right_hand": [
+            0.72,
+            0.45,
+            1.35
+          ],
+          "head_target": [
+            0.8,
+            1.0,
+            1.4
+          ]
+        },
+        {
+          "t": 3.0,
+          "right_hand": [
+            0.72,
+            0.45,
+            1.35
+          ],
+          "hold": true
+        },
+        {
+          "t": 3.5,
+          "body": "neutral_stand"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/point_guidance/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/point_guidance/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/point_guidance/smplx_frames"
+      },
+      "quality_checks": [
+        "pointing direction is readable",
+        "feet stay planted",
+        "non-looping clip returns to stable stance"
+      ]
+    },
+    {
+      "request_id": "human_adult_blue_jacket__turn_left",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_adult_blue_jacket__turn_right",
+      "human_resource_id": "human_adult_blue_jacket",
+      "appearance_id": "appearance_adult_blue_jacket",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "human_guided_uncertain_region"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a blue jacket and dark pants. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_blue_jacket/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_blue_jacket/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_adult_green_sweater__stand",
+      "human_resource_id": "human_adult_green_sweater",
+      "appearance_id": "appearance_adult_green_sweater",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a green sweater and light trousers. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_green_sweater/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_adult_green_sweater__busy_idle",
+      "human_resource_id": "human_adult_green_sweater",
+      "appearance_id": "appearance_adult_green_sweater",
+      "action_id": "busy_idle",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 5.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a green sweater and light trousers. Stand in place as a busy bystander who is not engaging the robot. Add subtle weight shifts and small head or hand movement, but do not wave or step away.",
+      "instruction": "Stand in place as a busy bystander who is not engaging the robot. Add subtle weight shifts and small head or hand movement, but do not wave or step away.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_green_sweater/busy_idle/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/busy_idle/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/busy_idle/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "non-interactive body language",
+        "loopable idle motion"
+      ]
+    },
+    {
+      "request_id": "human_adult_green_sweater__yield_stop",
+      "human_resource_id": "human_adult_green_sweater",
+      "appearance_id": "appearance_adult_green_sweater",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a green sweater and light trousers. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_green_sweater/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_adult_green_sweater__turn_left",
+      "human_resource_id": "human_adult_green_sweater",
+      "appearance_id": "appearance_adult_green_sweater",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a green sweater and light trousers. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_green_sweater/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_adult_green_sweater__turn_right",
+      "human_resource_id": "human_adult_green_sweater",
+      "appearance_id": "appearance_adult_green_sweater",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "deliver_to_human",
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "adult wearing a green sweater and light trousers. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_adult_green_sweater/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_adult_green_sweater/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_elderly_gray_coat__stand",
+      "human_resource_id": "human_elderly_gray_coat",
+      "appearance_id": "appearance_elderly_gray_coat",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "elderly person wearing a gray coat. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_elderly_gray_coat/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_elderly_gray_coat__yield_stop",
+      "human_resource_id": "human_elderly_gray_coat",
+      "appearance_id": "appearance_elderly_gray_coat",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "required",
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "elderly person wearing a gray coat. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_elderly_gray_coat/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_elderly_gray_coat__walk_slow",
+      "human_resource_id": "human_elderly_gray_coat",
+      "appearance_id": "appearance_elderly_gray_coat",
+      "action_id": "walk_slow",
+      "render_action_id": "walk",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "prompt": "elderly person wearing a gray coat. Walk forward slowly and carefully with a shorter stride. Keep the motion loopable for path-following retiming.",
+      "instruction": "Walk forward slowly and carefully with a shorter stride. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 2.0,
+          "root_xy": [
+            0.0,
+            0.65
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 4.0,
+          "root_xy": [
+            0.0,
+            1.3
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_elderly_gray_coat/walk_slow/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/walk_slow/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/walk_slow/smplx_frames"
+      },
+      "quality_checks": [
+        "slow pace is visually distinct from normal walk",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    {
+      "request_id": "human_elderly_gray_coat__turn_left",
+      "human_resource_id": "human_elderly_gray_coat",
+      "appearance_id": "appearance_elderly_gray_coat",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "elderly person wearing a gray coat. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_elderly_gray_coat/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_elderly_gray_coat__turn_right",
+      "human_resource_id": "human_elderly_gray_coat",
+      "appearance_id": "appearance_elderly_gray_coat",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "navigate_with_social_constraints:personal_space"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "elderly person wearing a gray coat. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_elderly_gray_coat/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_elderly_gray_coat/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__queue_wait",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "queue_wait",
+      "render_action_id": "queue_wait",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 5.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Stand in a queue facing forward. Keep feet nearly planted, make small patient waiting movements, and occasionally shift weight without leaving the queue position.",
+      "instruction": "Stand in a queue facing forward. Keep feet nearly planted, make small patient waiting movements, and occasionally shift weight without leaving the queue position.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/queue_wait/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/queue_wait/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/queue_wait/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.08m",
+        "queue posture remains forward-facing",
+        "loopable waiting motion"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__receive_item",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "receive_item",
+      "render_action_id": "receive_item",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Stand near a service robot, extend both hands slightly forward to receive a small item, bring it toward the torso, then settle back to neutral standing.",
+      "instruction": "Stand near a service robot, extend both hands slightly forward to receive a small item, bring it toward the torso, then settle back to neutral standing.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.22,
+            0.05,
+            1.05
+          ],
+          "left_hand": [
+            -0.22,
+            0.05,
+            1.05
+          ]
+        },
+        {
+          "t": 1.2,
+          "right_hand": [
+            0.16,
+            0.45,
+            1.15
+          ],
+          "left_hand": [
+            -0.16,
+            0.45,
+            1.15
+          ]
+        },
+        {
+          "t": 2.2,
+          "right_hand": [
+            0.12,
+            0.15,
+            1.1
+          ],
+          "left_hand": [
+            -0.12,
+            0.15,
+            1.1
+          ]
+        },
+        {
+          "t": 3.0,
+          "body": "neutral_stand"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/receive_item/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/receive_item/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/receive_item/smplx_frames"
+      },
+      "quality_checks": [
+        "hands move forward before returning",
+        "feet stay planted",
+        "non-looping clip ends in neutral stance"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__stand",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__wave",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "wave",
+      "render_action_id": "wave",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Stand in place and wave one hand at a nearby robot to get attention. Keep the gesture friendly and readable from a first-person robot camera.",
+      "instruction": "Stand in place and wave one hand at a nearby robot to get attention. Keep the gesture friendly and readable from a first-person robot camera.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "body": "neutral_stand",
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        },
+        {
+          "t": 0.8,
+          "right_hand": [
+            0.35,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 1.6,
+          "right_hand": [
+            0.55,
+            0.12,
+            1.48
+          ]
+        },
+        {
+          "t": 2.4,
+          "right_hand": [
+            0.28,
+            0.12,
+            1.55
+          ]
+        },
+        {
+          "t": 3.0,
+          "right_hand": [
+            0.25,
+            0.05,
+            1.1
+          ]
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/wave/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/wave/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/wave/smplx_frames"
+      },
+      "quality_checks": [
+        "right hand clearly rises above shoulder",
+        "feet stay planted",
+        "loop boundary is smooth"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__turn_left",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_worker_orange_vest__turn_right",
+      "human_resource_id": "human_worker_orange_vest",
+      "appearance_id": "appearance_worker_orange_vest",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "worker wearing an orange vest. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_worker_orange_vest/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_worker_orange_vest/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__queue_wait",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "queue_wait",
+      "render_action_id": "queue_wait",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 5.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "young adult student wearing a red hoodie and backpack. Stand in a queue facing forward. Keep feet nearly planted, make small patient waiting movements, and occasionally shift weight without leaving the queue position.",
+      "instruction": "Stand in a queue facing forward. Keep feet nearly planted, make small patient waiting movements, and occasionally shift weight without leaving the queue position.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/queue_wait/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/queue_wait/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/queue_wait/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.08m",
+        "queue posture remains forward-facing",
+        "loopable waiting motion"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__walk",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "walk",
+      "render_action_id": "walk",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "prompt": "young adult student wearing a red hoodie and backpack. Walk forward at a normal indoor pace with natural arm swing. Keep the motion loopable for path-following retiming.",
+      "instruction": "Walk forward at a normal indoor pace with natural arm swing. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "root_xy": [
+            0.0,
+            0.9
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 3.0,
+          "root_xy": [
+            0.0,
+            1.8
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/walk/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/walk/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/walk/smplx_frames"
+      },
+      "quality_checks": [
+        "no foot sliding after retiming",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__stand",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "young adult student wearing a red hoodie and backpack. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__yield_stop",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "young adult student wearing a red hoodie and backpack. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__turn_left",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "young adult student wearing a red hoodie and backpack. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_student_red_hoodie__turn_right",
+      "human_resource_id": "human_student_red_hoodie",
+      "appearance_id": "appearance_student_red_hoodie",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "serve_queue",
+        "navigate_with_social_constraints:queue_order",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "young adult student wearing a red hoodie and backpack. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_student_red_hoodie/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_student_red_hoodie/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_black_coat__walk",
+      "human_resource_id": "human_pedestrian_black_coat",
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "action_id": "walk",
+      "render_action_id": "walk",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 3.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "prompt": "pedestrian wearing a black coat. Walk forward at a normal indoor pace with natural arm swing. Keep the motion loopable for path-following retiming.",
+      "instruction": "Walk forward at a normal indoor pace with natural arm swing. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "root_xy": [
+            0.0,
+            0.9
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 3.0,
+          "root_xy": [
+            0.0,
+            1.8
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_black_coat/walk/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/walk/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/walk/smplx_frames"
+      },
+      "quality_checks": [
+        "no foot sliding after retiming",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_black_coat__yield_stop",
+      "human_resource_id": "human_pedestrian_black_coat",
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a black coat. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_black_coat/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_black_coat__stand",
+      "human_resource_id": "human_pedestrian_black_coat",
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a black coat. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_black_coat/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_black_coat__turn_left",
+      "human_resource_id": "human_pedestrian_black_coat",
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a black coat. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_black_coat/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_black_coat__turn_right",
+      "human_resource_id": "human_pedestrian_black_coat",
+      "appearance_id": "appearance_pedestrian_black_coat",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined",
+        "navigate_with_social_constraints:pedestrian_yield"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a black coat. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_black_coat/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_black_coat/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_yellow_shirt__walk_fast",
+      "human_resource_id": "human_pedestrian_yellow_shirt",
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "action_id": "walk_fast",
+      "render_action_id": "walk",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.4,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "prompt": "pedestrian wearing a yellow shirt. Walk forward briskly at a fast indoor pace without running. Keep the motion loopable for path-following retiming.",
+      "instruction": "Walk forward briskly at a fast indoor pace without running. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.2,
+          "root_xy": [
+            0.0,
+            1.1
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 2.4,
+          "root_xy": [
+            0.0,
+            2.2
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_yellow_shirt/walk_fast/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/walk_fast/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/walk_fast/smplx_frames"
+      },
+      "quality_checks": [
+        "fast pace is visually distinct from normal walk",
+        "does not look like running",
+        "root motion can be replaced by map path"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_yellow_shirt__yield_stop",
+      "human_resource_id": "human_pedestrian_yellow_shirt",
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a yellow shirt. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_yellow_shirt/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_yellow_shirt__stand",
+      "human_resource_id": "human_pedestrian_yellow_shirt",
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a yellow shirt. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_yellow_shirt/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_yellow_shirt__turn_left",
+      "human_resource_id": "human_pedestrian_yellow_shirt",
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a yellow shirt. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_yellow_shirt__turn_right",
+      "human_resource_id": "human_pedestrian_yellow_shirt",
+      "appearance_id": "appearance_pedestrian_yellow_shirt",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a yellow shirt. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_yellow_shirt/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_purple_jacket__walk_slow",
+      "human_resource_id": "human_pedestrian_purple_jacket",
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "action_id": "walk_slow",
+      "render_action_id": "walk",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "follow_map_path",
+      "prompt": "pedestrian wearing a purple jacket. Walk forward slowly and carefully with a shorter stride. Keep the motion loopable for path-following retiming.",
+      "instruction": "Walk forward slowly and carefully with a shorter stride. Keep the motion loopable for path-following retiming.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 2.0,
+          "root_xy": [
+            0.0,
+            0.65
+          ],
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 4.0,
+          "root_xy": [
+            0.0,
+            1.3
+          ],
+          "facing_yaw_rad": 0.0
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_purple_jacket/walk_slow/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/walk_slow/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/walk_slow/smplx_frames"
+      },
+      "quality_checks": [
+        "slow pace is visually distinct from normal walk",
+        "loopable stride cycle",
+        "root motion can be replaced by map path"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_purple_jacket__yield_stop",
+      "human_resource_id": "human_pedestrian_purple_jacket",
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "action_id": "yield_stop",
+      "render_action_id": "yield_stop",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "kimodo",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 2.5,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a purple jacket. Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "instruction": "Pause and yield space to a nearby robot or pedestrian. Make a small side-step or lean, then hold a stopped posture.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "root_xy": [
+            0.0,
+            0.0
+          ],
+          "body": "neutral_stand"
+        },
+        {
+          "t": 1.0,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "slight_side_step"
+        },
+        {
+          "t": 2.5,
+          "root_xy": [
+            -0.15,
+            0.08
+          ],
+          "body": "stopped_yielding"
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_purple_jacket/yield_stop/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/yield_stop/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/yield_stop/smplx_frames"
+      },
+      "quality_checks": [
+        "root translation remains under 0.25m",
+        "yield posture is distinct from normal idle",
+        "loopable stopped posture"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_purple_jacket__stand",
+      "human_resource_id": "human_pedestrian_purple_jacket",
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "action_id": "stand",
+      "render_action_id": "stand",
+      "priority": "required",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text",
+      "fps": 30.0,
+      "duration_s": 4.0,
+      "loop": true,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a purple jacket. Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "instruction": "Stand in place with a neutral relaxed posture. Keep feet planted, allow small natural breathing and posture shifts, and face forward.",
+      "keypoints": null,
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_purple_jacket/stand/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/stand/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/stand/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "first and last frames loop smoothly",
+        "hands do not intersect torso"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_purple_jacket__turn_left",
+      "human_resource_id": "human_pedestrian_purple_jacket",
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "action_id": "turn_left",
+      "render_action_id": "turn_left",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a purple jacket. Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the left by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": 1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_left/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_left/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_left/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees left",
+        "non-looping clip ends stable"
+      ]
+    },
+    {
+      "request_id": "human_pedestrian_purple_jacket__turn_right",
+      "human_resource_id": "human_pedestrian_purple_jacket",
+      "appearance_id": "appearance_pedestrian_purple_jacket",
+      "action_id": "turn_right",
+      "render_action_id": "turn_right",
+      "priority": "nice_to_have",
+      "mission_families": [
+        "dense_dynamic_humans",
+        "dense_dynamic_avoidance",
+        "dense_dynamic_combined"
+      ],
+      "generator": "stmc",
+      "input_style": "text_with_keypoints",
+      "fps": 30.0,
+      "duration_s": 1.5,
+      "loop": false,
+      "root_motion_mode": "stationary",
+      "prompt": "pedestrian wearing a purple jacket. Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "instruction": "Pivot in place to the right by 90 degrees while keeping feet near the same spot and ending balanced.",
+      "keypoints": [
+        {
+          "t": 0.0,
+          "facing_yaw_rad": 0.0
+        },
+        {
+          "t": 1.5,
+          "facing_yaw_rad": -1.5708
+        }
+      ],
+      "output_contract": {
+        "manifest_path": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_right/manifest.json",
+        "ply_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_right/ply_frames",
+        "smplx_frame_dir": "assets/human_actions/generated/human_pedestrian_purple_jacket/turn_right/smplx_frames"
+      },
+      "quality_checks": [
+        "no root translation larger than 0.05m",
+        "ends facing 90 degrees right",
+        "non-looping clip ends stable"
+      ]
+    }
+  ]
+}
