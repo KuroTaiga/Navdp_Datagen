@@ -64,6 +64,7 @@ from utils.telesim_actor_utils import (  # type: ignore
     load_actor_sequence,
     actor_data_to_tensors,
 )
+from utils.actor_visibility import sphere_visible_in_camera, transformed_actor_sphere
 from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 
 LOGGER = logging.getLogger("render_label_paths_telesim")
@@ -1131,6 +1132,9 @@ def render_label_with_actor(
     scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
     combined_model: CombinedGaussianModel | None = None
     combined_actor_size: int | None = None
+    actor_cull_enabled = bool(getattr(args, "actor_visibility_culling", False))
+    actor_cull_margin_m = float(getattr(args, "actor_cull_margin_m", 0.0) or 0.0)
+    actor_culled_frames = 0
 
     light_config: LightFilterConfig | None = getattr(args, "light_config", None)
     cl_config: CameraLightConfig | None = getattr(args, "cl_config", None)
@@ -1151,36 +1155,63 @@ def render_label_with_actor(
         )
 
     def _render_frames(writer=None):
-        nonlocal render_time, encode_time, frames_rendered, combined_model, combined_actor_size
+        nonlocal render_time, encode_time, frames_rendered, combined_model, combined_actor_size, actor_culled_frames
         for idx, ((pose, _), transform, actor_idx) in enumerate(
             zip(poses, actor_transforms, actor_indices)
         ):
-            sequence_frame = actor_runtime.sequence.frames[actor_idx]
-            # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
-            actor_data = apply_transform_to_frame(
-                sequence_frame,
-                actor_runtime.sequence,
-                transform,
-            )
-            actor_render = actor_data_to_tensors(
-                actor_data,
-                actor_runtime.sequence,
-                device=base_gaussians.get_xyz.device,
-                target_rest_dim=scene_rest_dim,
-            )
-            current_actor_size = int(actor_render.xyz.shape[0])
-            if combined_model is None or combined_actor_size != current_actor_size:
-                combined_actor_size = current_actor_size
-                combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+            render_gaussians = base_gaussians
+            actor_visible = True
+            if actor_cull_enabled:
+                camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+                sphere = transformed_actor_sphere(
+                    transform,
+                    radius_xy_m=actor_runtime.sequence.radius_xy,
+                    height_m=actor_runtime.sequence.height,
+                    margin_m=actor_cull_margin_m,
+                )
+                visibility = sphere_visible_in_camera(
+                    center_world=sphere.center_world,
+                    radius_m=sphere.radius_m,
+                    world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
+                    fov_x_rad=float(camera_for_cull.FoVx),
+                    fov_y_rad=float(camera_for_cull.FoVy),
+                    znear=float(camera_for_cull.znear),
+                    zfar=float(camera_for_cull.zfar),
+                    matrix_is_transposed=True,
+                )
+                actor_visible = bool(visibility.visible)
+                if not actor_visible:
+                    actor_culled_frames += 1
+            if actor_visible:
+                sequence_frame = actor_runtime.sequence.frames[actor_idx]
+                # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
+                actor_data = apply_transform_to_frame(
+                    sequence_frame,
+                    actor_runtime.sequence,
+                    transform,
+                )
+                actor_render = actor_data_to_tensors(
+                    actor_data,
+                    actor_runtime.sequence,
+                    device=base_gaussians.get_xyz.device,
+                    target_rest_dim=scene_rest_dim,
+                )
+                current_actor_size = int(actor_render.xyz.shape[0])
+                if combined_model is None or combined_actor_size != current_actor_size:
+                    combined_actor_size = current_actor_size
+                    combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+                else:
+                    combined_model.update_actor(actor_render)
+                render_gaussians = combined_model
             else:
-                combined_model.update_actor(actor_render)
+                combined_actor_size = None
 
             start = time.monotonic()
             if use_gpu_video:
                 render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
                     renderer,
                     pose,
-                    combined_model,
+                    render_gaussians,
                     return_render_tensor=True,
                     need_depth_inv=need_depth_inv,
                 )
@@ -1198,7 +1229,7 @@ def render_label_with_actor(
                 rgb, depth_inv, camera = _render_custom_gaussians(
                     renderer,
                     pose,
-                    combined_model,
+                    render_gaussians,
                     need_depth_inv=need_depth_inv,
                 )
             render_time += time.monotonic() - start
@@ -1287,6 +1318,7 @@ def render_label_with_actor(
             "render": render_time,
             "encode": encode_time,
         },
+        "actor_culled_frames": actor_culled_frames,
     }
 
 
@@ -1433,6 +1465,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--follow-buffer", type=float, default=0.0)
     parser.add_argument("--actor-foot-offset", type=float, default=0.0)
     parser.add_argument("--animation-cycle-mod", type=int, default=3)
+    parser.add_argument(
+        "--actor-visibility-culling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Skip composing the Gaussian actor on frames where its approximate "
+            "bounding sphere is outside the camera frustum. Default: off."
+        ),
+    )
+    parser.add_argument(
+        "--actor-cull-margin-m",
+        type=float,
+        default=0.25,
+        help="Extra bounding-sphere margin for --actor-visibility-culling.",
+    )
     parser.add_argument("--actor-no-loop", dest="actor_loop", action="store_false")
     parser.set_defaults(actor_loop=True)
     args, unknown = parser.parse_known_args()
