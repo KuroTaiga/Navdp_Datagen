@@ -24,6 +24,37 @@ Defaults:
 - human and peer-robot visibility culling: enabled in generated jobs
 - default peer robot GLB: `assets/robots/g1_29dof_mode_16.glb`
 
+## Avatar Action Sources
+
+The manifest supports two action-source modes.
+
+Pre-generated action assets:
+
+- `asset.pre_generated: true`
+- `asset.requires_generation: false`
+- `asset.ply_frame_dir` or `asset.manifest_path` points at renderer-ready
+  action frames
+
+Generated action requests:
+
+- `asset.pre_generated: false` or `source` is `kimodo`, `stmc`, or
+  `generated_on_the_fly`
+- `asset.requires_generation: true`
+- `generation_request.enabled: true`
+- `generation_request.generator` records `kimodo`, `stmc`, or the configured
+  generator source
+- `generation_request.instruction` preserves the text prompt
+- `generation_request.input_style` is `text` or `text_with_keypoints`
+- `generation_request.keypoints` preserves optional keypoint or waypoint
+  constraints
+- `generation_request.output_contract` names where the generated manifest,
+  PLY frames, and SMPL-X frames should be materialized before rendering
+
+Server-side preflight should fail a render job if any action segment still has
+`asset.requires_generation: true`. The action generation platform should fill
+the output contract first, then rerun manifest conversion or patch the action
+segment into a pre-generated asset.
+
 ## Top-Level Shape
 
 The generated JSON has:
@@ -68,8 +99,11 @@ Schema-only Pathplanner families are converted with warnings only:
 ## Current Limits
 
 - The manifest is declarative; it does not launch CUDA rendering.
-- Missing human PLY frame directories are warnings today. The server launcher
-  should turn those into preflight failures before reserving a GPU.
+- Generated actions are represented as requests. They must be materialized into
+  renderer-ready PLY/SMPL-X frame directories before GPU rendering.
+- Missing human PLY frame directories are warnings today when no generation
+  request is attached. The server launcher should turn those into preflight
+  failures before reserving a GPU.
 - Peer robots are referenced in jobs, but multi-robot GLB compositing still
   needs a manifest-driven executor.
 - Human action switching is represented as multiple `action_segments`; the hot

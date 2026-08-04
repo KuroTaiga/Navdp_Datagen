@@ -76,6 +76,8 @@ Implemented in:
   gesture, guidance, and service interactions.
 - [x] Allow one human to switch action sequences over time.
 - [x] Keep action-time sampling deterministic from scenario seed and actor id.
+- [x] Preserve pre-generated action assets and Kimodo/STMC-style text or
+  text-plus-keypoint generation requests in the render manifest.
 - [ ] Validate missing action assets fail clearly before GPU rendering starts.
 
 ### 3. Multi-Robot Rendering

@@ -692,6 +692,24 @@ def _action_segment_record(
     action_catalog: Mapping[str, Mapping[str, Any]],
 ) -> JsonDict:
     catalog_entry = dict(action_catalog.get(action_id, {}))
+    source = str(sequence.get("source") or catalog_entry.get("source") or "catalog_or_inferred")
+    generator_config = dict(
+        _mapping_or_empty(sequence.get("generator_config") or catalog_entry.get("generator_config"))
+    )
+    source_prompt = str(sequence.get("source_prompt") or catalog_entry.get("source_prompt") or "")
+    generation_seed = sequence.get("generation_seed", catalog_entry.get("generation_seed"))
+    manifest_path = _str_or_none(sequence.get("manifest_path") or catalog_entry.get("default_manifest_path"))
+    ply_frame_dir = _str_or_none(sequence.get("ply_frame_dir") or catalog_entry.get("default_ply_frame_dir"))
+    smplx_frame_dir = _str_or_none(
+        sequence.get("smplx_frame_dir") or catalog_entry.get("default_smplx_frame_dir")
+    )
+    pre_generated = bool(sequence.get("pre_generated", catalog_entry.get("pre_generated", True)))
+    requires_generation = _action_requires_generation(
+        source=source,
+        pre_generated=pre_generated,
+        ply_frame_dir=ply_frame_dir,
+        manifest_path=manifest_path,
+    )
     return {
         "start_time_s": start_time_s,
         "end_time_s": end_time_s,
@@ -701,19 +719,35 @@ def _action_segment_record(
         "render_action_id": action_id,
         "action_label": str(sequence.get("action_label") or catalog_entry.get("display_name") or action_id),
         "asset": {
-            "manifest_path": _str_or_none(sequence.get("manifest_path") or catalog_entry.get("default_manifest_path")),
-            "ply_frame_dir": _str_or_none(sequence.get("ply_frame_dir") or catalog_entry.get("default_ply_frame_dir")),
-            "smplx_frame_dir": _str_or_none(
-                sequence.get("smplx_frame_dir") or catalog_entry.get("default_smplx_frame_dir")
-            ),
-            "source": str(sequence.get("source") or catalog_entry.get("source") or "catalog_or_inferred"),
-            "pre_generated": bool(sequence.get("pre_generated", catalog_entry.get("pre_generated", True))),
+            "manifest_path": manifest_path,
+            "ply_frame_dir": ply_frame_dir,
+            "smplx_frame_dir": smplx_frame_dir,
+            "source": source,
+            "pre_generated": pre_generated,
+            "requires_generation": requires_generation,
             "loop": bool(sequence.get("loop", catalog_entry.get("loop", True))),
             "root_motion_mode": str(
                 sequence.get("root_motion_mode")
                 or catalog_entry.get("root_motion_mode")
                 or ("follow_map_path" if action_id == "walk" else "stationary")
             ),
+            "fps": _optional_float(sequence.get("fps", catalog_entry.get("fps"))),
+            "frame_count": _optional_int(sequence.get("frame_count", catalog_entry.get("frame_count"))),
+            "duration_s": _optional_float(sequence.get("duration", catalog_entry.get("duration"))),
+        },
+        "generation_request": {
+            "enabled": requires_generation,
+            "generator": _action_generator_name(source),
+            "instruction": source_prompt or str(sequence.get("action_label") or action_id),
+            "input_style": _generation_input_style(generator_config),
+            "keypoints": _action_keypoints(sequence, catalog_entry, generator_config),
+            "seed": _optional_int(generation_seed),
+            "generator_config": generator_config,
+            "output_contract": {
+                "manifest_path": manifest_path,
+                "ply_frame_dir": ply_frame_dir,
+                "smplx_frame_dir": smplx_frame_dir,
+            },
         },
         "metadata": {
             "human_id": human_id,
@@ -721,6 +755,60 @@ def _action_segment_record(
             "catalog_action_found": bool(catalog_entry),
         },
     }
+
+
+def _action_requires_generation(
+    *,
+    source: str,
+    pre_generated: bool,
+    ply_frame_dir: str | None,
+    manifest_path: str | None,
+) -> bool:
+    source_norm = source.strip().lower()
+    if source_norm in {"kimodo", "stmc", "generated_on_the_fly", "motion_generator"}:
+        return True
+    return not pre_generated or (ply_frame_dir is None and manifest_path is None)
+
+
+def _action_generator_name(source: str) -> str | None:
+    source_norm = source.strip().lower()
+    if source_norm in {"kimodo", "stmc"}:
+        return source_norm
+    if source_norm in {"generated_on_the_fly", "motion_generator"}:
+        return source_norm
+    return None
+
+
+def _generation_input_style(generator_config: Mapping[str, Any]) -> str:
+    keypoints = _action_keypoints({}, {}, generator_config)
+    if keypoints is not None:
+        return "text_with_keypoints"
+    return "text"
+
+
+def _action_keypoints(
+    sequence: Mapping[str, Any],
+    catalog_entry: Mapping[str, Any],
+    generator_config: Mapping[str, Any],
+) -> Any:
+    for payload in (sequence, catalog_entry, generator_config):
+        for key in (
+            "keypoints",
+            "keypoint_constraints",
+            "motion_keypoints",
+            "pose_keypoints",
+            "waypoints",
+        ):
+            value = payload.get(key)
+            if value:
+                return value
+    return None
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
 
 
 def _action_id_for_segment(
@@ -775,14 +863,14 @@ def _infer_human_action_id_from_labels(
     token_set = set(tokens)
     if "walk" in token_set or "walking" in token_set or "moving" in token_set:
         return "walk"
-    if "queue" in role_and_tags or "queue" in token_set or "queueing" in token_set:
-        return "queue_wait"
     if token_set.intersection({"receive", "receive_item"}):
         return "receive_item"
     if token_set.intersection({"talk", "talking", "gesture", "gesturing", "guidance", "informant", "wave", "waving"}):
         return "wave"
     if token_set.intersection({"yield", "yield_stop"}):
         return "yield_stop"
+    if "queue" in role_and_tags or "queue" in token_set or "queueing" in token_set:
+        return "queue_wait"
     if token_set.intersection({"idle", "stand", "standing", "stopped", "waiting", "wait"}):
         return "stand"
     return "stand"
@@ -980,7 +1068,12 @@ def _manifest_warnings(
                 warnings.append(
                     f"{scenario_id}: human {human['actor_id']} action {action_id!r} is not in the action catalog"
                 )
-            if not asset.get("ply_frame_dir"):
+            if asset.get("requires_generation"):
+                warnings.append(
+                    f"{scenario_id}: human {human['actor_id']} action {action_id!r} "
+                    "requires action generation before rendering"
+                )
+            elif not asset.get("ply_frame_dir"):
                 warnings.append(
                     f"{scenario_id}: human {human['actor_id']} action {action_id!r} has no ply_frame_dir"
                 )

@@ -212,3 +212,68 @@ def test_explicit_training_robot_ids_control_viewpoints() -> None:
         "robot_alpha",
         "robot_gamma",
     ]
+
+
+def test_generated_kimodo_action_preserves_text_and_keypoints() -> None:
+    human = _human("human_informant", role="informant", tags=["guidance_source"])
+    human["action_sequences"] = [
+        {
+            "sequence_id": "seq_guidance_kimodo",
+            "action_label": "gesture",
+            "source": "kimodo",
+            "source_prompt": "stand still, raise the right hand, then point toward the corridor",
+            "pre_generated": False,
+            "generation_seed": 1234,
+            "generator_config": {
+                "duration_s": 2.5,
+                "keypoints": [
+                    {"t": 0.0, "body": "neutral_stand"},
+                    {"t": 1.0, "right_hand": [0.35, 0.0, 1.45]},
+                    {"t": 2.0, "right_hand": [0.65, 0.4, 1.35]},
+                ],
+            },
+        }
+    ]
+    human["behavior_timeline"][0]["action_sequence_id"] = "seq_guidance_kimodo"
+
+    manifest = scenario_to_render_manifest(
+        _scenario("human_guided_uncertain_region", humans=[human]),
+        action_catalog=_action_catalog(),
+    )
+
+    segment = manifest["actors"]["humans"][0]["action_segments"][0]
+    assert segment["render_action_id"] == "wave"
+    assert segment["asset"]["requires_generation"]
+    assert segment["generation_request"]["enabled"]
+    assert segment["generation_request"]["generator"] == "kimodo"
+    assert segment["generation_request"]["input_style"] == "text_with_keypoints"
+    assert segment["generation_request"]["seed"] == 1234
+    assert segment["generation_request"]["keypoints"][1]["right_hand"] == [0.35, 0.0, 1.45]
+    assert any("requires action generation before rendering" in warning for warning in manifest["warnings"])
+
+
+def test_generated_stmc_action_can_be_text_only() -> None:
+    human = _human("human_service", role="queue_participant", tags=["queue_participant"])
+    human["action_sequences"] = [
+        {
+            "sequence_id": "seq_service_stmc",
+            "action_label": "receive item",
+            "source": "stmc",
+            "source_prompt": "wait in line, step forward, and accept a small item",
+            "pre_generated": False,
+            "generator_config": {"duration_s": 4.0},
+        }
+    ]
+    human["behavior_timeline"][0]["action_sequence_id"] = "seq_service_stmc"
+
+    manifest = scenario_to_render_manifest(
+        _scenario("serve_queue", humans=[human]),
+        action_catalog=_action_catalog(),
+    )
+
+    segment = manifest["actors"]["humans"][0]["action_segments"][0]
+    assert segment["render_action_id"] == "receive_item"
+    assert segment["asset"]["requires_generation"]
+    assert segment["generation_request"]["generator"] == "stmc"
+    assert segment["generation_request"]["input_style"] == "text"
+    assert segment["generation_request"]["instruction"] == "wait in line, step forward, and accept a small item"
