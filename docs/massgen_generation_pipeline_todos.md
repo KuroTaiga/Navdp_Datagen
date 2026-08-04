@@ -48,9 +48,9 @@ builders and scenario examples.
 
 ### 1. Scenario Render Contract
 
-- [ ] Define a portable scenario-to-render manifest generated from Pathplanner
+- [x] Define a portable scenario-to-render manifest generated from Pathplanner
   scenario JSONs.
-- [ ] Normalize actor records into:
+- [x] Normalize actor records into:
   - actor id;
   - actor kind: `human` or `robot`;
   - asset reference;
@@ -58,24 +58,30 @@ builders and scenario examples.
   - per-frame or time-sampled world pose;
   - visibility radius/height;
   - mission/event bindings.
-- [ ] Normalize robot viewpoint records into one render job per robot.
-- [ ] Preserve source scenario id, mission id, robot id, and frame timestamps in
+- [x] Normalize robot viewpoint records into one render job per robot.
+- [x] Preserve source scenario id, mission id, robot id, and frame timestamps in
   camera/action metadata.
+
+Implemented in:
+
+- `utils/massgen_render_manifest.py`
+- `scripts/export_massgen_render_manifest.py`
+- `docs/massgen_render_manifest_contract.md`
 
 ### 2. Dynamic Human Actions
 
-- [ ] Map Pathplanner human `behavior_timeline` actions to available Gaussian
+- [x] Map Pathplanner human `behavior_timeline` actions to available Gaussian
   PLY action sequences.
-- [ ] Add an action catalog lookup layer for sit, stand, walk, wait, queue,
+- [x] Add an action catalog lookup layer for sit, stand, walk, wait, queue,
   gesture, guidance, and service interactions.
-- [ ] Allow one human to switch action sequences over time.
-- [ ] Keep action-time sampling deterministic from scenario seed and actor id.
+- [x] Allow one human to switch action sequences over time.
+- [x] Keep action-time sampling deterministic from scenario seed and actor id.
 - [ ] Validate missing action assets fail clearly before GPU rendering starts.
 
 ### 3. Multi-Robot Rendering
 
-- [ ] Generate one FPV/follow render job per active robot trajectory.
-- [ ] Export peer-robot pose tracks for every viewpoint stream.
+- [x] Generate one FPV/follow render job per active robot trajectory.
+- [x] Export peer-robot pose tracks for every viewpoint stream.
 - [ ] Reuse the existing GLB robot compositor for peer robots.
 - [ ] Add multi-robot overlay support instead of one `--poses-json` per run.
 - [ ] Depth-compose peer robots against saved GS depth maps when available.
@@ -90,6 +96,8 @@ Started in this branch:
 - [x] Added `--actor-visibility-culling` to `render_label_paths_telesim.py` for
   the existing single Gaussian actor path.
 - [x] Added local non-CUDA tests for the visibility math.
+- [x] Render manifests now enable human and peer-robot visibility culling by
+  default for generated jobs.
 
 Remaining:
 
@@ -120,7 +128,11 @@ Local macOS:
 
 - [x] `python3 -m py_compile __init__.py render_label_paths_telesim.py utils/actor_visibility.py tests/test_actor_visibility.py`
 - [x] `/Users/dongjk/miniconda3/bin/python3.13 -m pytest tests/test_actor_visibility.py`
-- [ ] Scenario-manifest conversion tests with tiny fixture JSONs.
+- [x] `python3 -m py_compile utils/massgen_render_manifest.py scripts/export_massgen_render_manifest.py tests/test_massgen_render_manifest.py`
+- [x] `/Users/dongjk/miniconda3/bin/python3.13 -m pytest tests/test_massgen_render_manifest.py tests/test_actor_visibility.py`
+- [x] Scenario-manifest conversion tests with tiny fixture JSONs.
+- [x] CLI smoke conversion against Pathplanner
+  `minimal_passing_mission_stream.json`.
 
 Server/platform:
 
@@ -133,6 +145,6 @@ Server/platform:
 
 ## Next Implementation Step
 
-Build the scenario-to-render manifest converter. It should live outside the hot
-render loop and produce explicit render jobs so GPU workers do not need to parse
-full Pathplanner scenarios repeatedly.
+Build the manifest-driven render executor. It should materialize each job into
+camera frames, compose visible human Gaussian PLY action segments, render/cull
+peer GLB robots, and launch with `GAUSSIAN_RENDER_BACKEND=gsplat` on the server.
