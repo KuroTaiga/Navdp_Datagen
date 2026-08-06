@@ -53,6 +53,10 @@ update calls for it:
   Matplotlib cache output.
 - Removed the tracked private `scripts/.env` host config from Git, kept it
   ignored for local use, and added a sanitized `scripts/slave_finder.example.env`.
+- Extracted duplicated storage/runtime supervision from the legacy FPV and
+  follow launchers into `scripts/render/launchers/legacy_storage_runner.sh`.
+- Made `scripts/storage/storage_targets.sh` avoid Bash 4-only lowercase and
+  nameref syntax so the root launchers run under macOS Bash 3.2.
 
 ## Target Layout
 

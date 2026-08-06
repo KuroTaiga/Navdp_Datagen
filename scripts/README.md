@@ -15,6 +15,7 @@ to active renderers and compatibility launchers.
 - `render/`: render-specific utilities outside the primary root renderers.
 - `render/assets/`: robot/asset conversion and GLB overlay tools.
 - `render/compare/`: render comparison utilities.
+- `render/launchers/`: shared shell helpers used by compatibility launchers.
 - `render/views/`: view/preview/verification renderers.
 - `smoke/`: small manual smoke tests and demo launchers.
 - `storage/`: storage, sync, archive, and cleanup helpers.

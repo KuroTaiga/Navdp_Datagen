@@ -27,10 +27,24 @@ storage_bool_true() {
   if [ -z "$val" ]; then
     return 1
   fi
-  case "${val,,}" in
+  local normalized
+  normalized=$(printf '%s' "$val" | tr '[:upper:]' '[:lower:]')
+  case "$normalized" in
     1|true|yes|y|on) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+_storage_set_array_by_name() {
+  local dest_name="$1"
+  shift
+  eval "$dest_name=()"
+
+  local arg quoted
+  for arg in "$@"; do
+    quoted=$(printf '%q' "$arg")
+    eval "$dest_name+=( $quoted )"
+  done
 }
 
 _storage_join_cmd() {
@@ -47,7 +61,7 @@ _storage_join_cmd() {
 }
 
 storage_make_ssh_cmd() {
-  local -n _dest=$1
+  local dest_name="$1"
   local ssh_target="${REMOTE_SSH_TARGET:-}"
   if [ -z "$ssh_target" ]; then
     echo "[STORAGE] ERROR: REMOTE_SSH_TARGET is not set." >&2
@@ -63,7 +77,7 @@ storage_make_ssh_cmd() {
   else
     ssh_opts+=(-o StrictHostKeyChecking=no)
   fi
-  _dest=(ssh "${ssh_opts[@]}" "$ssh_target")
+  _storage_set_array_by_name "$dest_name" ssh "${ssh_opts[@]}" "$ssh_target"
 }
 
 # Sync a directory to a remote Linux PC via rsync over SSH.
