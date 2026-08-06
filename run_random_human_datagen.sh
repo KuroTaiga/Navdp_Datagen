@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/storage_targets.sh"
+source "${SCRIPT_DIR}/scripts/storage/storage_targets.sh"
 
 # Ensure we have a Python interpreter available (needed for path resolution helper below).
 
@@ -134,13 +134,13 @@ PARALLEL_REPORT_DIR=${PARALLEL_REPORT_DIR:-./parallel_render_report_CHINGMU_key1
 SCENES_DIR=${SCENES_DIR:-./data/CHINGMU_scenes_rescaled}
 TASKS_DIR=${TASKS_DIR:-./data/CHINGMU_75_rescaled_0800_42_iter1}
 OUTPUT_DIR=${OUTPUT_DIR:-./navdata/CHINGMU_0800_follow_flaw}
-OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/random_human_dataset_w_ban_33w_1}
+OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 PROGRESS_JSON=${PROGRESS_JSON:-./analysis/CHINGMU_0800_follow_1.json}
 STATUS_JSON=${STATUS_JSON:-./analysis/CHINGMU_0800_follow_status.json}
 PER_JOB_METRICS_DIR=${PER_JOB_METRICS_DIR:-./analysis/CHINGMU_0800_follow_metrics}
-REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/mnt/DATA/navdp_data_33w_1}}
-REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-lenovo@192.168.151.40}
+REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
+REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-}
 LOCAL_OUTPUT_BASENAME="$(basename "$OUTPUT_DIR")"
 REMOTE_TARGET_DIR="${REMOTE_STORAGE_ROOT%/}/${LOCAL_OUTPUT_BASENAME}"
 REMOTE_SYNC_INTERVAL_SECS=${REMOTE_SYNC_INTERVAL_SECS:-120}
@@ -519,7 +519,7 @@ generate_assignment_manifest() {
   TASKS_DIR="${TASKS_DIR}" \
   SEED="${SEED}" \
   EXCLUDE_DETAILED_LABELS="${exclude_detailed}" \
-  bash "${SCRIPT_DIR}/scripts/generate_assignment_manifest.sh"
+  bash "${SCRIPT_DIR}/scripts/actions/generate_assignment_manifest.sh"
 }
 
 if $RESUME_MODE; then
@@ -576,6 +576,10 @@ prepare_local_output_dir "$OUTPUT_DIR"
 # Connectivity sanity check so we fail early if the NAS is unreachable before any
 # heavy compute starts.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
+  if [ -z "$OFFLOAD_NAS_DIR" ]; then
+    echo "[CHECK] ERROR: ENABLE_NAS_STORAGE=true requires OFFLOAD_NAS_DIR." >&2
+    exit 1
+  fi
   NAS_TEST_DIR="${OFFLOAD_NAS_DIR}/__connectivity_check__"
   if mkdir -p "${NAS_TEST_DIR}" \
     && : > "${NAS_TEST_DIR}/.touch" \
@@ -616,6 +620,10 @@ fi
 # Rendering CLI snippets are composed here so storage flags can extend/override
 # behavior (NAS uploads, BEV toggles, etc.) without duplicating the Python call.
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
+  if [ -z "$OFFLOAD_NAS_DIR" ]; then
+    echo "[STORAGE] ERROR: ENABLE_NAS_STORAGE=true requires OFFLOAD_NAS_DIR." >&2
+    exit 1
+  fi
   render_extra_snippets+=("--offload-nas-dir ${OFFLOAD_NAS_DIR} --offload-min-free-gb ${OFFLOAD_MIN_FREE_GB}")
 fi
 

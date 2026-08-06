@@ -34,7 +34,7 @@ ACTIONS_DATASET_DIR=${ACTIONS_DATASET_DIR:-${OUTPUT_DIR}_actions}
 
 # FPV does NOT need an actor assignment manifest.
 cmd=(
-  "$PYTHON_BIN" "$SCRIPT_DIR/gen_path_dataset_telesim.py"
+  "$PYTHON_BIN" "$SCRIPT_DIR/scripts/datasets/gen_path_dataset_telesim.py"
   --scenes-dir "${SCENES_DIR}"
   --tasks-dir "${TASKS_DIR}"
   --camera-root "${CAMERA_DATASET_DIR}"

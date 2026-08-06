@@ -7,8 +7,8 @@ This repository generates navigation datasets (FPV and follow-camera) from 3D Ga
 - `parallel_render_paths.py`: sharded runner for parallel jobs.
 - `run_random_fpv_datagen.sh`: FPV dataset pipeline.
 - `run_random_human_datagen.sh`: follow-camera pipeline with actors.
-- `scripts/quick_pipeline_test.py`: small end-to-end test + resource report.
-- `scripts/render_glb_robot_overlay.py`: optional GLB robot foreground compositor for existing rendered frames.
+- `scripts/smoke/quick_pipeline_test.py`: small end-to-end test + resource report.
+- `scripts/render/assets/render_glb_robot_overlay.py`: optional GLB robot foreground compositor for existing rendered frames.
 - `navdp_datagen_pipeline.md`: pipeline overview and detailed usage.
 - `docs/scene_placement_orientation.md`: coordinate, floor-plane, yaw, and camera-basis reference for placing foreground objects.
 - `docs/`: design notes and scheduling plans.
@@ -50,11 +50,11 @@ python render_label_paths.py \
 
 Overlay a GLB robot on an existing GS render:
 ```bash
-python scripts/convert_urdf_visuals_to_glb.py \
+python scripts/render/assets/convert_urdf_visuals_to_glb.py \
   --urdf data/g1_description/g1_29dof_mode_16.urdf \
   --output assets/robots/g1_29dof_mode_16.glb
 
-python scripts/render_glb_robot_overlay.py \
+python scripts/render/assets/render_glb_robot_overlay.py \
   --camera-json data1/debug_render/0001_839920/100_camera.json \
   --frames-dir data1/debug_render/0001_839920/100 \
   --robot-glb assets/robots/g1_29dof_mode_16.glb \
@@ -68,7 +68,7 @@ Use `--compose-mode depth` when saved depth maps should occlude the GLB robot be
 
 Generate a 10-path G1 robot follow-camera example from the first `0001_*` scene:
 ```bash
-python scripts/run_g1_robot_follow_example.py \
+python scripts/smoke/run_g1_robot_follow_example.py \
   --tasks-dir data/interiorGS_0500_42 \
   --output-dir data2/g1_robot_follow_example \
   --path-count 10
@@ -76,7 +76,14 @@ python scripts/run_g1_robot_follow_example.py \
 
 Quick test (few labels + resource sampling):
 ```bash
-python scripts/quick_pipeline_test.py --scene 0001_839920 --label-count 3
+python scripts/smoke/quick_pipeline_test.py --scene 0001_839920 --label-count 3
+```
+
+Prepare a MassGen render run from config:
+```bash
+scripts/massgen/prepare_render_run.py \
+  --config-json configs/massgen/render_run_example.json \
+  --summary
 ```
 
 ## Backend Defaults and Flags

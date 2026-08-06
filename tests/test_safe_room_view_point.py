@@ -9,7 +9,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from safe_room_view_point import choose_safe_room_view_point
+from utils.safe_room_view_point import choose_safe_room_view_point
 
 
 ROOM_POLYGON = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]

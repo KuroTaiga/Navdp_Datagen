@@ -48,7 +48,7 @@ Key knobs: `--follow-distance` sets how far the camera trails the actor, `--acto
 ### Scaling to many scenes + actors
 1) Plan actor assignments (records seed + pairings):
 ```bash
-python random_actor_assignments.py \
+python scripts/actions/random_actor_assignments.py \
   --actor-root /path/to/actors_root \
   --tasks-dir data/task_outputs_10w_4 \
   --scenes-dir data/scenes \
@@ -72,8 +72,8 @@ Add `--metrics-json analysis/render_progress.json` to track progress, or `--resu
 - Per path: `*.mp4` video, frame folder with PNG + depth/camera JSON, optional `*_BEV.png`, and `*_follow_path.json` with camera/actor XY traces and spacing metadata.
 
 ## Quick checks and debugging
-- `python render_first_frame.py --scene 0001_839920 --overwrite --verbose` to sanity-check alignment without a full run.
-- `python post_datagen_analysis.py --renders-dir data/path_video_frames_10w_4 --tasks-dir data/task_outputs_10w_4 --output-dir analysis/render_eval` to verify coverage after a run.
+- `python scripts/render/views/render_first_frame.py --scene 0001_839920 --overwrite --verbose` to sanity-check alignment without a full run.
+- `python scripts/analysis/post_datagen_analysis.py --renders-dir data/path_video_frames_10w_4 --tasks-dir data/task_outputs_10w_4 --output-dir analysis/render_eval` to verify coverage after a run.
 - Storage knobs: `--offload-nas-dir` and `--gpu-only` in `render_label_paths.py` help manage disk and VRAM.
 
 For a deeper walkthrough of the full NavDP pipeline, see `navdp_datagen_pipeline.md`.

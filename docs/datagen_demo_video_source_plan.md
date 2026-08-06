@@ -45,7 +45,7 @@ This file lists the source clips needed to produce two storytelling videos:
 - Actor sequences: `data/SHHQ_gs/walking/` (or your actor root)
 - Render entrypoints:
   - `python render_label_paths.py ... --video --show-BEV`
-  - `python render_first_frame.py --overwrite --verbose` (for quick static previews)
+  - `python scripts/render/views/render_first_frame.py --overwrite --verbose` (for quick static previews)
 
 ## Editing Order (recommended)
 1. Build each video from short stage clips (H1->H7 and S1->S7).
@@ -54,4 +54,4 @@ This file lists the source clips needed to produce two storytelling videos:
 4. End each video with final integrated result shot.
 
 ## Optional: fast dataset mosaic opener
-Use `scripts/make_random_video_mosaic.py` to produce a short 16x10 random-grid opener from `./data2/0500_fpv` before the pipeline narrative starts.
+Use `scripts/media/make_random_video_mosaic.py` to produce a short 16x10 random-grid opener from `./data2/0500_fpv` before the pipeline narrative starts.

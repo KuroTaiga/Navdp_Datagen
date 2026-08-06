@@ -47,7 +47,7 @@ generate_assignment_manifest() {
   TASKS_DIR="${TASKS_DIR}" \
   SEED="${SEED}" \
   EXCLUDE_DETAILED_LABELS="${EXCLUDE_DETAILED_LABELS}" \
-  bash "${SCRIPT_DIR}/scripts/generate_assignment_manifest.sh"
+  bash "${SCRIPT_DIR}/scripts/actions/generate_assignment_manifest.sh"
 }
 
 if [ -n "${ASSIGNMENTS_OUT}" ] && [ ! -f "${ASSIGNMENTS_OUT}" ]; then
@@ -56,7 +56,7 @@ if [ -n "${ASSIGNMENTS_OUT}" ] && [ ! -f "${ASSIGNMENTS_OUT}" ]; then
 fi
 
 cmd=(
-  "$PYTHON_BIN" "$SCRIPT_DIR/gen_path_dataset_telesim.py"
+  "$PYTHON_BIN" "$SCRIPT_DIR/scripts/datasets/gen_path_dataset_telesim.py"
   --scenes-dir "${SCENES_DIR}"
   --tasks-dir "${TASKS_DIR}"
   --camera-root "${CAMERA_DATASET_DIR}"

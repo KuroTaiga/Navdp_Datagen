@@ -11,10 +11,18 @@ video output, and GPU scheduling.
 ## CLI
 
 ```bash
-python3 scripts/export_massgen_render_manifest.py \
+python3 scripts/massgen/export_massgen_render_manifest.py \
   --scenario-json /path/to/pathplanner_scenario.json \
   --action-catalog-json /path/to/action_codex.json \
   --output-json /path/to/render_manifest.json
+```
+
+For self-service runs with sensor selection and preflight, use:
+
+```bash
+scripts/massgen/prepare_render_run.py \
+  --config-json configs/massgen/render_run_example.json \
+  --summary
 ```
 
 Defaults:
@@ -87,6 +95,19 @@ The generated JSON has:
 - `warnings`: non-fatal conversion warnings for missing assets or unsupported
   families.
 
+Self-service run extension:
+
+- `sensor_rigs`: normalized robot-mounted sensor definitions imported from an
+  Isaac Sim/OpenUSD-compatible robot rig or an exported rig JSON, including
+  sensor names, robot-relative transforms, camera intrinsics, resolution,
+  clipping range, rate, and requested output modalities;
+- `jobs[*].sensors`: named sensor selections for each robot viewpoint, replacing
+  hard-coded FPV/follow camera constants while keeping a default FPV camera for
+  backwards compatibility;
+- fallback sensor profile names documented in
+  `docs/camera_sensor_defaults.md`, including `navdp_legacy_fpv`,
+  `g1_head_fpv_default`, and `openusd_camera_fallback`.
+
 ## Mission Family Mapping
 
 | Family | Viewpoint Jobs | Human Action Handling | Peer Robots |
@@ -118,3 +139,7 @@ Schema-only Pathplanner families are converted with warnings only:
   needs a manifest-driven executor.
 - Human action switching is represented as multiple `action_segments`; the hot
   render path still needs multi-human, multi-action composition.
+- Sensor settings are still script defaults today. The manifest needs a
+  normalized sensor-rig import path before users can render with arbitrary
+  Isaac Sim/OpenUSD robot sensor setups. Until then, default and comparison
+  profiles are documented in `docs/camera_sensor_defaults.md`.

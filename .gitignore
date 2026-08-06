@@ -1,5 +1,10 @@
 out/
+.pytest_cache/
+.matplotlib-cache/
+__pycache__/
 *.pyc
+*.npy
+*.ipynb
 .vscode
 output
 build

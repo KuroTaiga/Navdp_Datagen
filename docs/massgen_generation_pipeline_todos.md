@@ -1,6 +1,6 @@
 # MassGen Generation Pipeline TODOs
 
-Date: 2026-08-04
+Date: 2026-08-05
 Branch: `massgen`
 
 This document tracks the implementation work for turning Pathplanner MassGen
@@ -20,6 +20,11 @@ The renderer must support:
 - other robots visible from each robot camera;
 - actor visibility culling so off-camera human PLYs are not merged into the
   Gaussian scene;
+- a self-service workflow where a user can choose a mission family, scene,
+  robot/sensor rig, output root, and GPU allocation without editing renderer
+  internals;
+- import of robot sensor settings from an Isaac Sim/OpenUSD-compatible rig
+  description instead of hard-coded per-script camera constants;
 - multi-GPU server scheduling.
 
 ## Mission Family Rendering Needs
@@ -44,6 +49,50 @@ Schema-only Pathplanner mission types not active in MassGen yet:
 Do not add renderer assumptions for these until Pathplanner adds active
 builders and scenario examples.
 
+## Mission Family Rollout Order
+
+Update and validate one mission family at a time. Start with the families that
+only require one robot and stationary or near-stationary humans, then add
+single-robot moving-human cases, and only then add multi-robot viewpoints and
+peer-robot rendering.
+
+### Easy: One Robot, Stationary or Near-Stationary Humans
+
+- `deliver_to_human`
+- `serve_queue`
+- `human_guided_uncertain_region`
+- `navigate_with_social_constraints:personal_space`
+- `navigate_with_social_constraints:queue_order`
+- `navigate_with_social_constraints:group_integrity`
+
+### Medium: One Robot, Moving Humans
+
+- `navigate_with_social_constraints:pedestrian_yield`
+- `dense_dynamic_humans`
+- `dense_dynamic_avoidance` when configured as one robot plus moving humans
+
+### Hard: Multiple Robots and Multiple Viewpoints
+
+- `dense_multi_robot`
+- `dense_dynamic_combined`
+- `mission_stream`
+- `dense_dynamic_avoidance` when configured with active peer robots
+
+Suggested implementation order:
+
+1. `deliver_to_human`
+2. `serve_queue`
+3. `human_guided_uncertain_region`
+4. `navigate_with_social_constraints:personal_space`
+5. `navigate_with_social_constraints:queue_order`
+6. `navigate_with_social_constraints:group_integrity`
+7. `navigate_with_social_constraints:pedestrian_yield`
+8. `dense_dynamic_humans`
+9. `dense_dynamic_avoidance`
+10. `dense_multi_robot`
+11. `dense_dynamic_combined`
+12. `mission_stream`
+
 ## Workstreams
 
 ### 1. Scenario Render Contract
@@ -65,7 +114,7 @@ builders and scenario examples.
 Implemented in:
 
 - `utils/massgen_render_manifest.py`
-- `scripts/export_massgen_render_manifest.py`
+- `scripts/massgen/export_massgen_render_manifest.py`
 - `docs/massgen_render_manifest_contract.md`
 
 ### 2. Dynamic Human Actions
@@ -124,13 +173,76 @@ Remaining:
 - [ ] Add a platform smoke command for one scene, one mission family, and all
   robots.
 
-### 6. Validation
+### 6. Self-Service Render Pipeline
+
+- [x] Start branch-level script cleanup tracking in
+  `docs/script_cleanup_refactor_plan.md`.
+- [x] Remove the first one-off local transfer/debug scripts and convert the
+  mask-generation wrapper defaults from fixed `/mnt` paths to configurable
+  repo-local `out/` paths.
+- [x] Organize helper scripts into domain folders under `scripts/` and document
+  the expected layout in `scripts/README.md`.
+- [x] Provide one documented command that converts Pathplanner scenarios to a
+  render manifest and preflights assets/sensors before rendering.
+- [x] Add an initial user-facing config file for common run settings:
+  - scenario JSON;
+  - scene Gaussian assets;
+  - action catalog;
+  - robot/sensor rig file;
+  - output root;
+  - GPU selection and worker count.
+- [ ] Extend the run config to generate/select scenarios by mission family or
+  social-navigation subfamily, generated scenario root, and resume/overwrite
+  policy.
+- [x] Add `--dry-run` / `--preflight-only` mode that validates configured
+  assets, action clips, robot assets, sensor rigs, writable outputs, and CUDA
+  device selections before reserving a GPU.
+- [x] Emit a compact run summary with manifest path, selected families,
+  selected sensors, frame counts, output directories, and failure reasons.
+- [ ] Extend the run summary with command line and git commit.
+- [ ] Add copy-pasteable smoke commands for:
+  - one easy single-robot family;
+  - one moving-human family;
+  - one multi-robot family with all robot viewpoints.
+- [ ] Keep family-specific behavior in manifest adapters/executors rather than
+  requiring users to edit shell scripts for each mission family.
+
+### 7. Isaac Sim/OpenUSD Sensor Rig Import
+
+- [x] Document fallback camera/sensor profiles and the comparison between
+  OpenUSD/Isaac Sim defaults, G1 assumptions, and previous NavDP settings in
+  `docs/camera_sensor_defaults.md`.
+- [x] Define a renderer-neutral sensor rig schema that can be populated from an
+  Isaac Sim/OpenUSD robot setup.
+- [x] Add a JSON importer for exported Isaac Sim/OpenUSD-style robot rigs that
+  extracts:
+  - robot root prim and base frame;
+  - camera/sensor prim paths attached to the robot;
+  - sensor transforms relative to the robot/base frame;
+  - camera intrinsics such as focal length, aperture/FOV, resolution, clipping
+    range, and distortion model when available;
+  - sensor rates and enabled/disabled state;
+  - output modalities such as RGB, depth, segmentation, optical flow, or custom
+    sensor streams when supported by the renderer.
+- [x] Store normalized sensor rigs in the MassGen render manifest so jobs are
+  generated from named sensors rather than hard-coded FPV/follow camera values.
+- [x] Support named fallback profiles from `docs/camera_sensor_defaults.md`,
+  including `navdp_legacy_fpv`, `g1_head_fpv_default`, and
+  `openusd_camera_fallback`.
+- [x] Support selecting one or more named sensors per render run, with a default
+  robot FPV camera for backwards compatibility.
+- [x] Validate imported sensor settings against renderer capabilities and fail
+  clearly for unsupported sensor types or missing camera intrinsics.
+- [x] Add fixture tests for a minimal Isaac Sim/OpenUSD-style robot rig with RGB
+  and depth modalities.
+
+### 8. Validation
 
 Local macOS:
 
 - [x] `python3 -m py_compile __init__.py render_label_paths_telesim.py utils/actor_visibility.py tests/test_actor_visibility.py`
 - [x] `/Users/dongjk/miniconda3/bin/python3.13 -m pytest tests/test_actor_visibility.py`
-- [x] `python3 -m py_compile utils/massgen_render_manifest.py scripts/export_massgen_render_manifest.py tests/test_massgen_render_manifest.py`
+- [x] `python3 -m py_compile utils/massgen_render_manifest.py scripts/massgen/export_massgen_render_manifest.py tests/test_massgen_render_manifest.py`
 - [x] `/Users/dongjk/miniconda3/bin/python3.13 -m pytest tests/test_massgen_render_manifest.py tests/test_actor_visibility.py`
 - [x] Scenario-manifest conversion tests with tiny fixture JSONs.
 - [x] CLI smoke conversion against Pathplanner

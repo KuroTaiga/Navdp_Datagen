@@ -74,7 +74,7 @@ generate_assignment_manifest() {
   TASKS_DIR="${TASKS_DIR}" \
   SEED="${SEED}" \
   EXCLUDE_DETAILED_LABELS="${EXCLUDE_DETAILED_LABELS}" \
-  bash "${SCRIPT_DIR}/scripts/generate_assignment_manifest.sh"
+  bash "${SCRIPT_DIR}/scripts/actions/generate_assignment_manifest.sh"
 }
 
 if [ -n "${ASSIGNMENTS_OUT}" ] && [ ! -f "${ASSIGNMENTS_OUT}" ]; then

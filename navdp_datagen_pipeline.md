@@ -5,7 +5,7 @@ This document explains the end-to-end flow in `navdp_datagen`: how we take navig
 ## Inputs and Layout
 - **Scenes**: `data/scenes/<scene>/` with occupancy metadata (`occupancy.json/png`) and splat PLYs.
 - **Paths**: label-path JSONs under `data/selected_*` or `data/task_outputs_*` (e.g., `data/task_outputs_10w_4/<scene>/label_paths/*.json`). Each contains `raster_world`, `start/goal`, and instructions from the upstream path-generation repo.
-- **Actors**: Animated human PLY frame sequences. Collected under a root (e.g., `/media/.../actors/<actor_id>/*.ply`).
+- **Actors**: Animated human PLY frame sequences. Collected under a configured actor root such as `data/SHHQ_gs/walking/<actor_id>/*.ply`.
 - **Render outputs**: By default, `data/path_video_frames_10w_4/<scene>/...` (RGB/depth frames, MP4, BEV, follow-path metadata).
 - **Optional NPCs**: NPC placement/BEV debug via `render_label_paths.py` flags (e.g., `--npc-bev-debug`, `--npc-density-coverage 0.2 --npc-count 8 --npc-density-mode angular --npc-free-threshold 250 --npc-auto-clearance`). Can be applied to FPV or following data; BEV-only planning uses `--npc-bev-debug-only`.
 
@@ -19,11 +19,11 @@ This document explains the end-to-end flow in `navdp_datagen`: how we take navig
 ## 1) Pre-run Analysis (paths only)
 - **Overlap/coverage between datasets**:  
   ```bash
-  python analyze_selected_paths.py --data-dir data --datasets selected_33w selected_65k --show-scenes
+  python scripts/analysis/analyze_selected_paths.py --data-dir data --datasets selected_33w selected_65k --show-scenes
   ```
 - **Dataset-level stats** (lengths, keypoints, frames estimate):  
   ```bash
-  python datagen_analysis.py --tasks-dir data/selected_33w --output-dir analysis/datagen
+  python scripts/analysis/datagen_analysis.py --tasks-dir data/selected_33w --output-dir analysis/datagen
   ```
 These operate on the existing path JSONs; no rendering is done yet.
 
@@ -31,7 +31,7 @@ These operate on the existing path JSONs; no rendering is done yet.
 ### Random human assignment (diverse actors)
 Produces `data/actor_assignment_plan.json` mapping each path to an actor:
 ```bash
-python random_actor_assignments.py \
+python scripts/actions/random_actor_assignments.py \
   --actor-root /path/to/actors_root \
   --tasks-dir data/task_outputs_10w_4 \
   --scenes-dir data/scenes \
@@ -92,14 +92,14 @@ Wrapper: `run_datagen.sh` sets storage toggles (local/NAS/remote), clears output
 
 ## 4) First-Frame Renderer (quick preview)
 ```bash
-python render_first_frame.py --overwrite --verbose
+python scripts/render/views/render_first_frame.py --overwrite --verbose
 ```
 Takes `raster_world` from each JSON, builds a forward-looking camera at the first segment, and renders a single PNG (defaults to 256×256). Useful to sanity-check paths/PLY alignment without full videos.
 
 ## 5) Post-run Analysis (renders)
 Evaluate what was actually rendered and compare to the task list:
 ```bash
-python post_datagen_analysis.py \
+python scripts/analysis/post_datagen_analysis.py \
   --renders-dir data/path_video_frames_10w_4 \
   --tasks-dir data/task_outputs_10w_4 \
   --output-dir analysis/render_eval
@@ -110,21 +110,21 @@ Outputs:
 - Per-path metadata summary (frame counts, video presence/sizes, depth/RGB frame counts).
 
 ## Key Functions/Behaviors to Know
-- `random_actor_assignments.py`: discovers actors, computes foot offsets, randomizes assignments, writes manifest (seed recorded).
+- `scripts/actions/random_actor_assignments.py`: discovers actors, computes foot offsets, randomizes assignments, writes manifest (seed recorded).
 - `parallel_render_paths.py`: shards work by scene+actor, launches renderer jobs, tracks runtime/VRAM metrics, writes a progress JSON.
 - `render_label_paths.py`: core renderer. Prepares path geometry (`prepare_path_data`), samples camera positions (`PathSampler`), smooths forward vectors (`forward_direction`/`forward_direction_beta`), builds cameras (`build_perspective_camera`), and renders with `render_or`. Writes RGB, depth, BEV, and per-path metadata.
-- `render_first_frame.py`: renders only the first camera position; uses a fixed PLY and simple camera builder.
-- `datagen_analysis.py`: path-only stats (lengths, keypoints, estimated frames) before rendering.
-- `post_datagen_analysis.py`: render-level stats/coverage after rendering.
+- `scripts/render/views/render_first_frame.py`: renders only the first camera position; uses a fixed PLY and simple camera builder.
+- `scripts/analysis/datagen_analysis.py`: path-only stats (lengths, keypoints, estimated frames) before rendering.
+- `scripts/analysis/post_datagen_analysis.py`: render-level stats/coverage after rendering.
 
 ## Typical Pipelines
 - **Standard (random humans, full videos)**:  
-  `random_actor_assignments.py` → `parallel_render_paths.py` (or `run_datagen.sh`) → `post_datagen_analysis.py`
+  `scripts/actions/random_actor_assignments.py` -> `parallel_render_paths.py` (or `run_datagen.sh`) -> `scripts/analysis/post_datagen_analysis.py`
 - **Fixed/present human everywhere**:  
   Skip the random planner; call `render_label_paths.py` with `--actor-seq-dir` (and filters for scene/labels). Optionally still run `post_datagen_analysis.py`.
 - **Quick previews**:  
-  `render_first_frame.py` to spot-check paths/PLY alignment without full renders.
+  `scripts/render/views/render_first_frame.py` to spot-check paths/PLY alignment without full renders.
 - **Pre-flight coverage check**:  
-  `datagen_analysis.py` (and optionally `analyze_selected_paths.py`) to understand path distribution and overlap before burning GPU time.
+  `scripts/analysis/datagen_analysis.py` (and optionally `scripts/analysis/analyze_selected_paths.py`) to understand path distribution and overlap before burning GPU time.
 
 With these steps and scripts, you can plan actors, render first-person navigation videos (with or without a fixed human), and analyze both the input paths and the rendered outputs. Adjust parameters (follow distance, camera smoothing, GPU-only mode, offload dirs) to trade quality vs. throughput and storage.***

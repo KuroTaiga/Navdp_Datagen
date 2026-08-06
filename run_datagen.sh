@@ -2,11 +2,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/storage_targets.sh"
+source "${SCRIPT_DIR}/scripts/storage/storage_targets.sh"
 
 # ===== Storage toggles =====
 ENABLE_LOCAL_STORAGE=${ENABLE_LOCAL_STORAGE:-true}
-ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-true}
+ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE:-false}
 ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE:-false}
 CLEAR_LOCAL_OUTPUT_DIR=${CLEAR_LOCAL_OUTPUT_DIR:-true}
 
@@ -21,11 +21,11 @@ fi
 SCENE=${SCENE:-test_scene}
 CONDA_ENV=${CONDA_ENV:-cuda121}
 LOCAL_OUTPUT_DIR=${LOCAL_OUTPUT_DIR:-${SCRIPT_DIR}/data/path_video_frames_Jiankun_test}
-ACTOR_SEQ_DIR=${ACTOR_SEQ_DIR:-/media/dongjk/walk_45/}
+ACTOR_SEQ_DIR=${ACTOR_SEQ_DIR:-${SCRIPT_DIR}/data/SHHQ_gs/walking}
 VIDEO_BACKEND=${VIDEO_BACKEND:-gpu}
 VIDEO_NVENC_PRESET=${VIDEO_NVENC_PRESET:-}
 VIDEO_NVENC_BITRATE=${VIDEO_NVENC_BITRATE:-}
-OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-/mnt/nas/jiankundong/path_video_frames_Jiankun_test}
+OFFLOAD_NAS_DIR=${OFFLOAD_NAS_DIR:-}
 OFFLOAD_MIN_FREE_GB=${OFFLOAD_MIN_FREE_GB:-0.5}
 REMOTE_STORAGE_ROOT=${REMOTE_STORAGE_ROOT:-${REMOTE_OUTPUT_DIR:-/srv/navdp}}
 REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-user@other-training-pc}
@@ -37,6 +37,10 @@ echo "[CONFIG] ENABLE_NAS_STORAGE=${ENABLE_NAS_STORAGE}"
 echo "[CONFIG] ENABLE_REMOTE_STORAGE=${ENABLE_REMOTE_STORAGE}"
 
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
+  if [ -z "$OFFLOAD_NAS_DIR" ]; then
+    echo "[CHECK] ERROR: ENABLE_NAS_STORAGE=true requires OFFLOAD_NAS_DIR." >&2
+    exit 1
+  fi
   NAS_TEST_DIR="${OFFLOAD_NAS_DIR}/${SCENE}"
   if mkdir -p "${NAS_TEST_DIR}" \
     && : > "${NAS_TEST_DIR}/__touch_test__" \
@@ -88,6 +92,10 @@ if [ "${VIDEO_BACKEND}" = "gpu" ]; then
 fi
 
 if storage_bool_true "$ENABLE_NAS_STORAGE"; then
+  if [ -z "$OFFLOAD_NAS_DIR" ]; then
+    echo "[STORAGE] ERROR: ENABLE_NAS_STORAGE=true requires OFFLOAD_NAS_DIR." >&2
+    exit 1
+  fi
   BASE_ARGS+=(--offload-nas-dir "$OFFLOAD_NAS_DIR" --offload-min-free-gb "$OFFLOAD_MIN_FREE_GB")
 fi
 
