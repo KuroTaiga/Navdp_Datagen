@@ -1,0 +1,18 @@
+{
+  "actions": [
+    {
+      "action_id": "stand",
+      "default_manifest_path": "assets/human_actions/stand/manifest.json",
+      "default_ply_frame_dir": "assets/human_actions/stand/ply_frames",
+      "loop": true,
+      "root_motion_mode": "stationary"
+    },
+    {
+      "action_id": "walk",
+      "default_manifest_path": "assets/human_actions/walk/manifest.json",
+      "default_ply_frame_dir": "assets/human_actions/walk/ply_frames",
+      "loop": true,
+      "root_motion_mode": "follow_map_path"
+    }
+  ]
+}

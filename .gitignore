@@ -19,6 +19,7 @@ screenshots
 *.svg
 storage_remote_config.sh
 *.json
+!configs/**/*.json
 scripts/.env
 *.env
 data2

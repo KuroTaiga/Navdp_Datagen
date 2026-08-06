@@ -1,0 +1,16 @@
+{
+  "scenario_json": "configs/massgen/example_scenario.json",
+  "action_catalog_json": "configs/massgen/example_action_catalog.json",
+  "output_root": "out/massgen_runs/example",
+  "manifest_json": "out/massgen_runs/example/render_manifest.json",
+  "summary_json": "out/massgen_runs/example/run_summary.json",
+  "sensor_profile": "navdp_legacy_fpv",
+  "selected_sensors": ["fpv_rgb"],
+  "render_backend": "gsplat",
+  "fps": 10.0,
+  "default_robot_glb": "assets/robots/g1_29dof_mode_16.glb",
+  "gpu_devices": ["0"],
+  "workers": 1,
+  "strict_assets": false,
+  "visibility_culling": true
+}
