@@ -262,3 +262,7 @@ Server/platform:
 Build the manifest-driven render executor. It should materialize each job into
 camera frames, compose visible human Gaussian PLY action segments, render/cull
 peer GLB robots, and launch with `GAUSSIAN_RENDER_BACKEND=gsplat` on the server.
+
+Fresh-context handoff for that work:
+
+- `docs/per_mission_family_rendering_handoff.md`
