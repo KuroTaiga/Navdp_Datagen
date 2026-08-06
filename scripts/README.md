@@ -26,5 +26,7 @@ to active renderers and compatibility launchers.
   wrapper.
 - Avoid hard-coded local machine paths. Use CLI arguments or environment
   variables and fail clearly when required paths are missing.
+- Keep credentials and machine-local host configs in ignored files such as
+  `scripts/.env`; commit sanitized `*.example.*` files instead.
 - Keep root shell wrappers as compatibility shims only until a unified launcher
   replaces them.

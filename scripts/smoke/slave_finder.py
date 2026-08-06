@@ -4,15 +4,15 @@ Slave Finder
 =============
 Gradio dashboard that polls remote machines over SSH and summarizes their load.
 
-Hosts are read from a .env-style file with blocks such as:
+Hosts are read from a private .env-style file such as scripts/.env:
 
 Host worker-1
-  HostName 192.168.151.36
-  User dongjk
-  Password abc
+  HostName 192.0.2.10
+  User username
+  Password password
 
 Configuration:
-- SLAVE_FINDER_ENV: override path to the .env file (defaults to repo/.env).
+- SLAVE_FINDER_ENV: override path to the host config file (defaults to scripts/.env).
 - SLAVE_FINDER_REFRESH: auto-refresh interval in seconds (default: 10).
 - SLAVE_FINDER_SSH_TIMEOUT: SSH connection/command timeout in seconds (default: 6).
 - SLAVE_FINDER_HOST / SLAVE_FINDER_PORT: Gradio bind host/port (defaults: 0.0.0.0 / 7860).

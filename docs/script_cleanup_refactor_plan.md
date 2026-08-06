@@ -51,6 +51,8 @@ update calls for it:
   repo-local `out/` output paths instead of fixed `/mnt` paths.
 - Added ignore rules for Python/test caches, NumPy debug dumps, notebooks, and
   Matplotlib cache output.
+- Removed the tracked private `scripts/.env` host config from Git, kept it
+  ignored for local use, and added a sanitized `scripts/slave_finder.example.env`.
 
 ## Target Layout
 
