@@ -13,6 +13,15 @@ MESHS_ROOT="${SRC_ROOT%/}/meshes"
 DST_ROOT=${DST_ROOT:-${REPO_ROOT}/data/SHHQ_gs/walking}
 DRY_RUN=${DRY_RUN:-false}
 
+bool_true() {
+  local val
+  val=$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
+  case "$val" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 echo "[CONFIG] SRC_ROOT=${SRC_ROOT}"
 echo "[CONFIG] MESHS_ROOT=${MESHS_ROOT}"
 echo "[CONFIG] DST_ROOT=${DST_ROOT}"
@@ -28,11 +37,16 @@ collect_uids() {
   if [ "$#" -gt 0 ]; then
     printf '%s\n' "$@"
   else
-    find "$MESHS_ROOT" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9][0-9]*' -printf '%f\n' | sort
+    find "$MESHS_ROOT" -mindepth 1 -maxdepth 1 -type d -regex '.*/[0-9][0-9]*' \
+      | while IFS= read -r uid_dir; do basename "$uid_dir"; done \
+      | sort
   fi
 }
 
-mapfile -t UID_LIST < <(collect_uids "$@")
+UID_LIST=()
+while IFS= read -r uid; do
+  UID_LIST+=("$uid")
+done < <(collect_uids "$@")
 echo "[INFO] Found ${#UID_LIST[@]} UID folders to sync."
 
 sync_one_uid() {
@@ -52,7 +66,7 @@ sync_one_uid() {
 
   mkdir -p "$dst_dir"
   local rsync_args=(-ah --info=progress2)
-  if [[ "${DRY_RUN,,}" == "true" ]]; then
+  if bool_true "$DRY_RUN"; then
     rsync_args+=(--dry-run)
   fi
 

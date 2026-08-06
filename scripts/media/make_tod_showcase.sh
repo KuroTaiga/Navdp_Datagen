@@ -31,12 +31,15 @@ for preset in "${PRESETS[@]}"; do
     echo "[ERROR] Missing preset folder: ${preset_dir}" >&2
     exit 1
   fi
-  mapfile -t mp4s < <(find "$preset_dir" -type f -name "*.mp4" | sort)
+  mp4s=()
+  while IFS= read -r mp4; do
+    mp4s+=("$mp4")
+  done < <(find "$preset_dir" -type f -name "*.mp4" | sort)
   if [ "${#mp4s[@]}" -eq 0 ]; then
     echo "[ERROR] No MP4s found under ${preset_dir}" >&2
     exit 1
   fi
-  pick=$(printf "%s\n" "${mp4s[@]}" | shuf -n 1)
+  pick="${mp4s[$((RANDOM % ${#mp4s[@]}))]}"
   dst="${OUT_DIR}/${BASE_NAME}_${preset}.mp4"
   cp -f "$pick" "$dst"
   printf "%s\t%s\n" "$preset" "$pick" >>"$selection_log"

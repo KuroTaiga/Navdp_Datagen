@@ -57,6 +57,8 @@ update calls for it:
   follow launchers into `scripts/render/launchers/legacy_storage_runner.sh`.
 - Made `scripts/storage/storage_targets.sh` avoid Bash 4-only lowercase and
   nameref syntax so the root launchers run under macOS Bash 3.2.
+- Replaced remaining first-party `mapfile`, Bash lowercase expansion, and
+  GNU `find -printf` shell usage with more portable alternatives.
 
 ## Target Layout
 
