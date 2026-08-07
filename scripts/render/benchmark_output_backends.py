@@ -42,6 +42,7 @@ DEFAULT_MODES = "video_only,video_rgb,video_depth,rgb_only,depth_only"
 DEFAULT_BACKENDS = "nvenc,cpu,gpu"
 
 STAGE_ORDER = (
+    "actor_gpu_cache_upload_sec",
     "actor_visibility_sec",
     "actor_transform_sec",
     "actor_tensor_pack_sec",

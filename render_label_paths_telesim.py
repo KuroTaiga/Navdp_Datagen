@@ -13,6 +13,7 @@ import contextlib
 import json
 import logging
 import math
+import os
 import shutil
 import subprocess
 import sys
@@ -61,9 +62,12 @@ from utils.telesim_actor_utils import (  # type: ignore
     DEFAULT_ACTOR_PATTERN,
     DEFAULT_ACTOR_SPEED,
     DEFAULT_VIDEO_FPS,
+    GpuActorSequence,
+    build_gpu_actor_sequence,
     build_path_metadata,
     load_actor_sequence,
     actor_data_to_tensors,
+    transform_gpu_actor_frame,
 )
 from utils.actor_visibility import sphere_visible_in_camera, transformed_actor_sphere
 from utils.video_writer_utils import VideoWriterBackend, make_video_writer
@@ -80,6 +84,7 @@ STATUS_DONE = 1
 STATUS_RETRY = 2
 STATUS_SKIP = 3
 TELESIM_STAGE_KEYS = (
+    "actor_gpu_cache_upload_sec",
     "actor_visibility_sec",
     "actor_transform_sec",
     "actor_tensor_pack_sec",
@@ -190,6 +195,15 @@ def _is_cuda_oom_error(exc: Exception) -> bool:
         or "cublas_status_alloc_failed" in message
         or "cudnn_status_alloc_failed" in message
         or "out of memory" in message
+    )
+
+
+def _strict_gpu_backends_enabled() -> bool:
+    return str(os.getenv("STRICT_GPU_BACKENDS", "")).lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
     )
 
 
@@ -1172,6 +1186,9 @@ def render_label_with_actor(
     label_id: str,
     args: argparse.Namespace,
     actor_runtime: ActorRuntime,
+    gpu_actor_sequence: GpuActorSequence | None = None,
+    actor_gpu_error: str | None = None,
+    actor_gpu_cache_upload_sec: float = 0.0,
 ) -> dict:
     poses, actor_transforms, actor_indices = build_actor_follow_plans(
         prepared.path_xy,
@@ -1200,6 +1217,10 @@ def render_label_with_actor(
     frame_prefix = "frame"
 
     stage_seconds = _new_stage_seconds()
+    stage_seconds["actor_gpu_cache_upload_sec"] = max(
+        0.0,
+        float(actor_gpu_cache_upload_sec or 0.0),
+    )
     frames_rendered = 0
     fov_y_rad = math.radians(float(args.fov_deg))
 
@@ -1210,6 +1231,7 @@ def render_label_with_actor(
     actor_cull_enabled = bool(getattr(args, "actor_visibility_culling", False))
     actor_cull_margin_m = float(getattr(args, "actor_cull_margin_m", 0.0) or 0.0)
     actor_culled_frames = 0
+    actor_gpu_requested = bool(getattr(args, "actor_gpu_resident", False))
 
     light_config: LightFilterConfig | None = getattr(args, "light_config", None)
     cl_config: CameraLightConfig | None = getattr(args, "cl_config", None)
@@ -1260,21 +1282,29 @@ def render_label_with_actor(
                 if not actor_visible:
                     actor_culled_frames += 1
             if actor_visible:
-                sequence_frame = actor_runtime.sequence.frames[actor_idx]
-                # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
-                with _measure_stage(stage_seconds, "actor_transform_sec"):
-                    actor_data = apply_transform_to_frame(
-                        sequence_frame,
-                        actor_runtime.sequence,
-                        transform,
-                    )
-                with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
-                    actor_render = actor_data_to_tensors(
-                        actor_data,
-                        actor_runtime.sequence,
-                        device=base_gaussians.get_xyz.device,
-                        target_rest_dim=scene_rest_dim,
-                    )
+                if gpu_actor_sequence is not None:
+                    with _measure_stage(stage_seconds, "actor_transform_sec"):
+                        actor_render = transform_gpu_actor_frame(
+                            gpu_actor_sequence,
+                            actor_idx,
+                            transform,
+                        )
+                else:
+                    sequence_frame = actor_runtime.sequence.frames[actor_idx]
+                    # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
+                    with _measure_stage(stage_seconds, "actor_transform_sec"):
+                        actor_data = apply_transform_to_frame(
+                            sequence_frame,
+                            actor_runtime.sequence,
+                            transform,
+                        )
+                    with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
+                        actor_render = actor_data_to_tensors(
+                            actor_data,
+                            actor_runtime.sequence,
+                            device=base_gaussians.get_xyz.device,
+                            target_rest_dim=scene_rest_dim,
+                        )
                 with _measure_stage(stage_seconds, "actor_merge_update_sec"):
                     current_actor_size = int(actor_render.xyz.shape[0])
                     if combined_model is None or combined_actor_size != current_actor_size:
@@ -1424,6 +1454,17 @@ def render_label_with_actor(
         "duration_sec": duration,
         "stage_seconds": stage_payload,
         "actor_culled_frames": actor_culled_frames,
+        "actor_gpu_resident_requested": actor_gpu_requested,
+        "actor_gpu_resident": gpu_actor_sequence is not None,
+        "actor_gpu_cache_bytes": (
+            gpu_actor_sequence.bytes_allocated if gpu_actor_sequence is not None else 0
+        ),
+        "actor_gpu_sh_mode": (
+            gpu_actor_sequence.sh_mode
+            if gpu_actor_sequence is not None
+            else str(getattr(args, "actor_gpu_sh_mode", "copy"))
+        ),
+        "actor_gpu_error": actor_gpu_error,
     }
 
 
@@ -1584,6 +1625,27 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.25,
         help="Extra bounding-sphere margin for --actor-visibility-culling.",
+    )
+    parser.add_argument(
+        "--actor-gpu-resident",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Cache canonical actor frames on CUDA and transform actor xyz/rotation in torch. "
+            "Opt-in because SH-rest coefficients are copied instead of CPU-rotated."
+        ),
+    )
+    parser.add_argument(
+        "--actor-gpu-cache-mb",
+        type=float,
+        default=2048.0,
+        help="Maximum CUDA memory to use for the actor frame cache; <=0 disables the cap.",
+    )
+    parser.add_argument(
+        "--actor-gpu-sh-mode",
+        choices=["copy"],
+        default="copy",
+        help="SH-rest handling for --actor-gpu-resident. copy is fast but not exact SH rotation.",
     )
     parser.add_argument("--actor-no-loop", dest="actor_loop", action="store_false")
     parser.set_defaults(actor_loop=True)
@@ -1901,6 +1963,9 @@ def main() -> int:
     renderer = build_renderer(asset, args)
 
     actor_runtime: ActorRuntime | None = None
+    gpu_actor_sequence: GpuActorSequence | None = None
+    actor_gpu_error: str | None = None
+    actor_gpu_cache_upload_sec = 0.0
     if args.actor_seq_dir is not None:
         actor_options = ActorOptions(
             sequence_dir=args.actor_seq_dir,
@@ -1923,6 +1988,47 @@ def main() -> int:
         actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
         actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
 
+    if actor_runtime is not None and bool(getattr(args, "actor_gpu_resident", False)):
+        base_gaussians = renderer._gaussians  # pylint: disable=protected-access
+        base_device = base_gaussians.get_xyz.device
+        if base_device.type != "cuda":
+            actor_gpu_error = f"scene gaussians are on {base_device}, not CUDA"
+            LOGGER.warning("Actor GPU-resident cache disabled: %s", actor_gpu_error)
+        else:
+            cache_mb = float(getattr(args, "actor_gpu_cache_mb", 0.0) or 0.0)
+            memory_cap_mb = cache_mb if cache_mb > 0.0 else None
+            sh_mode = str(getattr(args, "actor_gpu_sh_mode", "copy"))
+            scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
+            start = time.perf_counter()
+            try:
+                gpu_actor_sequence = build_gpu_actor_sequence(
+                    actor_runtime.sequence,
+                    device=base_device,
+                    target_rest_dim=scene_rest_dim,
+                    memory_cap_mb=memory_cap_mb,
+                    sh_mode=sh_mode,
+                )
+                actor_gpu_cache_upload_sec = time.perf_counter() - start
+                LOGGER.info(
+                    "Actor GPU-resident cache enabled: frames=%d size=%s sh_mode=%s upload=%.3fs",
+                    gpu_actor_sequence.frame_count,
+                    _format_bytes(gpu_actor_sequence.bytes_allocated),
+                    gpu_actor_sequence.sh_mode,
+                    actor_gpu_cache_upload_sec,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                actor_gpu_cache_upload_sec = time.perf_counter() - start
+                actor_gpu_error = str(exc)
+                if _strict_gpu_backends_enabled():
+                    raise RuntimeError(
+                        f"Actor GPU-resident cache failed in strict mode: {actor_gpu_error}"
+                    ) from exc
+                LOGGER.warning(
+                    "Actor GPU-resident cache disabled: %s; falling back to exact CPU/PLY transform path.",
+                    actor_gpu_error,
+                )
+
+    actor_gpu_cache_metric_pending = actor_gpu_cache_upload_sec
     for path_file in pending_label_paths:
         label_id = path_file.stem
         if args.verbose:
@@ -1948,7 +2054,11 @@ def main() -> int:
                     label_id=label_id,
                     args=args,
                     actor_runtime=actor_runtime,
+                    gpu_actor_sequence=gpu_actor_sequence,
+                    actor_gpu_error=actor_gpu_error,
+                    actor_gpu_cache_upload_sec=actor_gpu_cache_metric_pending,
                 )
+                actor_gpu_cache_metric_pending = 0.0
             else:
                 path_metrics = render_label(
                     renderer=renderer,

@@ -120,6 +120,18 @@ class ActorRenderFrame:
     rotation: torch.Tensor
 
 
+@dataclass
+class GpuActorSequence:
+    frames: list[ActorRenderFrame]
+    bytes_allocated: int
+    target_rest_dim: int
+    sh_mode: str
+
+    @property
+    def frame_count(self) -> int:
+        return len(self.frames)
+
+
 def natural_sort_key(path: Path) -> list[object]:
     parts = _DIGIT_PATTERN.split(path.stem)
     key: list[object] = []
@@ -402,6 +414,197 @@ def actor_data_to_tensors(
         opacity=opacity.contiguous(),
         scaling=scaling.contiguous(),
         rotation=rotation.contiguous(),
+    )
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return int(tensor.numel() * tensor.element_size())
+
+
+def _actor_render_frame_bytes(frame: ActorRenderFrame) -> int:
+    return sum(
+        _tensor_bytes(tensor)
+        for tensor in (
+            frame.xyz,
+            frame.features_dc,
+            frame.features_rest,
+            frame.opacity,
+            frame.scaling,
+            frame.rotation,
+        )
+    )
+
+
+def build_gpu_actor_sequence(
+    sequence: ActorSequence,
+    *,
+    device: torch.device,
+    target_rest_dim: int | None = None,
+    memory_cap_mb: float | None = None,
+    sh_mode: str = "copy",
+) -> GpuActorSequence:
+    """Move canonical actor frames to GPU once for per-frame GPU transforms."""
+
+    if sh_mode not in ("copy",):
+        raise ValueError(f"Unsupported actor GPU SH mode: {sh_mode}")
+    frames: list[ActorRenderFrame] = []
+    bytes_allocated = 0
+    for sequence_frame in sequence.frames:
+        render_frame = actor_data_to_tensors(
+            sequence_frame.base_data,
+            sequence,
+            device=device,
+            target_rest_dim=target_rest_dim,
+        )
+        frames.append(render_frame)
+        bytes_allocated += _actor_render_frame_bytes(render_frame)
+        if memory_cap_mb is not None and memory_cap_mb > 0.0:
+            cap_bytes = int(float(memory_cap_mb) * 1024.0 * 1024.0)
+            if bytes_allocated > cap_bytes:
+                raise MemoryError(
+                    "Actor GPU sequence exceeds cache cap: "
+                    f"{bytes_allocated / (1024.0 * 1024.0):.1f} MiB > {memory_cap_mb:.1f} MiB"
+                )
+    expected_rest_dim = int(target_rest_dim) if target_rest_dim is not None else sequence.rest_dim
+    return GpuActorSequence(
+        frames=frames,
+        bytes_allocated=bytes_allocated,
+        target_rest_dim=expected_rest_dim,
+        sh_mode=sh_mode,
+    )
+
+
+def _normalize_torch(vec: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+    norm = torch.linalg.norm(vec, dim=-1, keepdim=True)
+    norm = torch.clamp(norm, min=eps)
+    return vec / norm
+
+
+def _quat_wxyz_to_matrix_torch(quat: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = quat.unbind(dim=-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    return torch.stack(
+        [
+            1 - 2 * (yy + zz), 2 * (xy - wz), 2 * (xz + wy),
+            2 * (xy + wz), 1 - 2 * (xx + zz), 2 * (yz - wx),
+            2 * (xz - wy), 2 * (yz + wx), 1 - 2 * (xx + yy),
+        ],
+        dim=-1,
+    ).reshape(quat.shape[:-1] + (3, 3))
+
+
+def _matrix_to_quat_wxyz_torch(matrix: torch.Tensor) -> torch.Tensor:
+    tr = matrix[..., 0, 0] + matrix[..., 1, 1] + matrix[..., 2, 2]
+    quat = torch.empty(matrix.shape[:-2] + (4,), device=matrix.device, dtype=matrix.dtype)
+    cond = tr > 0.0
+
+    if torch.any(cond):
+        m = matrix[cond]
+        root = torch.sqrt(tr[cond] + 1.0)
+        quat_cond = torch.zeros((m.shape[0], 4), device=matrix.device, dtype=matrix.dtype)
+        quat_cond[:, 0] = 0.5 * root
+        root = 0.5 / root
+        quat_cond[:, 1] = (m[:, 2, 1] - m[:, 1, 2]) * root
+        quat_cond[:, 2] = (m[:, 0, 2] - m[:, 2, 0]) * root
+        quat_cond[:, 3] = (m[:, 1, 0] - m[:, 0, 1]) * root
+        quat[cond] = quat_cond
+
+    if torch.any(~cond):
+        m = matrix[~cond]
+        diag = torch.stack([m[:, 0, 0], m[:, 1, 1], m[:, 2, 2]], dim=1)
+        idx = torch.argmax(diag, dim=1)
+        quat_cond = torch.zeros((m.shape[0], 4), device=matrix.device, dtype=matrix.dtype)
+
+        mask0 = idx == 0
+        if torch.any(mask0):
+            r = m[mask0]
+            root = torch.sqrt(
+                torch.clamp(1.0 + r[:, 0, 0] - r[:, 1, 1] - r[:, 2, 2], min=0.0)
+            ) * 2.0
+            quat_cond[mask0, 0] = (r[:, 2, 1] - r[:, 1, 2]) / root
+            quat_cond[mask0, 1] = 0.25 * root
+            quat_cond[mask0, 2] = (r[:, 0, 1] + r[:, 1, 0]) / root
+            quat_cond[mask0, 3] = (r[:, 0, 2] + r[:, 2, 0]) / root
+
+        mask1 = idx == 1
+        if torch.any(mask1):
+            r = m[mask1]
+            root = torch.sqrt(
+                torch.clamp(1.0 - r[:, 0, 0] + r[:, 1, 1] - r[:, 2, 2], min=0.0)
+            ) * 2.0
+            quat_cond[mask1, 0] = (r[:, 0, 2] - r[:, 2, 0]) / root
+            quat_cond[mask1, 1] = (r[:, 0, 1] + r[:, 1, 0]) / root
+            quat_cond[mask1, 2] = 0.25 * root
+            quat_cond[mask1, 3] = (r[:, 1, 2] + r[:, 2, 1]) / root
+
+        mask2 = idx == 2
+        if torch.any(mask2):
+            r = m[mask2]
+            root = torch.sqrt(
+                torch.clamp(1.0 - r[:, 0, 0] - r[:, 1, 1] + r[:, 2, 2], min=0.0)
+            ) * 2.0
+            quat_cond[mask2, 0] = (r[:, 1, 0] - r[:, 0, 1]) / root
+            quat_cond[mask2, 1] = (r[:, 0, 2] + r[:, 2, 0]) / root
+            quat_cond[mask2, 2] = (r[:, 1, 2] + r[:, 2, 1]) / root
+            quat_cond[mask2, 3] = 0.25 * root
+
+        quat[~cond] = quat_cond
+
+    return _normalize_torch(quat)
+
+
+def transform_gpu_actor_frame(
+    gpu_sequence: GpuActorSequence,
+    actor_idx: int,
+    transform: np.ndarray,
+) -> ActorRenderFrame:
+    """Return a world-space actor frame while keeping all source data GPU-resident."""
+
+    if not gpu_sequence.frames:
+        raise ValueError("GPU actor sequence is empty.")
+    canonical = gpu_sequence.frames[int(actor_idx) % len(gpu_sequence.frames)]
+    if transform.shape != (4, 4):
+        raise ValueError("transform must be a 4x4 matrix")
+
+    device = canonical.xyz.device
+    dtype = canonical.xyz.dtype
+    a = transform[:3, :3].astype(np.float64)
+    t = transform[:3, 3].astype(np.float64)
+    rotation = a.T.copy()
+    scale = float(np.sqrt((rotation @ rotation.T)[0, 0]))
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"Invalid scale derived from transform: {scale}")
+    rotation /= scale
+
+    rot_t = torch.as_tensor(rotation, device=device, dtype=dtype)
+    trans_t = torch.as_tensor(t, device=device, dtype=dtype)
+    xyz = canonical.xyz @ rot_t.T
+    xyz = xyz + trans_t
+
+    if canonical.scaling.shape[1] == 0:
+        scaling = canonical.scaling
+    elif math.isclose(scale, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        scaling = canonical.scaling
+    else:
+        scaling = canonical.scaling + math.log(scale)
+
+    if canonical.rotation.numel() > 0:
+        quat = _normalize_torch(canonical.rotation)
+        local_rotation = _quat_wxyz_to_matrix_torch(quat)
+        composed = torch.einsum("ij,njk->nik", rot_t, local_rotation)
+        rotation_world = _matrix_to_quat_wxyz_torch(composed)
+    else:
+        rotation_world = canonical.rotation
+
+    return ActorRenderFrame(
+        xyz=xyz.contiguous(),
+        features_dc=canonical.features_dc,
+        features_rest=canonical.features_rest,
+        opacity=canonical.opacity,
+        scaling=scaling.contiguous() if scaling is not canonical.scaling else scaling,
+        rotation=rotation_world.contiguous() if rotation_world is not canonical.rotation else rotation_world,
     )
 
 
