@@ -207,7 +207,24 @@ Remaining:
 - [ ] Keep family-specific behavior in manifest adapters/executors rather than
   requiring users to edit shell scripts for each mission family.
 
-### 7. Isaac Sim/OpenUSD Sensor Rig Import
+### 7. Output Bottleneck Benchmarking
+
+- [x] Add per-step TeleSim timing for human transform/tensor-pack/merge,
+  Gaussian rendering, GPU readback, PNG/depth writes, and video write/encode/mux
+  stages.
+- [x] Add `scripts/render/benchmark_output_backends.py` to run matched
+  mode/backend benchmarks and emit JSON/Markdown reports plus one MP4 per video
+  backend.
+- [x] Document the safe 5880-host workflow in
+  `docs/output_backend_benchmark.md`, including dirty-tree inspection before
+  branch switching.
+- [ ] Run the benchmark on the 5880 host and compare `nvenc`, `cpu`, and `gpu`
+  backends for video-only, video+RGB, video+depth, RGB-only, and depth-only
+  output modes.
+- [ ] Use the report to decide whether the next optimization target is
+  video/photo output, human PLY transform/merge, or Gaussian rendering.
+
+### 8. Isaac Sim/OpenUSD Sensor Rig Import
 
 - [x] Document fallback camera/sensor profiles and the comparison between
   OpenUSD/Isaac Sim defaults, G1 assumptions, and previous NavDP settings in
@@ -236,7 +253,7 @@ Remaining:
 - [x] Add fixture tests for a minimal Isaac Sim/OpenUSD-style robot rig with RGB
   and depth modalities.
 
-### 8. Validation
+### 9. Validation
 
 Local macOS:
 
@@ -254,6 +271,8 @@ Server/platform:
 - [ ] One `serve_queue` render job with queue actors.
 - [ ] One `dense_multi_robot` render with at least two robot viewpoints.
 - [ ] One `dense_dynamic_combined` render with humans plus peer robots.
+- [ ] One output-backend benchmark run on the 5880 host with report and MP4s
+  saved under the chosen benchmark output root.
 - [ ] Confirm logs show `gsplat` backend selection.
 - [ ] Confirm no off-camera human PLYs are merged when culling is enabled.
 

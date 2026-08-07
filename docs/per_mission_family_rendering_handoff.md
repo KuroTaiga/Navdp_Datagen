@@ -361,6 +361,22 @@ docs/camera_sensor_defaults.md
 Do not reintroduce hard-coded camera constants in family-specific shell scripts.
 The family executor should read sensors from manifest jobs.
 
+## Output Backend Benchmark
+
+Before deciding that human PLY transform/merge needs C++/CUDA, run the output
+benchmark on the render server and inspect the stage totals:
+
+```text
+docs/output_backend_benchmark.md
+scripts/render/benchmark_output_backends.py
+```
+
+The benchmark compares `nvenc`, `cpu`, and `gpu` video backends across
+video-only, video+RGB, video+depth, RGB-only, and depth-only modes. It writes a
+Markdown report, JSON summary, logs, and MP4 outputs per video backend. Use it
+to verify whether the longest step is actually video encode/flush, PNG/depth
+writes, human PLY transform/tensor-pack/merge, or Gaussian rendering.
+
 ## Known Caveats
 
 - Local macOS cannot validate CUDA rendering. GPU validation must run on the

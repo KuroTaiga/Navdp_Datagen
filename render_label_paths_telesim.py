@@ -9,6 +9,7 @@ writes MP4 + optional camera metadata for quick pipeline validation.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import logging
 import math
@@ -78,6 +79,56 @@ STATUS_NOT_RUN = 0
 STATUS_DONE = 1
 STATUS_RETRY = 2
 STATUS_SKIP = 3
+TELESIM_STAGE_KEYS = (
+    "actor_visibility_sec",
+    "actor_transform_sec",
+    "actor_tensor_pack_sec",
+    "actor_merge_update_sec",
+    "gaussian_render_sec",
+    "gpu_readback_sec",
+    "perframe_light_sec",
+    "camera_metadata_sec",
+    "perframe_depth_sec",
+    "perframe_png_sec",
+    "mp4_write_sec",
+    "h264_encode_sec",
+    "h264_mux_sec",
+    "video_close_sec",
+)
+TELESIM_ALIAS_STAGE_KEYS = ("render", "encode", "measured_total_sec")
+
+
+def _new_stage_seconds() -> dict[str, float]:
+    return {stage: 0.0 for stage in TELESIM_STAGE_KEYS}
+
+
+@contextlib.contextmanager
+def _measure_stage(stage_seconds: dict[str, float], stage: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        stage_seconds[stage] = stage_seconds.get(stage, 0.0) + (time.perf_counter() - start)
+
+
+def _finalize_stage_seconds(stage_seconds: dict[str, float]) -> dict[str, float]:
+    render_sec = (
+        stage_seconds.get("gaussian_render_sec", 0.0)
+        + stage_seconds.get("gpu_readback_sec", 0.0)
+    )
+    encode_sec = (
+        stage_seconds.get("mp4_write_sec", 0.0)
+        + stage_seconds.get("h264_encode_sec", 0.0)
+    )
+    measured_total_sec = sum(
+        float(value)
+        for key, value in stage_seconds.items()
+        if key not in TELESIM_ALIAS_STAGE_KEYS
+    )
+    stage_seconds["render"] = render_sec
+    stage_seconds["encode"] = encode_sec
+    stage_seconds["measured_total_sec"] = measured_total_sec
+    return dict(stage_seconds)
 
 
 def _format_seconds(seconds: float | None) -> str:
@@ -916,8 +967,7 @@ def render_label(
     video_path = scene_dir / f"{label_id}.mp4"
     frame_prefix = "frame"
 
-    render_time = 0.0
-    encode_time = 0.0
+    stage_seconds = _new_stage_seconds()
     frames_rendered = 0
     fov_y_rad = math.radians(float(args.fov_deg))
 
@@ -928,6 +978,7 @@ def render_label(
 
     video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
     use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
+    video_stage = "h264_encode_sec" if use_gpu_video else "mp4_write_sec"
     need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
     camera_frames: list[dict] = []
     if use_gpu_video and (
@@ -940,49 +991,54 @@ def render_label(
         )
 
     def _render_frames(writer=None):
-        nonlocal render_time, encode_time, frames_rendered
+        nonlocal frames_rendered
         for idx, (pose, _) in enumerate(poses):
-            start = time.monotonic()
             if use_gpu_video:
-                render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
-                    renderer,
-                    pose,
-                    renderer._gaussians,  # pylint: disable=protected-access
-                    return_render_tensor=True,
-                    need_depth_inv=need_depth_inv,
-                )
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
+                        renderer,
+                        pose,
+                        renderer._gaussians,  # pylint: disable=protected-access
+                        return_render_tensor=True,
+                        need_depth_inv=need_depth_inv,
+                    )
                 rgb = None
                 if args.rgb_frames:
-                    rgb = (
-                        (render_tensor.clamp(0.0, 1.0) * 255.0)
-                        .to(torch.uint8)
-                        .permute(1, 2, 0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    with _measure_stage(stage_seconds, "gpu_readback_sec"):
+                        rgb = (
+                            (render_tensor.clamp(0.0, 1.0) * 255.0)
+                            .to(torch.uint8)
+                            .permute(1, 2, 0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
             else:
-                rgb, depth_inv, camera = _render_custom_gaussians(
-                    renderer,
-                    pose,
-                    renderer._gaussians,  # pylint: disable=protected-access
-                    need_depth_inv=need_depth_inv,
-                )
-            render_time += time.monotonic() - start
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    rgb, depth_inv, camera = _render_custom_gaussians(
+                        renderer,
+                        pose,
+                        renderer._gaussians,  # pylint: disable=protected-access
+                        need_depth_inv=need_depth_inv,
+                    )
             if not use_gpu_video:
-                rgb = _apply_light_filter_if_enabled(
-                    rgb,
-                    light_config,
-                    frame_index=idx,
-                    seed_offset=light_seed_offset,
-                )
-                rgb = _apply_camera_light_if_enabled(
-                    rgb,
-                    depth_inv,
-                    camera,
-                    cl_config,
-                    cl_light_world=cl_light_world,
-                )
+                if light_config is not None and light_config.enabled():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_light_filter_if_enabled(
+                            rgb,
+                            light_config,
+                            frame_index=idx,
+                            seed_offset=light_seed_offset,
+                        )
+                if cl_config is not None and cl_config.active():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_camera_light_if_enabled(
+                            rgb,
+                            depth_inv,
+                            camera,
+                            cl_config,
+                            cl_light_world=cl_light_world,
+                        )
             if args.rotate_180:
                 if use_gpu_video:
                     if rgb is not None:
@@ -991,43 +1047,45 @@ def render_label(
                     rgb = np.flipud(np.fliplr(rgb))
             frames_rendered += 1
             if args.save_camera_metadata:
-                cam_payload = _serialize_camera(
-                    renderer=renderer,
-                    pose=pose,
-                    frame_size=tuple(args.resolution),
-                    fov_y_rad=fov_y_rad,
-                )
-                camera_frames.append({"frame": int(idx), **cam_payload})
+                with _measure_stage(stage_seconds, "camera_metadata_sec"):
+                    cam_payload = _serialize_camera(
+                        renderer=renderer,
+                        pose=pose,
+                        frame_size=tuple(args.resolution),
+                        fov_y_rad=fov_y_rad,
+                    )
+                    camera_frames.append({"frame": int(idx), **cam_payload})
             if args.save_depth_maps and depth_inv is not None:
-                _save_depth_map(
-                    depth_inv=depth_inv,
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=idx,
-                    rotate_180=args.rotate_180,
-                )
+                with _measure_stage(stage_seconds, "perframe_depth_sec"):
+                    _save_depth_map(
+                        depth_inv=depth_inv,
+                        frames_dir=frames_dir,
+                        frame_prefix=frame_prefix,
+                        frame_idx=idx,
+                        rotate_180=args.rotate_180,
+                    )
             if args.rgb_frames:
                 frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
                 if rgb is None:
                     raise RuntimeError("rgb frame requested but was not produced.")
-                imageio.imwrite(frame_path, rgb)
+                with _measure_stage(stage_seconds, "perframe_png_sec"):
+                    imageio.imwrite(frame_path, rgb)
 
             if args.video and writer is not None:
-                start = time.monotonic()
-                if use_gpu_video:
-                    frame_gpu = _render_tensor_to_gpu_format(
-                        render_tensor, gpu_format=GPU_VIDEO_FORMAT
-                    )
-                    if args.rotate_180:
-                        frame_gpu = frame_gpu.flip((0, 1))
-                    writer.append_data(frame_gpu.contiguous())
-                else:
-                    writer.append_data(rgb)
-                encode_time += time.monotonic() - start
+                with _measure_stage(stage_seconds, video_stage):
+                    if use_gpu_video:
+                        frame_gpu = _render_tensor_to_gpu_format(
+                            render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                        if args.rotate_180:
+                            frame_gpu = frame_gpu.flip((0, 1))
+                        writer.append_data(frame_gpu.contiguous())
+                    else:
+                        writer.append_data(rgb)
 
     if args.video:
         w, h = int(args.resolution[0]), int(args.resolution[1])
-        with make_video_writer(
+        writer = make_video_writer(
             video_path,
             fps=args.video_fps,
             backend=video_backend,
@@ -1036,24 +1094,42 @@ def render_label(
             width=w,
             height=h,
             gpu_format=GPU_VIDEO_FORMAT,
-        ) as writer:
+            encode_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_encode_sec"))
+                if use_gpu_video
+                else None
+            ),
+            mux_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_mux_sec"))
+                if use_gpu_video
+                else None
+            ),
+        )
+        try:
             _render_frames(writer=writer)
+        finally:
+            close_timer = (
+                contextlib.nullcontext()
+                if use_gpu_video
+                else _measure_stage(stage_seconds, "video_close_sec")
+            )
+            with close_timer:
+                writer.close()
     else:
         _render_frames(writer=None)
 
     if args.save_camera_metadata:
-        _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
+        with _measure_stage(stage_seconds, "camera_metadata_sec"):
+            _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
 
-    duration = render_time + encode_time
+    stage_payload = _finalize_stage_seconds(stage_seconds)
+    duration = stage_payload["measured_total_sec"]
     return {
         "scene_id": args.scene,
         "label_id": label_id,
         "frames": frames_rendered,
         "duration_sec": duration,
-        "stage_seconds": {
-            "render": render_time,
-            "encode": encode_time,
-        },
+        "stage_seconds": stage_payload,
     }
 
 
@@ -1123,8 +1199,7 @@ def render_label_with_actor(
     video_path = scene_dir / f"{label_id}.mp4"
     frame_prefix = "frame"
 
-    render_time = 0.0
-    encode_time = 0.0
+    stage_seconds = _new_stage_seconds()
     frames_rendered = 0
     fov_y_rad = math.radians(float(args.fov_deg))
 
@@ -1143,6 +1218,7 @@ def render_label_with_actor(
 
     video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
     use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
+    video_stage = "h264_encode_sec" if use_gpu_video else "mp4_write_sec"
     need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
     camera_frames: list[dict] = []
     if use_gpu_video and (
@@ -1155,98 +1231,107 @@ def render_label_with_actor(
         )
 
     def _render_frames(writer=None):
-        nonlocal render_time, encode_time, frames_rendered, combined_model, combined_actor_size, actor_culled_frames
+        nonlocal frames_rendered, combined_model, combined_actor_size, actor_culled_frames
         for idx, ((pose, _), transform, actor_idx) in enumerate(
             zip(poses, actor_transforms, actor_indices)
         ):
             render_gaussians = base_gaussians
             actor_visible = True
             if actor_cull_enabled:
-                camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
-                sphere = transformed_actor_sphere(
-                    transform,
-                    radius_xy_m=actor_runtime.sequence.radius_xy,
-                    height_m=actor_runtime.sequence.height,
-                    margin_m=actor_cull_margin_m,
-                )
-                visibility = sphere_visible_in_camera(
-                    center_world=sphere.center_world,
-                    radius_m=sphere.radius_m,
-                    world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
-                    fov_x_rad=float(camera_for_cull.FoVx),
-                    fov_y_rad=float(camera_for_cull.FoVy),
-                    znear=float(camera_for_cull.znear),
-                    zfar=float(camera_for_cull.zfar),
-                    matrix_is_transposed=True,
-                )
+                with _measure_stage(stage_seconds, "actor_visibility_sec"):
+                    camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+                    sphere = transformed_actor_sphere(
+                        transform,
+                        radius_xy_m=actor_runtime.sequence.radius_xy,
+                        height_m=actor_runtime.sequence.height,
+                        margin_m=actor_cull_margin_m,
+                    )
+                    visibility = sphere_visible_in_camera(
+                        center_world=sphere.center_world,
+                        radius_m=sphere.radius_m,
+                        world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
+                        fov_x_rad=float(camera_for_cull.FoVx),
+                        fov_y_rad=float(camera_for_cull.FoVy),
+                        znear=float(camera_for_cull.znear),
+                        zfar=float(camera_for_cull.zfar),
+                        matrix_is_transposed=True,
+                    )
                 actor_visible = bool(visibility.visible)
                 if not actor_visible:
                     actor_culled_frames += 1
             if actor_visible:
                 sequence_frame = actor_runtime.sequence.frames[actor_idx]
                 # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
-                actor_data = apply_transform_to_frame(
-                    sequence_frame,
-                    actor_runtime.sequence,
-                    transform,
-                )
-                actor_render = actor_data_to_tensors(
-                    actor_data,
-                    actor_runtime.sequence,
-                    device=base_gaussians.get_xyz.device,
-                    target_rest_dim=scene_rest_dim,
-                )
-                current_actor_size = int(actor_render.xyz.shape[0])
-                if combined_model is None or combined_actor_size != current_actor_size:
-                    combined_actor_size = current_actor_size
-                    combined_model = CombinedGaussianModel(base_gaussians, actor_render)
-                else:
-                    combined_model.update_actor(actor_render)
+                with _measure_stage(stage_seconds, "actor_transform_sec"):
+                    actor_data = apply_transform_to_frame(
+                        sequence_frame,
+                        actor_runtime.sequence,
+                        transform,
+                    )
+                with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
+                    actor_render = actor_data_to_tensors(
+                        actor_data,
+                        actor_runtime.sequence,
+                        device=base_gaussians.get_xyz.device,
+                        target_rest_dim=scene_rest_dim,
+                    )
+                with _measure_stage(stage_seconds, "actor_merge_update_sec"):
+                    current_actor_size = int(actor_render.xyz.shape[0])
+                    if combined_model is None or combined_actor_size != current_actor_size:
+                        combined_actor_size = current_actor_size
+                        combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+                    else:
+                        combined_model.update_actor(actor_render)
                 render_gaussians = combined_model
             else:
                 combined_actor_size = None
 
-            start = time.monotonic()
             if use_gpu_video:
-                render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
-                    renderer,
-                    pose,
-                    render_gaussians,
-                    return_render_tensor=True,
-                    need_depth_inv=need_depth_inv,
-                )
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
+                        renderer,
+                        pose,
+                        render_gaussians,
+                        return_render_tensor=True,
+                        need_depth_inv=need_depth_inv,
+                    )
                 rgb = None
                 if args.rgb_frames:
-                    rgb = (
-                        (render_tensor.clamp(0.0, 1.0) * 255.0)
-                        .to(torch.uint8)
-                        .permute(1, 2, 0)
-                        .detach()
-                        .cpu()
-                        .numpy()
-                    )
+                    with _measure_stage(stage_seconds, "gpu_readback_sec"):
+                        rgb = (
+                            (render_tensor.clamp(0.0, 1.0) * 255.0)
+                            .to(torch.uint8)
+                            .permute(1, 2, 0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
             else:
-                rgb, depth_inv, camera = _render_custom_gaussians(
-                    renderer,
-                    pose,
-                    render_gaussians,
-                    need_depth_inv=need_depth_inv,
-                )
-            render_time += time.monotonic() - start
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    rgb, depth_inv, camera = _render_custom_gaussians(
+                        renderer,
+                        pose,
+                        render_gaussians,
+                        need_depth_inv=need_depth_inv,
+                    )
             if not use_gpu_video:
-                rgb = _apply_light_filter_if_enabled(
-                    rgb,
-                    light_config,
-                    frame_index=idx,
-                    seed_offset=light_seed_offset,
-                )
-                rgb = _apply_camera_light_if_enabled(
-                    rgb,
-                    depth_inv,
-                    camera,
-                    cl_config,
-                    cl_light_world=cl_light_world,
-                )
+                if light_config is not None and light_config.enabled():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_light_filter_if_enabled(
+                            rgb,
+                            light_config,
+                            frame_index=idx,
+                            seed_offset=light_seed_offset,
+                        )
+                if cl_config is not None and cl_config.active():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_camera_light_if_enabled(
+                            rgb,
+                            depth_inv,
+                            camera,
+                            cl_config,
+                            cl_light_world=cl_light_world,
+                        )
             if args.rotate_180:
                 if use_gpu_video:
                     if rgb is not None:
@@ -1255,43 +1340,45 @@ def render_label_with_actor(
                     rgb = np.flipud(np.fliplr(rgb))
             frames_rendered += 1
             if args.save_camera_metadata:
-                cam_payload = _serialize_camera(
-                    renderer=renderer,
-                    pose=pose,
-                    frame_size=tuple(args.resolution),
-                    fov_y_rad=fov_y_rad,
-                )
-                camera_frames.append({"frame": int(idx), **cam_payload})
+                with _measure_stage(stage_seconds, "camera_metadata_sec"):
+                    cam_payload = _serialize_camera(
+                        renderer=renderer,
+                        pose=pose,
+                        frame_size=tuple(args.resolution),
+                        fov_y_rad=fov_y_rad,
+                    )
+                    camera_frames.append({"frame": int(idx), **cam_payload})
             if args.save_depth_maps and depth_inv is not None:
-                _save_depth_map(
-                    depth_inv=depth_inv,
-                    frames_dir=frames_dir,
-                    frame_prefix=frame_prefix,
-                    frame_idx=idx,
-                    rotate_180=args.rotate_180,
-                )
+                with _measure_stage(stage_seconds, "perframe_depth_sec"):
+                    _save_depth_map(
+                        depth_inv=depth_inv,
+                        frames_dir=frames_dir,
+                        frame_prefix=frame_prefix,
+                        frame_idx=idx,
+                        rotate_180=args.rotate_180,
+                    )
             if args.rgb_frames:
                 frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
                 if rgb is None:
                     raise RuntimeError("rgb frame requested but was not produced.")
-                imageio.imwrite(frame_path, rgb)
+                with _measure_stage(stage_seconds, "perframe_png_sec"):
+                    imageio.imwrite(frame_path, rgb)
 
             if args.video and writer is not None:
-                start = time.monotonic()
-                if use_gpu_video:
-                    frame_gpu = _render_tensor_to_gpu_format(
-                        render_tensor, gpu_format=GPU_VIDEO_FORMAT
-                    )
-                    if args.rotate_180:
-                        frame_gpu = frame_gpu.flip((0, 1))
-                    writer.append_data(frame_gpu.contiguous())
-                else:
-                    writer.append_data(rgb)
-                encode_time += time.monotonic() - start
+                with _measure_stage(stage_seconds, video_stage):
+                    if use_gpu_video:
+                        frame_gpu = _render_tensor_to_gpu_format(
+                            render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                        if args.rotate_180:
+                            frame_gpu = frame_gpu.flip((0, 1))
+                        writer.append_data(frame_gpu.contiguous())
+                    else:
+                        writer.append_data(rgb)
 
     if args.video:
         w, h = int(args.resolution[0]), int(args.resolution[1])
-        with make_video_writer(
+        writer = make_video_writer(
             video_path,
             fps=args.video_fps,
             backend=video_backend,
@@ -1300,24 +1387,42 @@ def render_label_with_actor(
             width=w,
             height=h,
             gpu_format=GPU_VIDEO_FORMAT,
-        ) as writer:
+            encode_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_encode_sec"))
+                if use_gpu_video
+                else None
+            ),
+            mux_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_mux_sec"))
+                if use_gpu_video
+                else None
+            ),
+        )
+        try:
             _render_frames(writer=writer)
+        finally:
+            close_timer = (
+                contextlib.nullcontext()
+                if use_gpu_video
+                else _measure_stage(stage_seconds, "video_close_sec")
+            )
+            with close_timer:
+                writer.close()
     else:
         _render_frames(writer=None)
 
     if args.save_camera_metadata:
-        _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
+        with _measure_stage(stage_seconds, "camera_metadata_sec"):
+            _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
 
-    duration = render_time + encode_time
+    stage_payload = _finalize_stage_seconds(stage_seconds)
+    duration = stage_payload["measured_total_sec"]
     return {
         "scene_id": args.scene,
         "label_id": label_id,
         "frames": frames_rendered,
         "duration_sec": duration,
-        "stage_seconds": {
-            "render": render_time,
-            "encode": encode_time,
-        },
+        "stage_seconds": stage_payload,
         "actor_culled_frames": actor_culled_frames,
     }
 
@@ -1597,6 +1702,7 @@ def main() -> int:
     total_frames = 0
     total_duration = 0.0
     total_encode = 0.0
+    total_mux = 0.0
     path_statuses: dict[tuple[str, str], dict] = {}
     paths_planned = len(label_paths)
     paths_done = 0  # done includes ok/skip/fatal; OOM is still pending
@@ -1764,9 +1870,9 @@ def main() -> int:
             "h264_encode_total_sec": total_encode,
             "h264_encode_sec_per_frame": None,
             "h264_encode_fps": None,
-            "h264_mux_total_sec": 0.0,
-            "h264_mux_sec_per_frame": 0.0,
-            "h264_mux_sec_per_path": (0.0 if not paths_payload else 0.0),
+            "h264_mux_total_sec": total_mux,
+            "h264_mux_sec_per_frame": None,
+            "h264_mux_sec_per_path": None,
             "vram_peak_max_bytes": 0.0,
             "vram_avg_max_worker_bytes": 0.0,
             "paths": paths_payload,
@@ -1870,6 +1976,7 @@ def main() -> int:
             total_duration += float(path_metrics.get("duration_sec", 0.0))
             stage = path_metrics.get("stage_seconds") or {}
             total_encode += float(stage.get("encode", 0.0))
+            total_mux += float(stage.get("h264_mux_sec", 0.0))
             _log_path_progress(label_id, status="ok", frames=int(path_metrics.get("frames", 0) or 0))
 
             if args.save_follow_metadata:
@@ -1933,9 +2040,9 @@ def main() -> int:
         "h264_encode_total_sec": total_encode,
         "h264_encode_sec_per_frame": (total_encode / total_frames) if total_frames > 0 else None,
         "h264_encode_fps": (total_frames / total_encode) if total_encode > 0 else None,
-        "h264_mux_total_sec": 0.0,
-        "h264_mux_sec_per_frame": 0.0,
-        "h264_mux_sec_per_path": (0.0 if not paths_payload else 0.0),
+        "h264_mux_total_sec": total_mux,
+        "h264_mux_sec_per_frame": (total_mux / total_frames) if total_frames > 0 else None,
+        "h264_mux_sec_per_path": (total_mux / len(paths_payload)) if paths_payload else None,
         "vram_peak_max_bytes": 0.0,
         "vram_avg_max_worker_bytes": 0.0,
         "paths": paths_payload,
