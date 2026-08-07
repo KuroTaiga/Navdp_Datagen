@@ -31,6 +31,7 @@ _GPU_VIDEO_SYNC_MODE = (os.getenv("GPU_VIDEO_SYNC", "both") or "both").lower()
 _GPU_VIDEO_SYNC_BEFORE = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "before", "both")
 _GPU_VIDEO_SYNC_AFTER = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "after", "both")
 _GPU_VIDEO_RETAIN_FRAMES = int(os.getenv("GPU_VIDEO_RETAIN_FRAMES", "8") or 0)
+_VIDEO_GOP_FRAMES_ENV = os.getenv("VIDEO_GOP_FRAMES") or os.getenv("GPU_VIDEO_GOP_FRAMES")
 _GPU_VIDEO_DISABLE_BFRAMES = os.getenv("GPU_VIDEO_DISABLE_BFRAMES", "1").lower() in (
     "1",
     "true",
@@ -43,6 +44,19 @@ _GPU_VIDEO_CLONE = os.getenv("GPU_VIDEO_CLONE", "1").lower() in (
     "yes",
     "on",
 )
+
+
+def _resolve_gop_frames(fps: float, gop_frames: int | None = None) -> int:
+    if gop_frames is not None and int(gop_frames) > 0:
+        return int(gop_frames)
+    if _VIDEO_GOP_FRAMES_ENV:
+        try:
+            env_value = int(_VIDEO_GOP_FRAMES_ENV)
+        except ValueError:
+            env_value = 0
+        if env_value > 0:
+            return env_value
+    return max(1, int(round(float(fps))))
 
 
 def _resolve_ffmpeg_bin() -> str | None:
@@ -67,6 +81,7 @@ class GpuVideoWriter:
         ffmpeg_bin: str | None = None,
         encode_timer=None,
         mux_timer=None,
+        gop_frames: int | None = None,
     ) -> None:
         try:
             import PyNvVideoCodec as nvc  # type: ignore
@@ -90,7 +105,14 @@ class GpuVideoWriter:
         self._mux_timer = mux_timer
         self._retain_frames = _GPU_VIDEO_RETAIN_FRAMES
         self._recent_frames: list = []
-        base_params: dict[str, str] = {"codec": "h264", "fps": str(int(round(fps)))}
+        resolved_gop = _resolve_gop_frames(fps, gop_frames)
+        base_params: dict[str, str] = {
+            "codec": "h264",
+            "fps": str(int(round(fps))),
+            "gop": str(resolved_gop),
+            "idrperiod": str(resolved_gop),
+            "repeatspspps": "1",
+        }
         if nvenc_preset:
             base_params["preset"] = nvenc_preset
         if nvenc_bitrate:
@@ -220,6 +242,7 @@ def make_video_writer(
     width: int | None = None,
     height: int | None = None,
     gpu_format: str = "ABGR",
+    gop_frames: int | None = None,
     encode_timer=None,
     mux_timer=None,
 ):
@@ -227,6 +250,7 @@ def make_video_writer(
         backend.value if isinstance(backend, VideoWriterBackend) else str(backend).lower()
     )
     if backend_value == VideoWriterBackend.CPU.value:
+        resolved_gop = _resolve_gop_frames(fps, gop_frames)
         try:
             return imageio.get_writer(
                 path,
@@ -234,6 +258,14 @@ def make_video_writer(
                 fps=fps,
                 codec="libx264",
                 pixelformat=pixel_format,
+                output_params=[
+                    "-g",
+                    str(resolved_gop),
+                    "-keyint_min",
+                    str(resolved_gop),
+                    "-sc_threshold",
+                    "0",
+                ],
             )
         except Exception as exc:  # pylint: disable=broad-except
             global _CPU_H264_FALLBACK_REPORTED
@@ -246,7 +278,17 @@ def make_video_writer(
                 _CPU_H264_FALLBACK_REPORTED = True
             return imageio.get_writer(path, mode="I", fps=fps)
     if backend_value == VideoWriterBackend.NVENC.value:
-        output_params = []
+        resolved_gop = _resolve_gop_frames(fps, gop_frames)
+        output_params = [
+            "-g",
+            str(resolved_gop),
+            "-keyint_min",
+            str(resolved_gop),
+            "-forced-idr",
+            "1",
+            "-sc_threshold",
+            "0",
+        ]
         if nvenc_preset:
             output_params.extend(["-preset", nvenc_preset])
         if nvenc_bitrate:
@@ -286,6 +328,7 @@ def make_video_writer(
             nvenc_preset=nvenc_preset,
             nvenc_bitrate=nvenc_bitrate,
             pixel_format=gpu_format,
+            gop_frames=gop_frames,
             encode_timer=encode_timer,
             mux_timer=mux_timer,
         )
