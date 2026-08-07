@@ -950,6 +950,30 @@ def _safe_mkdir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
+def _resolve_gaussian_model(scene_dir: Path, explicit_model: Path | None) -> Path:
+    if explicit_model is not None:
+        return explicit_model
+
+    preferred_plys = [
+        scene_dir / "3dgs_raw.ply",
+        scene_dir / "3dgs_decompressed.ply",
+        scene_dir / "decompressed.ply",
+        scene_dir / "debug-decompressed.ply",
+        scene_dir / "point_cloud.ply",
+        scene_dir / "3dgs_compressed.ply",
+    ]
+    for path in preferred_plys:
+        if path.exists():
+            if path.name == "3dgs_compressed.ply":
+                LOGGER.warning(
+                    "Using packed compressed Gaussian PLY as a last resort: %s. "
+                    "Prefer 3dgs_raw.ply or unpack it to 3dgs_decompressed.ply first.",
+                    path,
+                )
+            return path
+    return preferred_plys[0]
+
+
 def render_label(
     *,
     renderer: GaussianRendererBackend,
@@ -1737,11 +1761,7 @@ def main() -> int:
     if label_dir is None:
         raise FileNotFoundError(f"No label JSONs under {tasks_scene_dir}")
 
-    gaussian_model = (
-        args.gaussian_model
-        if args.gaussian_model is not None
-        else (scene_dir / "3dgs_raw.ply")
-    )
+    gaussian_model = _resolve_gaussian_model(scene_dir, args.gaussian_model)
     if not gaussian_model.exists():
         candidates = sorted(scene_dir.glob("*.ply"))
         if not candidates:
