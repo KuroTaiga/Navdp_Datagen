@@ -267,6 +267,9 @@ def _run_one(
     )
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
+    if args.ffmpeg_bin is not None:
+        env["IMAGEIO_FFMPEG_EXE"] = str(args.ffmpeg_bin)
+        env["FFMPEG_BIN"] = str(args.ffmpeg_bin)
     if args.strict_gpu_backends:
         env["STRICT_GPU_BACKENDS"] = "1"
     if spec.backend == "gpu":
@@ -289,6 +292,13 @@ def _run_one(
     videos = _find_output_videos(run_output_dir)
     stage_totals = _sum_stage_seconds(metrics)
     frames_total = metrics.get("frames_total")
+    paths_ok = int(metrics.get("paths_ok") or 0)
+    paths_fatal = int(metrics.get("paths_fatal") or 0)
+    paths_oom = int(metrics.get("paths_oom") or 0)
+    paths_attempted = int(metrics.get("paths_attempted") or 0)
+    metrics_ok = (paths_fatal == 0 and paths_oom == 0)
+    if metrics and paths_attempted > 0:
+        metrics_ok = metrics_ok and paths_ok > 0
     time_per_frame = (
         (wall_time_sec / float(frames_total))
         if frames_total not in (None, 0) and wall_time_sec > 0.0
@@ -299,7 +309,7 @@ def _run_one(
         "mode": spec.mode,
         "backend": spec.backend,
         "returncode": int(completed.returncode),
-        "ok": completed.returncode == 0,
+        "ok": completed.returncode == 0 and metrics_ok,
         "wall_time_sec": wall_time_sec,
         "wall_time_per_frame_sec": time_per_frame,
         "metrics_path": str(metrics_path),
@@ -310,6 +320,10 @@ def _run_one(
         "video_bytes": _output_bytes(videos),
         "frames_total": int(frames_total or 0),
         "paths_total": int(metrics.get("paths_total") or 0),
+        "paths_ok": paths_ok,
+        "paths_fatal": paths_fatal,
+        "paths_oom": paths_oom,
+        "paths_attempted": paths_attempted,
         "duration_total_sec": metrics.get("duration_total_sec"),
         "time_per_frame_sec": metrics.get("time_per_frame_sec"),
         "h264_encode_total_sec": metrics.get("h264_encode_total_sec"),
@@ -361,6 +375,11 @@ def _write_report(output_root: Path, payload: dict) -> Path:
                 run["backend"],
                 status,
                 str(run["frames_total"]),
+                (
+                    f"ok={run.get('paths_ok', 0)} "
+                    f"fatal={run.get('paths_fatal', 0)} "
+                    f"oom={run.get('paths_oom', 0)}"
+                ),
                 _format_seconds(run["wall_time_sec"]),
                 _format_seconds(run["wall_time_per_frame_sec"]),
                 _format_bytes(run["video_bytes"]),
@@ -468,6 +487,7 @@ def _write_report(output_root: Path, payload: dict) -> Path:
                 "Backend",
                 "Status",
                 "Frames",
+                "Paths",
                 "Wall sec",
                 "Wall sec/frame",
                 "Video bytes",
@@ -539,6 +559,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument("--resolution", type=int, nargs=2, default=(960, 720), metavar=("W", "H"))
     parser.add_argument("--video-nvenc-preset", default=None)
     parser.add_argument("--video-nvenc-bitrate", default=None)
+    parser.add_argument("--ffmpeg-bin", type=Path, default=None)
     parser.add_argument("--camera-metadata", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--path-progress", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--strict-gpu-backends", action=argparse.BooleanOptionalAction, default=True)

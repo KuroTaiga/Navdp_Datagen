@@ -80,6 +80,8 @@ name shared by both input directories.
 
 ```bash
 python3 scripts/render/benchmark_output_backends.py \
+  --python-bin /home/dongjk/.conda/envs/cuda121/bin/python \
+  --ffmpeg-bin /home/dongjk/.conda/envs/cuda121/bin/ffmpeg \
   --scenes-dir ./data/CHINGMU_scenes_rescaled \
   --tasks-dir ./data/CHINGMU_75_rescaled_0800_42_iter1 \
   --output-root /tmp/navdp_output_backend_benchmark \
@@ -92,6 +94,11 @@ python3 scripts/render/benchmark_output_backends.py \
 By default, `STRICT_GPU_BACKENDS=1` is set for child renderer processes so NVENC
 does not silently fall back to CPU. The `gpu` backend requires `PyNvVideoCodec`;
 if it is missing, that run fails and the report keeps the failure log.
+
+On the 5880 host, pass the conda env FFmpeg via `--ffmpeg-bin`; imageio's
+bundled FFmpeg may not include `h264_nvenc`. Avoid `--video-nvenc-preset p4`
+when comparing the `gpu` backend on that host because PyNvVideoCodec may reject
+that preset even when FFmpeg NVENC accepts it.
 
 ## Reading Results
 
