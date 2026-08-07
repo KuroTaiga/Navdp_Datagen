@@ -1,4 +1,6 @@
 out/
+.DS_Store
+benchmark_outputs/
 .pytest_cache/
 .matplotlib-cache/
 __pycache__/
