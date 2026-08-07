@@ -27,17 +27,17 @@ _STRICT_GPU_BACKENDS = os.getenv("STRICT_GPU_BACKENDS", "").lower() in (
     "yes",
     "on",
 )
-_GPU_VIDEO_SYNC_MODE = os.getenv("GPU_VIDEO_SYNC", "").lower()
+_GPU_VIDEO_SYNC_MODE = (os.getenv("GPU_VIDEO_SYNC", "both") or "both").lower()
 _GPU_VIDEO_SYNC_BEFORE = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "before", "both")
 _GPU_VIDEO_SYNC_AFTER = _GPU_VIDEO_SYNC_MODE in ("1", "true", "yes", "on", "after", "both")
-_GPU_VIDEO_RETAIN_FRAMES = int(os.getenv("GPU_VIDEO_RETAIN_FRAMES", "0") or 0)
-_GPU_VIDEO_DISABLE_BFRAMES = os.getenv("GPU_VIDEO_DISABLE_BFRAMES", "").lower() in (
+_GPU_VIDEO_RETAIN_FRAMES = int(os.getenv("GPU_VIDEO_RETAIN_FRAMES", "8") or 0)
+_GPU_VIDEO_DISABLE_BFRAMES = os.getenv("GPU_VIDEO_DISABLE_BFRAMES", "1").lower() in (
     "1",
     "true",
     "yes",
     "on",
 )
-_GPU_VIDEO_CLONE = os.getenv("GPU_VIDEO_CLONE", "").lower() in (
+_GPU_VIDEO_CLONE = os.getenv("GPU_VIDEO_CLONE", "1").lower() in (
     "1",
     "true",
     "yes",
