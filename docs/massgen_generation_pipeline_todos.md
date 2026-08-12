@@ -241,9 +241,11 @@ Remaining:
 - [x] Document the safe 5880-host workflow in
   `docs/output_backend_benchmark.md`, including dirty-tree inspection before
   branch switching.
-- [ ] Run the benchmark on the 5880 host and compare `nvenc`, `cpu`, and `gpu`
+- [ ] Run the output-backend benchmark on the 5880 host and compare `nvenc`, `cpu`, and `gpu`
   backends for video-only, video+RGB, video+depth, RGB-only, and depth-only
   output modes.
+- [x] Run the human-only actor baseline/optimized benchmark on 5880 for
+  `deliver_to_human` at commit `25f647d`.
 - [ ] Use the report to decide whether the next optimization target is
   video/photo output, human PLY transform/merge, or Gaussian rendering.
 
@@ -303,23 +305,23 @@ Local macOS:
 
 Server/platform:
 
-- [ ] One `deliver_to_human` render job with visible target human.
-- [ ] One human-only actor baseline/optimized benchmark report on 5880 using
+- [x] One `deliver_to_human` render job with visible target human.
+- [x] One human-only actor baseline/optimized benchmark report on 5880 using
   `scripts/massgen/benchmark_simple_actor_render.py`.
-- [ ] One `serve_queue` render job with queue actors.
+- [x] One `serve_queue` render job with queue actors.
+- [x] One `dense_dynamic_humans` render job with moving human actors.
 - [ ] One `dense_multi_robot` render with at least two robot viewpoints.
 - [ ] One `dense_dynamic_combined` render with humans plus peer robots.
 - [ ] One output-backend benchmark run on the 5880 host with report and MP4s
   saved under the chosen benchmark output root.
-- [ ] Confirm logs show `gsplat` backend selection.
+- [x] Confirm logs show `gsplat` backend selection.
 - [ ] Confirm no off-camera human PLYs are merged when culling is enabled.
 
 ## Next Implementation Step
 
-Run 5880 smoke renders for `deliver_to_human`, a multi-human `serve_queue`, and
-a moving-human/dense-human job, then capture the paired baseline/optimized
-actor-bundle benchmark. After visual validation, optimize the multi-target
-hot path using the benchmark stage totals.
+Use the downloaded 5880 MP4s and actor/camera metadata for visual review, then
+decide whether the next implementation pass should connect peer-robot GLB
+composition or run the broader output-backend benchmark matrix.
 
 Fresh-context handoff for that work:
 

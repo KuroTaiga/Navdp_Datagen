@@ -226,14 +226,14 @@ git ls-files --others --exclude-standard
 
 | Step | Family | Status | Local Evidence | 5880 Evidence | Downloaded Artifacts | Cleanup |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `deliver_to_human` | Local human-only path ready | Actor-bundle materialization added. Planned command passes `--actor-plan-json`, visibility culling, actor metadata, and `GAUSSIAN_RENDER_BACKEND=gsplat`. Local tests pass. | Not run after actor-bundle work. | None yet. | None yet. |
-| 2 | `serve_queue` | Local human-only path ready | One-human and multi-human queue manifests use actor bundles with `queue_wait`; per-frame actor metadata records visible/culled/rendered actors. | Not run. | None. | None. |
+| 1 | `deliver_to_human` | 5880 smoke passed | Actor-bundle materialization added. Planned command passes `--actor-plan-json`, visibility culling, actor metadata, and `GAUSSIAN_RENDER_BACKEND=gsplat`. Local tests pass. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_rendered_frames=3`, MP4 written. Initial `nvenc` attempt failed because imageio ffmpeg lacks `h264_nvenc`. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/deliver_smoke_001/` plus logs. | Remote smoke root removed after download. |
+| 2 | `serve_queue` | 5880 smoke passed | One-human and multi-human queue manifests use actor bundles with `queue_wait`; per-frame actor metadata records visible/culled/rendered actors. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_count=2`, `actor_rendered_frames=6`, MP4 written. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/serve_queue_smoke_001/` plus logs. | Remote smoke root removed after download. |
 | 3 | `human_guided_uncertain_region` | Local human-only path ready | Informant + one robot is covered by actor-bundle tests with `wave` action selection. | Not run. | None. | None. |
 | 4 | `navigate_with_social_constraints:personal_space` | Local human-only path ready | One human + one robot is covered by social-law family selection and actor-bundle tests. | Not run. | None. | None. |
 | 5 | `navigate_with_social_constraints:queue_order` | Local human-only path ready | One-human and multi-human queue-order manifests use actor bundles with `queue_wait`. | Not run. | None. | None. |
 | 6 | `navigate_with_social_constraints:group_integrity` | Local human-only path ready | One-human group-integrity social-law selection maps to `stand`; multi-human grouping can use the same actor-bundle renderer if assets are present. | Not run. | None. | None. |
 | 7 | `navigate_with_social_constraints:pedestrian_yield` | Local human-only path ready | One moving human + one robot is covered by actor-plan interpolation tests with `walk` action selection. | Not run. | None. | None. |
-| 8 | `dense_dynamic_humans` | Local human-only path ready | One-human and multi-human moving-human manifests use actor bundles; culling counters are emitted per actor/frame. | Not run. | None. | None. |
+| 8 | `dense_dynamic_humans` | 5880 smoke passed | One-human and multi-human moving-human manifests use actor bundles; culling counters are emitted per actor/frame. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_count=2`, `actor_rendered_frames=6`, MP4 written. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/dense_humans_smoke_001/` plus logs. | Remote smoke root removed after download. |
 | 9 | `dense_dynamic_avoidance` | Local one-robot/human-only path ready | One-robot moving-human jobs use actor bundles; jobs with peer robots still block on GLB overlay integration. | Not run. | None. | None. |
 | 10 | `dense_multi_robot` | Not started | Requires peer-robot GLB overlay integration. | Not run. | None. | None. |
 | 11 | `dense_dynamic_combined` | Not started | Requires moving humans plus peer robots. | Not run. | None. | None. |
@@ -264,9 +264,9 @@ git ls-files --others --exclude-standard
   `tests/inputs/massgen_generated/deliver_to_human/`.
 - [ ] Ensure strict preflight blocks missing target-human action assets before GPU
   work starts.
-- [ ] Run one 5880 smoke render where the target human is visible.
-- [ ] Download the smoke MP4 and metrics for visual review.
-- [ ] Clean local and 5880 smoke artifacts after review.
+- [x] Run one 5880 smoke render where the target human is visible.
+- [x] Download the smoke MP4 and metrics for visual review.
+- [x] Clean 5880 smoke artifacts after download.
 
 ## Human-Only Actor-Bundle Boundary
 
@@ -314,3 +314,19 @@ same selected job and writes `simple_actor_benchmark_summary.json` plus
 `simple_actor_benchmark_report.md`. Compare wall time and actor stages
 (`actor_transform_sec`, `actor_tensor_pack_sec`, `actor_merge_update_sec`, and
 `actor_gpu_cache_upload_sec`) before changing the multi-target renderer.
+
+Commit `25f647d` remote benchmark evidence:
+
+- Remote focused tests passed on 5880:
+  `tests/test_gpu_actor_sequence.py`,
+  `tests/test_massgen_render_executor.py`,
+  `tests/test_massgen_render_run_config.py`, and
+  `tests/test_massgen_render_manifest.py` (`25 passed`).
+- `deliver_smoke_001` actor benchmark used CPU video backend because the bundled
+  imageio ffmpeg binary does not expose `h264_nvenc`.
+- `baseline_cpu_actor`: OK, 3 frames, wall `3.410s`, actor stages `0.224s`.
+- `optimized_gpu_actor_cache`: OK, 3 frames, wall `3.193s`, actor stages
+  `0.221s`; it removed per-frame tensor packing and paid a one-time `0.138s`
+  GPU cache upload.
+- Downloaded report:
+  `out/massgen_5880_smoke/25f647d/benchmark_25f647d_cpu/deliver_smoke_001/simple_actor_benchmark_report.md`.

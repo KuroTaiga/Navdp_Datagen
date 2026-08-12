@@ -150,3 +150,21 @@ Use the actor-stage deltas to decide whether the next multi-target optimization
 should focus on keeping actor frames resident on GPU, reducing per-frame tensor
 packing, or changing how multiple actor slices are merged into the Gaussian
 model.
+
+## 5880 Human-Only Actor Benchmark
+
+Commit `25f647d` was tested on 5880 using the clean worktree
+`/tmp/navdp_datagen_massgen_test`. The imageio ffmpeg binary in the `cuda121`
+environment does not include `h264_nvenc`, so the verified MP4 run used
+`--video-backend cpu` while rendering with `GAUSSIAN_RENDER_BACKEND=gsplat` and
+CUDA.
+
+Results for `deliver_smoke_001` with `--minimal-frames 3`:
+
+| Variant | OK | Frames | Wall sec | Actor stages sec |
+| --- | --- | --- | --- | --- |
+| `baseline_cpu_actor` | yes | 3 | 3.410 | 0.224 |
+| `optimized_gpu_actor_cache` | yes | 3 | 3.193 | 0.221 |
+
+Artifacts downloaded to
+`out/massgen_5880_smoke/25f647d/benchmark_25f647d_cpu/deliver_smoke_001/`.
