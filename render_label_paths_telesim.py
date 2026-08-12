@@ -782,6 +782,7 @@ class ActorMotionPlan:
     actor_height_m: float | None = None
     actor_fps: float | None = None
     loop: bool | None = None
+    action: dict | None = None
 
 
 def load_actor_motion_plan(path: Path) -> ActorMotionPlan:
@@ -833,6 +834,7 @@ def _actor_motion_plan_from_payload(
         actor_height_m=float(actor_height_m) if actor_height_m is not None else None,
         actor_fps=float(actor_fps) if actor_fps is not None else None,
         loop=bool(loop) if loop is not None else None,
+        action=dict(payload.get("action") or {}) if isinstance(payload.get("action"), Mapping) else None,
     )
 
 
@@ -851,9 +853,9 @@ def build_actor_motion_plan_transforms(
     frame_count: int,
     floor_z: float,
     actor_runtime: ActorRuntime,
-) -> tuple[list[np.ndarray], list[int]]:
+) -> tuple[list[np.ndarray], list[int], list[bool]]:
     if frame_count <= 0:
-        return [], []
+        return [], [], []
     if not plan.frames:
         raise ValueError("Actor motion plan has no usable frames.")
 
@@ -864,6 +866,7 @@ def build_actor_motion_plan_transforms(
     num_actor_frames = len(actor_runtime.sequence.frames)
     transforms: list[np.ndarray] = []
     actor_indices: list[int] = []
+    active_flags: list[bool] = []
 
     for frame_idx in range(frame_count):
         raw_frame = plan.frames[min(frame_idx, len(plan.frames) - 1)]
@@ -890,9 +893,10 @@ def build_actor_motion_plan_transforms(
         else:
             anim_idx = min(int(anim_cursor), max(0, num_actor_frames - 1))
         actor_indices.append(anim_idx)
+        active_flags.append(bool(raw_frame.get("active", True)))
         anim_cursor += anim_step
 
-    return transforms, actor_indices
+    return transforms, actor_indices, active_flags
 
 
 def _render_custom_gaussians(
@@ -1495,8 +1499,12 @@ def render_label_with_actor_plans(
     if args.minimal_frames is not None and args.minimal_frames > 0:
         poses = poses[: args.minimal_frames]
         actor_tracks = [
-            (transforms[: args.minimal_frames], indices[: args.minimal_frames])
-            for transforms, indices in actor_tracks
+            (
+                transforms[: args.minimal_frames],
+                indices[: args.minimal_frames],
+                active_flags[: args.minimal_frames],
+            )
+            for transforms, indices, active_flags in actor_tracks
         ]
 
     scene_dir = output_dir / args.scene
@@ -1556,12 +1564,30 @@ def render_label_with_actor_plans(
             visible_actor_frames: list[ActorRenderFrame] = []
             frame_actor_metadata: list[dict] = []
             camera_for_cull = None
-            for render_runtime, (actor_transforms, actor_indices) in zip(actor_render_runtimes, actor_tracks):
+            for render_runtime, (actor_transforms, actor_indices, actor_active_flags) in zip(
+                actor_render_runtimes,
+                actor_tracks,
+            ):
                 if idx >= len(actor_transforms) or idx >= len(actor_indices):
                     continue
                 transform = actor_transforms[idx]
                 actor_idx = actor_indices[idx]
+                actor_active = bool(actor_active_flags[idx]) if idx < len(actor_active_flags) else True
+                plan_action = render_runtime.plan.action or {}
                 actor_visible = True
+                if not actor_active:
+                    frame_actor_metadata.append(
+                        {
+                            "actor_id": render_runtime.plan.actor_id,
+                            "candidate": False,
+                            "active": False,
+                            "visible": False,
+                            "rendered": False,
+                            "animation_frame_index": int(actor_idx),
+                            "action": plan_action or None,
+                        }
+                    )
+                    continue
                 actor_candidate_frames += 1
                 if actor_cull_enabled:
                     if camera_for_cull is None:
@@ -1602,9 +1628,11 @@ def render_label_with_actor_plans(
                     {
                         "actor_id": render_runtime.plan.actor_id,
                         "candidate": True,
+                        "active": True,
                         "visible": bool(actor_visible),
                         "rendered": bool(actor_visible),
                         "animation_frame_index": int(actor_idx),
+                        "action": plan_action or None,
                     }
                 )
 
@@ -1836,7 +1864,7 @@ def render_label_with_actor(
             look_down=args.look_down,
             stabilize=args.stabilize,
         )
-        actor_transforms, actor_indices = build_actor_motion_plan_transforms(
+        actor_transforms, actor_indices, actor_active_flags = build_actor_motion_plan_transforms(
             actor_motion_plan,
             frame_count=len(poses),
             floor_z=prepared.floor_z,
@@ -1854,11 +1882,13 @@ def render_label_with_actor(
             stabilize=args.stabilize,
             actor_runtime=actor_runtime,
         )
+        actor_active_flags = [True] * len(actor_indices)
 
     if args.minimal_frames is not None and args.minimal_frames > 0:
         poses = poses[: args.minimal_frames]
         actor_transforms = actor_transforms[: args.minimal_frames]
         actor_indices = actor_indices[: args.minimal_frames]
+        actor_active_flags = actor_active_flags[: args.minimal_frames]
 
     scene_dir = output_dir / args.scene
     _safe_mkdir(scene_dir)
@@ -1920,29 +1950,47 @@ def render_label_with_actor(
         ):
             render_gaussians = base_gaussians
             actor_visible = True
-            actor_candidate_frames += 1
+            actor_active = bool(actor_active_flags[idx]) if idx < len(actor_active_flags) else True
+            frame_actor_meta = {
+                "actor_id": actor_id or None,
+                "candidate": bool(actor_active),
+                "active": bool(actor_active),
+                "visible": False,
+                "rendered": False,
+                "animation_frame_index": int(actor_idx),
+                "action": actor_motion_plan.action if actor_motion_plan is not None else None,
+            }
+            if not actor_active:
+                combined_actor_size = None
+            else:
+                actor_candidate_frames += 1
             if actor_cull_enabled:
-                with _measure_stage(stage_seconds, "actor_visibility_sec"):
-                    camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
-                    sphere = transformed_actor_sphere(
-                        transform,
-                        radius_xy_m=actor_runtime.sequence.radius_xy,
-                        height_m=actor_runtime.sequence.height,
-                        margin_m=actor_cull_margin_m,
-                    )
-                    visibility = sphere_visible_in_camera(
-                        center_world=sphere.center_world,
-                        radius_m=sphere.radius_m,
-                        world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
-                        fov_x_rad=float(camera_for_cull.FoVx),
-                        fov_y_rad=float(camera_for_cull.FoVy),
-                        znear=float(camera_for_cull.znear),
-                        zfar=float(camera_for_cull.zfar),
-                        matrix_is_transposed=True,
-                    )
-                actor_visible = bool(visibility.visible)
-                if not actor_visible:
-                    actor_culled_frames += 1
+                if not actor_active:
+                    actor_visible = False
+                else:
+                    with _measure_stage(stage_seconds, "actor_visibility_sec"):
+                        camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+                        sphere = transformed_actor_sphere(
+                            transform,
+                            radius_xy_m=actor_runtime.sequence.radius_xy,
+                            height_m=actor_runtime.sequence.height,
+                            margin_m=actor_cull_margin_m,
+                        )
+                        visibility = sphere_visible_in_camera(
+                            center_world=sphere.center_world,
+                            radius_m=sphere.radius_m,
+                            world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
+                            fov_x_rad=float(camera_for_cull.FoVx),
+                            fov_y_rad=float(camera_for_cull.FoVy),
+                            znear=float(camera_for_cull.znear),
+                            zfar=float(camera_for_cull.zfar),
+                            matrix_is_transposed=True,
+                        )
+                    actor_visible = bool(visibility.visible)
+                    if not actor_visible:
+                        actor_culled_frames += 1
+            elif not actor_active:
+                actor_visible = False
             if actor_visible:
                 actor_visible_frames += 1
                 if gpu_actor_sequence is not None:
@@ -1977,20 +2025,14 @@ def render_label_with_actor(
                         combined_model.update_actor(actor_render)
                 render_gaussians = combined_model
                 actor_rendered_frames += 1
+                frame_actor_meta["visible"] = True
+                frame_actor_meta["rendered"] = True
             else:
                 combined_actor_size = None
             actor_frame_metadata.append(
                 {
                     "frame": int(idx),
-                    "actors": [
-                        {
-                            "actor_id": actor_id or None,
-                            "candidate": True,
-                            "visible": bool(actor_visible),
-                            "rendered": bool(actor_visible),
-                            "animation_frame_index": int(actor_idx),
-                        }
-                    ],
+                    "actors": [frame_actor_meta],
                 }
             )
 

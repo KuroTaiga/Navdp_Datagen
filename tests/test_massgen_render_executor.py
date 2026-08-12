@@ -450,6 +450,54 @@ def test_executor_supports_multi_human_human_only_bundle(tmp_path) -> None:
         assert all(len(actor["frames"]) == 3 for actor in actor_payload["actors"])
 
 
+def test_executor_supports_multi_sequence_same_human_bundle(tmp_path) -> None:
+    manifest, scenario_json, output_root = _prepared_manifest(
+        tmp_path,
+        scenario_id="guided_multi_action_easy_001",
+        mission_type="human_guided_uncertain_region",
+        human_role="informant",
+        human_tags=["informant", "guidance"],
+        behavior_label="wave",
+    )
+    human = manifest["actors"]["humans"][0]
+    first_segment = json.loads(json.dumps(human["action_segments"][0]))
+    second_segment = json.loads(json.dumps(human["action_segments"][0]))
+    first_segment["render_action_id"] = "stand"
+    first_segment["action_sequence_id"] = "human_target_stand_000"
+    first_segment["start_time_s"] = 0.0
+    first_segment["end_time_s"] = 1.0
+    first_segment["asset"]["ply_frame_dir"] = str(tmp_path / "actions" / "stand" / "ply_frames")
+    second_segment["render_action_id"] = "wave"
+    second_segment["action_sequence_id"] = "human_target_wave_001"
+    second_segment["start_time_s"] = 1.0
+    second_segment["end_time_s"] = 2.0
+    second_segment["asset"]["ply_frame_dir"] = str(tmp_path / "actions" / "wave" / "ply_frames")
+    human["action_segments"] = [first_segment, second_segment]
+
+    plan = build_render_plans(
+        manifest,
+        manifest_path=scenario_json,
+        output_root=output_root,
+        families=["human_guided_uncertain_region"],
+        write_inputs=True,
+        python_bin=sys.executable,
+    )
+
+    assert plan["status"] == "ready"
+    job_plan = plan["plans"][0]
+    assert job_plan["status"] == "ready"
+    actor_payload = json.loads(Path(job_plan["actor_plan_path"]).read_text(encoding="utf-8"))
+    assert actor_payload["schema_version"] == "massgen_actor_bundle.v1"
+    assert len(actor_payload["actors"]) == 2
+    assert {actor["actor_id"] for actor in actor_payload["actors"]} == {"human_target"}
+    assert {actor["action"]["render_action_id"] for actor in actor_payload["actors"]} == {"stand", "wave"}
+    stand = next(actor for actor in actor_payload["actors"] if actor["action"]["render_action_id"] == "stand")
+    wave = next(actor for actor in actor_payload["actors"] if actor["action"]["render_action_id"] == "wave")
+    assert [frame["active"] for frame in stand["frames"]] == [True, True, False]
+    assert [frame["active"] for frame in wave["frames"]] == [False, True, True]
+    assert "uses 2 renderer action segments" in "\n".join(job_plan["warnings"])
+
+
 def test_executor_blocks_peer_robot_jobs_until_robot_overlay_is_connected(tmp_path) -> None:
     manifest, scenario_json, output_root = _prepared_manifest(tmp_path)
     manifest["jobs"][0]["peer_robot_ids"] = ["robot_beta"]

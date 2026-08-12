@@ -624,7 +624,7 @@ def _human_actor_plan_bundle(
         if human is None:
             blockers.append(f"job references unknown human actor {human_id}")
             continue
-        actor_payload, actor_blockers, actor_warnings = _human_actor_plan(
+        actor_payloads, actor_blockers, actor_warnings = _human_actor_plans(
             manifest,
             job,
             human,
@@ -634,8 +634,7 @@ def _human_actor_plan_bundle(
         )
         blockers.extend(actor_blockers)
         warnings.extend(actor_warnings)
-        if actor_payload is not None:
-            actor_plans.append(actor_payload)
+        actor_plans.extend(actor_payloads)
 
     if blockers:
         return None, None, blockers, warnings
@@ -652,7 +651,7 @@ def _human_actor_plan_bundle(
     return payload, actor_plan_path, blockers, warnings
 
 
-def _human_actor_plan(
+def _human_actor_plans(
     manifest: Mapping[str, Any],
     job: Mapping[str, Any],
     human: Mapping[str, Any],
@@ -660,7 +659,7 @@ def _human_actor_plan(
     *,
     base_dir: Path,
     camera_times: Sequence[float],
-) -> tuple[JsonDict | None, list[str], list[str]]:
+) -> tuple[list[JsonDict], list[str], list[str]]:
     blockers: list[str] = []
     warnings: list[str] = []
     segments = [
@@ -669,12 +668,20 @@ def _human_actor_plan(
         if isinstance(segment, Mapping)
     ]
     if not segments:
-        return None, [f"human {human_id} has no action segments"], warnings
+        return [], [f"human {human_id} has no action segments"], warnings
 
-    sequence_dirs: list[Path] = []
-    segment_loop = True
-    segment_fps = float(manifest.get("timing", {}).get("fps", 10.0) or 10.0)
-    selected_segment: Mapping[str, Any] | None = None
+    human_frames = _sample_human_motion_frames(human, camera_times)
+    if not human_frames:
+        return [], [f"human {human_id} has no usable trajectory or start_pose"], warnings
+
+    bounds = human.get("visibility_bounds", {})
+    actor_height_m = 1.7
+    if isinstance(bounds, Mapping) and bounds.get("height_m") is not None:
+        actor_height_m = float(bounds.get("height_m") or actor_height_m)
+
+    actor_plans: list[JsonDict] = []
+    manifest_fps = float(manifest.get("timing", {}).get("fps", 10.0) or 10.0)
+    usable_segment_count = 0
     for index, segment in enumerate(segments):
         asset = segment.get("asset", {})
         if not isinstance(asset, Mapping):
@@ -689,56 +696,53 @@ def _human_actor_plan(
             blockers.append(f"human {human_id} action segment {index} has no ply_frame_dir")
             continue
         sequence_dir = _resolve_path(ply_frame_dir, base_dir=base_dir)
-        sequence_dirs.append(sequence_dir)
-        if selected_segment is None:
-            selected_segment = segment
-            segment_loop = bool(asset.get("loop", True))
-            if asset.get("fps") is not None:
-                segment_fps = float(asset.get("fps") or segment_fps)
-
-    unique_sequence_dirs = {str(path) for path in sequence_dirs}
-    if len(unique_sequence_dirs) > 1:
-        blockers.append(
-            f"human {human_id} uses multiple action PLY sequences; multi-action rendering is not connected yet"
+        if not sequence_dir.is_dir():
+            blockers.append(f"human {human_id} action PLY directory does not exist: {sequence_dir}")
+            continue
+        usable_segment_count += 1
+        segment_fps = manifest_fps
+        if asset.get("fps") is not None:
+            segment_fps = float(asset.get("fps") or segment_fps)
+        start_time_s = _optional_float(segment.get("start_time_s"))
+        end_time_s = _optional_float(segment.get("end_time_s"))
+        segment_frames = _frames_with_segment_activity(
+            human_frames,
+            start_time_s=start_time_s,
+            end_time_s=end_time_s,
+            is_only_segment=len(segments) == 1,
         )
-    sequence_dir = sequence_dirs[0] if sequence_dirs else None
-    if sequence_dir is not None and not sequence_dir.is_dir():
-        blockers.append(f"human {human_id} action PLY directory does not exist: {sequence_dir}")
+        payload: JsonDict = {
+            "schema_version": "massgen_actor_plan.v1",
+            "actor_id": human_id,
+            "track_id": f"{human_id}__segment_{index:03d}",
+            "job_id": str(job.get("job_id") or ""),
+            "scene_id": str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
+            "sequence_dir": str(sequence_dir),
+            "actor_height_m": actor_height_m,
+            "actor_fps": segment_fps,
+            "loop": bool(asset.get("loop", True)),
+            "z_mode": "floor",
+            "yaw_offset_rad": 0.0,
+            "source": "massgen_render_executor",
+            "action": {
+                "render_action_id": segment.get("render_action_id"),
+                "action_sequence_id": segment.get("action_sequence_id"),
+                "start_time_s": segment.get("start_time_s"),
+                "end_time_s": segment.get("end_time_s"),
+            },
+            "frames": segment_frames,
+        }
+        actor_plans.append(payload)
+
     if blockers:
-        return None, blockers, warnings
-    if selected_segment is None or sequence_dir is None:
-        return None, [f"human {human_id} has no renderer-ready action segment"], warnings
-
-    human_frames = _sample_human_motion_frames(human, camera_times)
-    if not human_frames:
-        return None, [f"human {human_id} has no usable trajectory or start_pose"], warnings
-
-    bounds = human.get("visibility_bounds", {})
-    actor_height_m = 1.7
-    if isinstance(bounds, Mapping) and bounds.get("height_m") is not None:
-        actor_height_m = float(bounds.get("height_m") or actor_height_m)
-
-    payload: JsonDict = {
-        "schema_version": "massgen_actor_plan.v1",
-        "actor_id": human_id,
-        "job_id": str(job.get("job_id") or ""),
-        "scene_id": str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
-        "sequence_dir": str(sequence_dir),
-        "actor_height_m": actor_height_m,
-        "actor_fps": segment_fps,
-        "loop": segment_loop,
-        "z_mode": "floor",
-        "yaw_offset_rad": 0.0,
-        "source": "massgen_render_executor",
-        "action": {
-            "render_action_id": selected_segment.get("render_action_id"),
-            "action_sequence_id": selected_segment.get("action_sequence_id"),
-            "start_time_s": selected_segment.get("start_time_s"),
-            "end_time_s": selected_segment.get("end_time_s"),
-        },
-        "frames": human_frames,
-    }
-    return payload, blockers, warnings
+        return [], blockers, warnings
+    if usable_segment_count == 0 or not actor_plans:
+        return [], [f"human {human_id} has no renderer-ready action segment"], warnings
+    if usable_segment_count > 1:
+        warnings.append(
+            f"human {human_id} uses {usable_segment_count} renderer action segments; inactive frames are skipped"
+        )
+    return actor_plans, blockers, warnings
 
 
 def _trajectory_times(trajectory: Any) -> list[float]:
@@ -767,6 +771,36 @@ def _sample_human_motion_frames(human: Mapping[str, Any], times: Sequence[float]
         for index, time_s in enumerate(times)
         for position, yaw_rad in [_interpolate_human_motion(samples, float(time_s))]
     ]
+
+
+def _frames_with_segment_activity(
+    frames: Sequence[Mapping[str, Any]],
+    *,
+    start_time_s: float | None,
+    end_time_s: float | None,
+    is_only_segment: bool,
+) -> list[JsonDict]:
+    tagged: list[JsonDict] = []
+    for frame in frames:
+        item = dict(frame)
+        if is_only_segment:
+            item["active"] = True
+        else:
+            time_s = float(item.get("time_s", item.get("frame", 0.0)) or 0.0)
+            if start_time_s is not None and time_s < start_time_s:
+                item["active"] = False
+            elif end_time_s is not None and time_s > end_time_s:
+                item["active"] = False
+            else:
+                item["active"] = True
+        tagged.append(item)
+    return tagged
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    return float(value)
 
 
 def _human_motion_samples(human: Mapping[str, Any]) -> list[tuple[float, tuple[float, float, float], float]]:
