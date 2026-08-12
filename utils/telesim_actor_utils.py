@@ -15,6 +15,7 @@ from scene import GaussianModel
 from utils import gaussian_ply_utils as ply_utils
 from utils.general_utils import inverse_sigmoid
 from utils.render_utils import world_to_pixel
+from utils.sh_utils import RGB2SH
 
 EPS = 1e-6
 DEFAULT_VIDEO_FPS = 10
@@ -301,10 +302,7 @@ def load_actor_sequence(
         key=lambda name: int(name.split("_")[-1]),
     )
     rest_dim = len(feature_rest_names) // 3 if feature_rest_names else 0
-    scale_names = sorted(
-        [name for name in dtype_names if name.startswith("scale")],
-        key=lambda name: int(name.split("_")[-1]) if "_" in name else 0,
-    )
+    scale_names = list(ply_utils._find_scale_columns(first_ply.columns))
     rot_names = sorted(
         [name for name in dtype_names if name.startswith("rot_")],
         key=lambda name: int(name.split("_")[-1]),
@@ -347,11 +345,7 @@ def actor_data_to_tensors(
     xyz_np = np.stack((data["x"], data["y"], data["z"]), axis=1).astype(np.float32)
     xyz = torch.from_numpy(xyz_np).to(device)
 
-    dc_names = [f"f_dc_0", f"f_dc_1", f"f_dc_2"]
-    if not all(name in data.dtype.names for name in dc_names):
-        missing = [name for name in dc_names if name not in data.dtype.names]
-        raise KeyError(f"Actor PLY missing DC SH coefficients: {missing}")
-    features_dc_np = np.stack([data[name] for name in dc_names], axis=1).astype(np.float32)
+    features_dc_np = _actor_features_dc_np(data)
     features_dc = torch.from_numpy(features_dc_np[:, :, None]).to(device).transpose(1, 2).contiguous()
 
     source_rest_dim = sequence.rest_dim if sequence.rest_dim > 0 else 0
@@ -401,10 +395,14 @@ def actor_data_to_tensors(
         scales_np = np.zeros((data.shape[0], 0), dtype=np.float32)
     scaling = torch.from_numpy(scales_np).to(device)
 
-    rotation_np = np.stack(
-        [data[name] for name in sequence.rot_names],
-        axis=1,
-    ).astype(np.float32)
+    if sequence.rot_names:
+        rotation_np = np.stack(
+            [data[name] for name in sequence.rot_names],
+            axis=1,
+        ).astype(np.float32)
+    else:
+        rotation_np = np.zeros((data.shape[0], 4), dtype=np.float32)
+        rotation_np[:, 0] = 1.0
     rotation = torch.from_numpy(rotation_np).to(device)
 
     return ActorRenderFrame(
@@ -415,6 +413,23 @@ def actor_data_to_tensors(
         scaling=scaling.contiguous(),
         rotation=rotation.contiguous(),
     )
+
+
+def _actor_features_dc_np(data: np.ndarray) -> np.ndarray:
+    dc_names = [f"f_dc_{idx}" for idx in range(3)]
+    dtype_names = data.dtype.names or ()
+    if all(name in dtype_names for name in dc_names):
+        return np.stack([data[name] for name in dc_names], axis=1).astype(np.float32)
+    rgb_names = ["r", "g", "b"]
+    if all(name in dtype_names for name in rgb_names):
+        rgb = np.stack([data[name] for name in rgb_names], axis=1).astype(np.float32)
+        if np.nanmax(rgb) > 1.5:
+            rgb = rgb / 255.0
+        rgb = np.nan_to_num(rgb, nan=0.5, posinf=1.0, neginf=0.0)
+        rgb = np.clip(rgb, 0.0, 1.0)
+        return RGB2SH(rgb).astype(np.float32)
+    missing = [name for name in dc_names if name not in dtype_names]
+    raise KeyError(f"Actor PLY missing DC SH coefficients or RGB color columns: {missing}")
 
 
 def _tensor_bytes(tensor: torch.Tensor) -> int:

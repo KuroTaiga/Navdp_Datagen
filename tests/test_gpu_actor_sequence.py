@@ -13,6 +13,7 @@ from utils.telesim_actor_utils import (
     build_gpu_actor_sequence,
     transform_gpu_actor_frame,
 )
+from utils.sh_utils import RGB2SH
 
 
 def _actor_sequence() -> ActorSequence:
@@ -106,3 +107,67 @@ def test_gpu_actor_sequence_memory_cap_is_enforced() -> None:
             target_rest_dim=0,
             memory_cap_mb=0.000001,
         )
+
+
+def test_actor_tensor_pack_accepts_rgb_axis_scale_schema() -> None:
+    dtype = np.dtype(
+        [
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("scale_x", "f4"),
+            ("scale_y", "f4"),
+            ("scale_z", "f4"),
+            ("opacity", "f4"),
+            ("r", "u1"),
+            ("g", "u1"),
+            ("b", "u1"),
+        ]
+    )
+    data = np.zeros(2, dtype=dtype)
+    data["x"] = [0.0, 1.0]
+    data["y"] = [0.5, -0.5]
+    data["z"] = [0.2, 1.2]
+    data["scale_x"] = [-1.0, -2.0]
+    data["scale_y"] = [-1.1, -2.1]
+    data["scale_z"] = [-1.2, -2.2]
+    data["opacity"] = [-3.0, 0.0]
+    data["r"] = [255, 128]
+    data["g"] = [0, 128]
+    data["b"] = [64, 128]
+    sequence = ActorSequence(
+        frames=[ActorSequenceFrame(base_data=data)],
+        height=1.7,
+        hip_height=0.85,
+        radius_xy=0.3,
+        columns={name: idx for idx, name in enumerate(dtype.names or [])},
+        dtype=dtype,
+        feature_rest_names=[],
+        scale_names=["scale_x", "scale_y", "scale_z"],
+        rot_names=[],
+        rest_dim=0,
+        max_sh_degree=0,
+        uniform_scale=False,
+        max_points=2,
+    )
+
+    transformed = apply_transform_to_frame(
+        sequence.frames[0],
+        sequence,
+        build_transform_matrix(
+            np.eye(3, dtype=np.float64) * 2.0,
+            np.array([1.0, 2.0, 3.0], dtype=np.float64),
+        ),
+        backend="cpu",
+    )
+    render = actor_data_to_tensors(transformed, sequence, device=torch.device("cpu"))
+
+    expected_dc = RGB2SH(np.array([[1.0, 0.0, 64.0 / 255.0], [128.0 / 255.0] * 3], dtype=np.float32))
+    torch.testing.assert_close(render.features_dc[:, 0, :], torch.from_numpy(expected_dc))
+    torch.testing.assert_close(render.rotation, torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1))
+    np.testing.assert_allclose(
+        transformed["scale_x"],
+        data["scale_x"] + math.log(2.0),
+        rtol=1e-6,
+        atol=1e-6,
+    )

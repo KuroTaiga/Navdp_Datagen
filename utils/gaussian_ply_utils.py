@@ -169,6 +169,7 @@ def _find_scale_columns(columns: Mapping[str, int]) -> Tuple[str, ...]:
     candidates = [
         ("scale_0", "scale_1", "scale_2"),
         ("scales_0", "scales_1", "scales_2"),
+        ("scale_x", "scale_y", "scale_z"),
     ]
     for triplet in candidates:
         if all(name in columns for name in triplet):
