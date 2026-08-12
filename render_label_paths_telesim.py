@@ -968,13 +968,26 @@ def _serialize_camera(
     frame_size: tuple[int, int],
     fov_y_rad: float,
 ) -> dict:
-    matrices = renderer.camera_matrices(pose)
-    world_view = np.asarray(matrices["world_view"], dtype=np.float64)
-    projection = np.asarray(matrices["full_projection"], dtype=np.float64)
-    camera_to_world = np.linalg.inv(world_view)
-    camera_center = camera_to_world[3][:3].tolist()
     w, h = frame_size
-    fovx = 2.0 * math.atan(math.tan(fov_y_rad * 0.5) * (w / float(h)))
+    if hasattr(renderer, "camera_matrices"):
+        matrices = renderer.camera_matrices(pose)
+        world_view = np.asarray(matrices["world_view"], dtype=np.float64)
+        projection = np.asarray(matrices["full_projection"], dtype=np.float64)
+        znear = float(matrices["intrinsics"]["znear"])
+        zfar = float(matrices["intrinsics"]["zfar"])
+        fovx = 2.0 * math.atan(math.tan(fov_y_rad * 0.5) * (w / float(h)))
+        camera_to_world = np.linalg.inv(world_view)
+        camera_center = camera_to_world[3][:3].tolist()
+    else:
+        camera = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+        world_view = camera.world_view_transform.detach().cpu().numpy().T.astype(np.float64)
+        projection = camera.full_proj_transform.detach().cpu().numpy().astype(np.float64)
+        znear = float(camera.znear)
+        zfar = float(camera.zfar)
+        fovx = float(getattr(camera, "FoVx", 2.0 * math.atan(math.tan(fov_y_rad * 0.5) * (w / float(h)))))
+        fov_y_rad = float(getattr(camera, "FoVy", fov_y_rad))
+        camera_to_world = np.linalg.inv(world_view)
+        camera_center = camera_to_world[:3, 3].tolist()
     fx = w / (2.0 * math.tan(fovx * 0.5))
     fy = h / (2.0 * math.tan(fov_y_rad * 0.5))
 
@@ -987,8 +1000,8 @@ def _serialize_camera(
             "x_deg": math.degrees(float(fovx)),
             "y_deg": math.degrees(float(fov_y_rad)),
         },
-        "znear": float(matrices["intrinsics"]["znear"]),
-        "zfar": float(matrices["intrinsics"]["zfar"]),
+        "znear": znear,
+        "zfar": zfar,
         "intrinsics": {
             "fx": float(fx),
             "fy": float(fy),
