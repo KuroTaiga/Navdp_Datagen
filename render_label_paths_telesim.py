@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Iterable, Mapping, Sequence
 
 import imageio.v2 as imageio
 import numpy as np
@@ -57,12 +57,14 @@ from tele_sim.scene.assets import SceneAsset
 from gaussian_renderer import render as render_gaussians  # type: ignore
 from utils.telesim_actor_utils import (  # type: ignore
     ActorOptions,
+    ActorRenderFrame,
     ActorRuntime,
     CombinedGaussianModel,
     DEFAULT_ACTOR_PATTERN,
     DEFAULT_ACTOR_SPEED,
     DEFAULT_VIDEO_FPS,
     GpuActorSequence,
+    MultiActorCombinedGaussianModel,
     build_gpu_actor_sequence,
     build_path_metadata,
     load_actor_sequence,
@@ -770,6 +772,129 @@ def build_actor_follow_plans(
     return poses, actor_plans, actor_indices
 
 
+@dataclass(frozen=True)
+class ActorMotionPlan:
+    actor_id: str | None
+    sequence_dir: Path | None
+    frames: tuple[dict, ...]
+    z_mode: str
+    yaw_offset_rad: float
+    actor_height_m: float | None = None
+    actor_fps: float | None = None
+    loop: bool | None = None
+
+
+def load_actor_motion_plan(path: Path) -> ActorMotionPlan:
+    plans = load_actor_motion_plans(path)
+    if len(plans) != 1:
+        raise ValueError(f"Expected exactly one actor plan in {path}, found {len(plans)}")
+    return plans[0]
+
+
+def load_actor_motion_plans(path: Path) -> tuple[ActorMotionPlan, ...]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Actor plan must be a JSON object: {path}")
+    actors = payload.get("actors")
+    if isinstance(actors, list):
+        plans = [
+            _actor_motion_plan_from_payload(actor, path=path, index=index)
+            for index, actor in enumerate(actors)
+            if isinstance(actor, Mapping)
+        ]
+        if not plans:
+            raise ValueError(f"Actor plan bundle must contain at least one actor object: {path}")
+        return tuple(plans)
+    return (_actor_motion_plan_from_payload(payload, path=path, index=0),)
+
+
+def _actor_motion_plan_from_payload(
+    payload: Mapping,
+    *,
+    path: Path,
+    index: int,
+) -> ActorMotionPlan:
+    frames = payload.get("frames")
+    if not isinstance(frames, list) or not frames:
+        raise ValueError(f"Actor plan {index} must contain a non-empty frames list: {path}")
+    sequence_dir = payload.get("sequence_dir")
+    usable_frames = tuple(dict(frame) for frame in frames if isinstance(frame, Mapping))
+    if not usable_frames:
+        raise ValueError(f"Actor plan {index} has no usable frame objects: {path}")
+    actor_height_m = payload.get("actor_height_m")
+    actor_fps = payload.get("actor_fps")
+    loop = payload.get("loop")
+    return ActorMotionPlan(
+        actor_id=str(payload["actor_id"]) if payload.get("actor_id") else None,
+        sequence_dir=Path(sequence_dir).expanduser() if isinstance(sequence_dir, str) and sequence_dir else None,
+        frames=usable_frames,
+        z_mode=str(payload.get("z_mode") or "floor"),
+        yaw_offset_rad=float(payload.get("yaw_offset_rad", 0.0) or 0.0),
+        actor_height_m=float(actor_height_m) if actor_height_m is not None else None,
+        actor_fps=float(actor_fps) if actor_fps is not None else None,
+        loop=bool(loop) if loop is not None else None,
+    )
+
+
+@dataclass(frozen=True)
+class ActorRenderRuntime:
+    plan: ActorMotionPlan
+    runtime: ActorRuntime
+    gpu_sequence: GpuActorSequence | None = None
+    gpu_error: str | None = None
+    gpu_cache_upload_sec: float = 0.0
+
+
+def build_actor_motion_plan_transforms(
+    plan: ActorMotionPlan,
+    *,
+    frame_count: int,
+    floor_z: float,
+    actor_runtime: ActorRuntime,
+) -> tuple[list[np.ndarray], list[int]]:
+    if frame_count <= 0:
+        return [], []
+    if not plan.frames:
+        raise ValueError("Actor motion plan has no usable frames.")
+
+    actor_ground_z = float(floor_z + actor_runtime.options.foot_offset)
+    cycle_mod = max(1, int(getattr(actor_runtime.options, "animation_cycle_mod", 1)))
+    anim_step = (actor_runtime.options.fps / float(DEFAULT_VIDEO_FPS)) * cycle_mod
+    anim_cursor = 0.0
+    num_actor_frames = len(actor_runtime.sequence.frames)
+    transforms: list[np.ndarray] = []
+    actor_indices: list[int] = []
+
+    for frame_idx in range(frame_count):
+        raw_frame = plan.frames[min(frame_idx, len(plan.frames) - 1)]
+        raw_position = raw_frame.get("position")
+        if not isinstance(raw_position, Sequence) or len(raw_position) < 2:
+            raise ValueError(f"Actor motion frame {frame_idx} is missing position[x,y].")
+        x = float(raw_position[0])
+        y = float(raw_position[1])
+        if plan.z_mode == "absolute" and len(raw_position) >= 3:
+            z = float(raw_position[2])
+        else:
+            z = actor_ground_z
+        yaw_rad = float(raw_frame.get("yaw_rad", 0.0) or 0.0) + plan.yaw_offset_rad
+        transform = build_transform_matrix(
+            rotation_matrix_z_np(yaw_rad),
+            np.array([x, y, z], dtype=np.float64),
+        )
+        transforms.append(transform)
+
+        if raw_frame.get("animation_frame_index") is not None:
+            anim_idx = int(raw_frame["animation_frame_index"]) % max(1, num_actor_frames)
+        elif actor_runtime.options.loop:
+            anim_idx = int(anim_cursor) % max(1, num_actor_frames)
+        else:
+            anim_idx = min(int(anim_cursor), max(0, num_actor_frames - 1))
+        actor_indices.append(anim_idx)
+        anim_cursor += anim_step
+
+    return transforms, actor_indices
+
+
 def _render_custom_gaussians(
     renderer: GaussianRendererBackend,
     pose: Pose,
@@ -1176,7 +1301,7 @@ def _camera_xy_sequence(
     args: argparse.Namespace,
     actor_runtime: ActorRuntime | None,
 ) -> list[np.ndarray]:
-    if actor_runtime is None:
+    if actor_runtime is None or getattr(args, "actor_motion_plan", None) is not None:
         poses = build_camera_poses(
             prepared.path_xy,
             floor_z=prepared.floor_z,
@@ -1202,19 +1327,140 @@ def _camera_xy_sequence(
     return [pos[:2].copy() for _, pos in poses]
 
 
-def render_label_with_actor(
+def _load_actor_render_runtime(
+    *,
+    plan: ActorMotionPlan,
+    args: argparse.Namespace,
+    renderer: GaussianRendererBackend,
+) -> ActorRenderRuntime:
+    sequence_dir = plan.sequence_dir or args.actor_seq_dir
+    if sequence_dir is None:
+        raise ValueError("--actor-plan-json requires --actor-seq-dir or sequence_dir in every actor plan.")
+    actor_options = ActorOptions(
+        sequence_dir=sequence_dir,
+        pattern=args.actor_pattern,
+        height=float(plan.actor_height_m if plan.actor_height_m is not None else args.actor_height),
+        speed=float(args.actor_speed),
+        fps=float(plan.actor_fps if plan.actor_fps is not None else args.actor_fps),
+        loop=bool(plan.loop if plan.loop is not None else args.actor_loop),
+        foot_offset=float(args.actor_foot_offset),
+        follow_distance=float(args.follow_distance),
+        buffer_distance=float(args.follow_buffer),
+        animation_cycle_mod=int(args.animation_cycle_mod),
+    )
+    _validate_actor_options(actor_options)
+    actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
+    actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
+
+    gpu_actor_sequence: GpuActorSequence | None = None
+    actor_gpu_error: str | None = None
+    actor_gpu_cache_upload_sec = 0.0
+    if bool(getattr(args, "actor_gpu_resident", False)):
+        base_gaussians = renderer._gaussians  # pylint: disable=protected-access
+        base_device = base_gaussians.get_xyz.device
+        actor_label = plan.actor_id or str(sequence_dir)
+        if base_device.type != "cuda":
+            actor_gpu_error = f"scene gaussians are on {base_device}, not CUDA"
+            LOGGER.warning("Actor GPU-resident cache disabled for %s: %s", actor_label, actor_gpu_error)
+        else:
+            cache_mb = float(getattr(args, "actor_gpu_cache_mb", 0.0) or 0.0)
+            memory_cap_mb = cache_mb if cache_mb > 0.0 else None
+            sh_mode = str(getattr(args, "actor_gpu_sh_mode", "copy"))
+            scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
+            start = time.perf_counter()
+            try:
+                gpu_actor_sequence = build_gpu_actor_sequence(
+                    actor_runtime.sequence,
+                    device=base_device,
+                    target_rest_dim=scene_rest_dim,
+                    memory_cap_mb=memory_cap_mb,
+                    sh_mode=sh_mode,
+                )
+                actor_gpu_cache_upload_sec = time.perf_counter() - start
+                LOGGER.info(
+                    "Actor GPU-resident cache enabled: actor=%s frames=%d size=%s sh_mode=%s upload=%.3fs",
+                    actor_label,
+                    gpu_actor_sequence.frame_count,
+                    _format_bytes(gpu_actor_sequence.bytes_allocated),
+                    gpu_actor_sequence.sh_mode,
+                    actor_gpu_cache_upload_sec,
+                )
+            except Exception as exc:  # pylint: disable=broad-except
+                actor_gpu_cache_upload_sec = time.perf_counter() - start
+                actor_gpu_error = str(exc)
+                if _strict_gpu_backends_enabled():
+                    raise RuntimeError(
+                        f"Actor GPU-resident cache failed in strict mode: {actor_gpu_error}"
+                    ) from exc
+                LOGGER.warning(
+                    "Actor GPU-resident cache disabled for %s: %s; falling back to exact CPU/PLY transform path.",
+                    actor_label,
+                    actor_gpu_error,
+                )
+
+    return ActorRenderRuntime(
+        plan=plan,
+        runtime=actor_runtime,
+        gpu_sequence=gpu_actor_sequence,
+        gpu_error=actor_gpu_error,
+        gpu_cache_upload_sec=actor_gpu_cache_upload_sec,
+    )
+
+
+def _validate_actor_options(actor_options: ActorOptions) -> None:
+    if actor_options.fps <= 0.0:
+        raise ValueError("actor_fps must be positive.")
+    if actor_options.speed <= 0.0:
+        raise ValueError("actor_speed must be positive.")
+    if actor_options.buffer_distance > actor_options.follow_distance:
+        raise ValueError("follow_buffer must be <= follow_distance.")
+
+
+def _actor_render_frame(
+    *,
+    render_runtime: ActorRenderRuntime,
+    actor_idx: int,
+    transform: np.ndarray,
+    base_gaussians,
+    scene_rest_dim: int,
+    stage_seconds: dict[str, float],
+) -> ActorRenderFrame:
+    if render_runtime.gpu_sequence is not None:
+        with _measure_stage(stage_seconds, "actor_transform_sec"):
+            return transform_gpu_actor_frame(
+                render_runtime.gpu_sequence,
+                actor_idx,
+                transform,
+            )
+    sequence_frame = render_runtime.runtime.sequence.frames[actor_idx]
+    with _measure_stage(stage_seconds, "actor_transform_sec"):
+        actor_data = apply_transform_to_frame(
+            sequence_frame,
+            render_runtime.runtime.sequence,
+            transform,
+        )
+    with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
+        return actor_data_to_tensors(
+            actor_data,
+            render_runtime.runtime.sequence,
+            device=base_gaussians.get_xyz.device,
+            target_rest_dim=scene_rest_dim,
+        )
+
+
+def render_label_with_actor_plans(
     *,
     renderer: GaussianRendererBackend,
     prepared: PreparedPath,
     output_dir: Path,
     label_id: str,
     args: argparse.Namespace,
-    actor_runtime: ActorRuntime,
-    gpu_actor_sequence: GpuActorSequence | None = None,
-    actor_gpu_error: str | None = None,
-    actor_gpu_cache_upload_sec: float = 0.0,
+    actor_render_runtimes: Sequence[ActorRenderRuntime],
 ) -> dict:
-    poses, actor_transforms, actor_indices = build_actor_follow_plans(
+    if not actor_render_runtimes:
+        raise ValueError("actor_render_runtimes cannot be empty")
+
+    poses = build_camera_poses(
         prepared.path_xy,
         floor_z=prepared.floor_z,
         ceiling=prepared.ceiling,
@@ -1223,13 +1469,22 @@ def render_label_with_actor(
         look_ahead=args.look_ahead,
         look_down=args.look_down,
         stabilize=args.stabilize,
-        actor_runtime=actor_runtime,
     )
-
+    actor_tracks = [
+        build_actor_motion_plan_transforms(
+            render_runtime.plan,
+            frame_count=len(poses),
+            floor_z=prepared.floor_z,
+            actor_runtime=render_runtime.runtime,
+        )
+        for render_runtime in actor_render_runtimes
+    ]
     if args.minimal_frames is not None and args.minimal_frames > 0:
         poses = poses[: args.minimal_frames]
-        actor_transforms = actor_transforms[: args.minimal_frames]
-        actor_indices = actor_indices[: args.minimal_frames]
+        actor_tracks = [
+            (transforms[: args.minimal_frames], indices[: args.minimal_frames])
+            for transforms, indices in actor_tracks
+        ]
 
     scene_dir = output_dir / args.scene
     _safe_mkdir(scene_dir)
@@ -1241,20 +1496,24 @@ def render_label_with_actor(
     frame_prefix = "frame"
 
     stage_seconds = _new_stage_seconds()
-    stage_seconds["actor_gpu_cache_upload_sec"] = max(
-        0.0,
-        float(actor_gpu_cache_upload_sec or 0.0),
+    stage_seconds["actor_gpu_cache_upload_sec"] = sum(
+        max(0.0, float(render_runtime.gpu_cache_upload_sec or 0.0))
+        for render_runtime in actor_render_runtimes
     )
     frames_rendered = 0
     fov_y_rad = math.radians(float(args.fov_deg))
 
     base_gaussians = renderer._gaussians  # pylint: disable=protected-access
     scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
-    combined_model: CombinedGaussianModel | None = None
-    combined_actor_size: int | None = None
+    combined_model: MultiActorCombinedGaussianModel | None = None
+    combined_actor_signature: tuple[int, ...] | None = None
     actor_cull_enabled = bool(getattr(args, "actor_visibility_culling", False))
     actor_cull_margin_m = float(getattr(args, "actor_cull_margin_m", 0.0) or 0.0)
     actor_culled_frames = 0
+    actor_candidate_frames = 0
+    actor_visible_frames = 0
+    actor_rendered_frames = 0
+    actor_frame_metadata: list[dict] = []
     actor_gpu_requested = bool(getattr(args, "actor_gpu_resident", False))
 
     light_config: LightFilterConfig | None = getattr(args, "light_config", None)
@@ -1277,68 +1536,78 @@ def render_label_with_actor(
         )
 
     def _render_frames(writer=None):
-        nonlocal frames_rendered, combined_model, combined_actor_size, actor_culled_frames
-        for idx, ((pose, _), transform, actor_idx) in enumerate(
-            zip(poses, actor_transforms, actor_indices)
-        ):
+        nonlocal frames_rendered, combined_model, combined_actor_signature
+        nonlocal actor_culled_frames, actor_candidate_frames, actor_visible_frames, actor_rendered_frames
+        for idx, (pose, _) in enumerate(poses):
             render_gaussians = base_gaussians
-            actor_visible = True
-            if actor_cull_enabled:
-                with _measure_stage(stage_seconds, "actor_visibility_sec"):
-                    camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
-                    sphere = transformed_actor_sphere(
-                        transform,
-                        radius_xy_m=actor_runtime.sequence.radius_xy,
-                        height_m=actor_runtime.sequence.height,
-                        margin_m=actor_cull_margin_m,
-                    )
-                    visibility = sphere_visible_in_camera(
-                        center_world=sphere.center_world,
-                        radius_m=sphere.radius_m,
-                        world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
-                        fov_x_rad=float(camera_for_cull.FoVx),
-                        fov_y_rad=float(camera_for_cull.FoVy),
-                        znear=float(camera_for_cull.znear),
-                        zfar=float(camera_for_cull.zfar),
-                        matrix_is_transposed=True,
-                    )
-                actor_visible = bool(visibility.visible)
-                if not actor_visible:
-                    actor_culled_frames += 1
-            if actor_visible:
-                if gpu_actor_sequence is not None:
-                    with _measure_stage(stage_seconds, "actor_transform_sec"):
-                        actor_render = transform_gpu_actor_frame(
-                            gpu_actor_sequence,
-                            actor_idx,
+            visible_actor_frames: list[ActorRenderFrame] = []
+            frame_actor_metadata: list[dict] = []
+            camera_for_cull = None
+            for render_runtime, (actor_transforms, actor_indices) in zip(actor_render_runtimes, actor_tracks):
+                if idx >= len(actor_transforms) or idx >= len(actor_indices):
+                    continue
+                transform = actor_transforms[idx]
+                actor_idx = actor_indices[idx]
+                actor_visible = True
+                actor_candidate_frames += 1
+                if actor_cull_enabled:
+                    if camera_for_cull is None:
+                        camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+                    with _measure_stage(stage_seconds, "actor_visibility_sec"):
+                        sphere = transformed_actor_sphere(
                             transform,
+                            radius_xy_m=render_runtime.runtime.sequence.radius_xy,
+                            height_m=render_runtime.runtime.sequence.height,
+                            margin_m=actor_cull_margin_m,
                         )
-                else:
-                    sequence_frame = actor_runtime.sequence.frames[actor_idx]
-                    # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
-                    with _measure_stage(stage_seconds, "actor_transform_sec"):
-                        actor_data = apply_transform_to_frame(
-                            sequence_frame,
-                            actor_runtime.sequence,
-                            transform,
+                        visibility = sphere_visible_in_camera(
+                            center_world=sphere.center_world,
+                            radius_m=sphere.radius_m,
+                            world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
+                            fov_x_rad=float(camera_for_cull.FoVx),
+                            fov_y_rad=float(camera_for_cull.FoVy),
+                            znear=float(camera_for_cull.znear),
+                            zfar=float(camera_for_cull.zfar),
+                            matrix_is_transposed=True,
                         )
-                    with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
-                        actor_render = actor_data_to_tensors(
-                            actor_data,
-                            actor_runtime.sequence,
-                            device=base_gaussians.get_xyz.device,
-                            target_rest_dim=scene_rest_dim,
-                        )
+                    actor_visible = bool(visibility.visible)
+                    if not actor_visible:
+                        actor_culled_frames += 1
+                if actor_visible:
+                    actor_visible_frames += 1
+                    actor_render = _actor_render_frame(
+                        render_runtime=render_runtime,
+                        actor_idx=actor_idx,
+                        transform=transform,
+                        base_gaussians=base_gaussians,
+                        scene_rest_dim=scene_rest_dim,
+                        stage_seconds=stage_seconds,
+                    )
+                    visible_actor_frames.append(actor_render)
+                    actor_rendered_frames += 1
+                frame_actor_metadata.append(
+                    {
+                        "actor_id": render_runtime.plan.actor_id,
+                        "candidate": True,
+                        "visible": bool(actor_visible),
+                        "rendered": bool(actor_visible),
+                        "animation_frame_index": int(actor_idx),
+                    }
+                )
+
+            if visible_actor_frames:
                 with _measure_stage(stage_seconds, "actor_merge_update_sec"):
-                    current_actor_size = int(actor_render.xyz.shape[0])
-                    if combined_model is None or combined_actor_size != current_actor_size:
-                        combined_actor_size = current_actor_size
-                        combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+                    signature = tuple(int(frame.xyz.shape[0]) for frame in visible_actor_frames)
+                    if combined_model is None or combined_actor_signature != signature:
+                        combined_actor_signature = signature
+                        combined_model = MultiActorCombinedGaussianModel(base_gaussians, visible_actor_frames)
                     else:
-                        combined_model.update_actor(actor_render)
+                        combined_model.update_actors(visible_actor_frames)
                 render_gaussians = combined_model
             else:
-                combined_actor_size = None
+                combined_actor_signature = None
+
+            actor_frame_metadata.append({"frame": int(idx), "actors": frame_actor_metadata})
 
             if use_gpu_video:
                 with _measure_stage(stage_seconds, "gaussian_render_sec"):
@@ -1469,6 +1738,403 @@ def render_label_with_actor(
         with _measure_stage(stage_seconds, "camera_metadata_sec"):
             _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
 
+    actor_metadata_path: Path | None = None
+    if bool(getattr(args, "save_actor_metadata", False)):
+        actor_metadata_path = scene_dir / f"{label_id}_actors.json"
+        actor_metadata_path.write_text(
+            json.dumps(
+                {
+                    "scene_id": args.scene,
+                    "label_id": label_id,
+                    "actor_plan_json": (
+                        str(getattr(args, "actor_plan_json"))
+                        if getattr(args, "actor_plan_json", None) is not None
+                        else None
+                    ),
+                    "actor_ids": [
+                        render_runtime.plan.actor_id for render_runtime in actor_render_runtimes
+                    ],
+                    "candidate_frames": actor_candidate_frames,
+                    "visible_frames": actor_visible_frames,
+                    "culled_frames": actor_culled_frames,
+                    "rendered_frames": actor_rendered_frames,
+                    "frames": actor_frame_metadata,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    stage_payload = _finalize_stage_seconds(stage_seconds)
+    duration = stage_payload["measured_total_sec"]
+    gpu_sequences = [item.gpu_sequence for item in actor_render_runtimes if item.gpu_sequence is not None]
+    actor_gpu_errors = {
+        str(item.plan.actor_id or index): item.gpu_error
+        for index, item in enumerate(actor_render_runtimes)
+        if item.gpu_error
+    }
+    return {
+        "scene_id": args.scene,
+        "label_id": label_id,
+        "frames": frames_rendered,
+        "duration_sec": duration,
+        "stage_seconds": stage_payload,
+        "actor_culled_frames": actor_culled_frames,
+        "actor_candidate_frames": actor_candidate_frames,
+        "actor_visible_frames": actor_visible_frames,
+        "actor_rendered_frames": actor_rendered_frames,
+        "actor_metadata_path": str(actor_metadata_path) if actor_metadata_path is not None else None,
+        "actor_count": len(actor_render_runtimes),
+        "actor_ids": [item.plan.actor_id for item in actor_render_runtimes],
+        "actor_gpu_resident_requested": actor_gpu_requested,
+        "actor_gpu_resident": len(gpu_sequences) == len(actor_render_runtimes),
+        "actor_gpu_cache_bytes": sum(item.bytes_allocated for item in gpu_sequences),
+        "actor_gpu_sh_mode": (
+            gpu_sequences[0].sh_mode
+            if gpu_sequences
+            else str(getattr(args, "actor_gpu_sh_mode", "copy"))
+        ),
+        "actor_gpu_error": actor_gpu_errors or None,
+    }
+
+
+def render_label_with_actor(
+    *,
+    renderer: GaussianRendererBackend,
+    prepared: PreparedPath,
+    output_dir: Path,
+    label_id: str,
+    args: argparse.Namespace,
+    actor_runtime: ActorRuntime,
+    gpu_actor_sequence: GpuActorSequence | None = None,
+    actor_gpu_error: str | None = None,
+    actor_gpu_cache_upload_sec: float = 0.0,
+) -> dict:
+    actor_motion_plan: ActorMotionPlan | None = getattr(args, "actor_motion_plan", None)
+    if actor_motion_plan is not None:
+        poses = build_camera_poses(
+            prepared.path_xy,
+            floor_z=prepared.floor_z,
+            ceiling=prepared.ceiling,
+            follow_distance=args.follow_distance,
+            height_offset=args.height_offset,
+            look_ahead=args.look_ahead,
+            look_down=args.look_down,
+            stabilize=args.stabilize,
+        )
+        actor_transforms, actor_indices = build_actor_motion_plan_transforms(
+            actor_motion_plan,
+            frame_count=len(poses),
+            floor_z=prepared.floor_z,
+            actor_runtime=actor_runtime,
+        )
+    else:
+        poses, actor_transforms, actor_indices = build_actor_follow_plans(
+            prepared.path_xy,
+            floor_z=prepared.floor_z,
+            ceiling=prepared.ceiling,
+            follow_distance=args.follow_distance,
+            height_offset=args.height_offset,
+            look_ahead=args.look_ahead,
+            look_down=args.look_down,
+            stabilize=args.stabilize,
+            actor_runtime=actor_runtime,
+        )
+
+    if args.minimal_frames is not None and args.minimal_frames > 0:
+        poses = poses[: args.minimal_frames]
+        actor_transforms = actor_transforms[: args.minimal_frames]
+        actor_indices = actor_indices[: args.minimal_frames]
+
+    scene_dir = output_dir / args.scene
+    _safe_mkdir(scene_dir)
+    frames_dir = scene_dir / label_id
+    if args.save_depth_maps or args.rgb_frames:
+        _safe_mkdir(frames_dir)
+
+    video_path = scene_dir / f"{label_id}.mp4"
+    frame_prefix = "frame"
+
+    stage_seconds = _new_stage_seconds()
+    stage_seconds["actor_gpu_cache_upload_sec"] = max(
+        0.0,
+        float(actor_gpu_cache_upload_sec or 0.0),
+    )
+    frames_rendered = 0
+    fov_y_rad = math.radians(float(args.fov_deg))
+
+    base_gaussians = renderer._gaussians  # pylint: disable=protected-access
+    scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
+    combined_model: CombinedGaussianModel | None = None
+    combined_actor_size: int | None = None
+    actor_cull_enabled = bool(getattr(args, "actor_visibility_culling", False))
+    actor_cull_margin_m = float(getattr(args, "actor_cull_margin_m", 0.0) or 0.0)
+    actor_culled_frames = 0
+    actor_candidate_frames = 0
+    actor_visible_frames = 0
+    actor_rendered_frames = 0
+    actor_frame_metadata: list[dict] = []
+    actor_id = str(getattr(args, "job_actor_id", "") or "")
+    if actor_motion_plan is not None and actor_motion_plan.actor_id:
+        actor_id = actor_motion_plan.actor_id
+    actor_gpu_requested = bool(getattr(args, "actor_gpu_resident", False))
+
+    light_config: LightFilterConfig | None = getattr(args, "light_config", None)
+    cl_config: CameraLightConfig | None = getattr(args, "cl_config", None)
+    cl_light_world = getattr(args, "cl_light_world", None)
+    light_seed_offset = getattr(args, "light_seed_offset", 0)
+
+    video_backend = VideoWriterBackend(str(args.video_backend or VideoWriterBackend.NVENC.value))
+    use_gpu_video = bool(args.video) and video_backend == VideoWriterBackend.GPU
+    video_stage = "h264_encode_sec" if use_gpu_video else "mp4_write_sec"
+    need_depth_inv = bool(args.save_depth_maps) or (cl_config is not None and cl_config.active())
+    camera_frames: list[dict] = []
+    if use_gpu_video and (
+        (light_config is not None and light_config.enabled())
+        or (cl_config is not None and cl_config.active())
+    ):
+        raise RuntimeError(
+            "video-backend=gpu does not support light filters / camera light shading; "
+            "use --video-backend nvenc|cpu or disable --light-mode / --cl-enable."
+        )
+
+    def _render_frames(writer=None):
+        nonlocal frames_rendered, combined_model, combined_actor_size, actor_culled_frames
+        nonlocal actor_candidate_frames, actor_visible_frames, actor_rendered_frames
+        for idx, ((pose, _), transform, actor_idx) in enumerate(
+            zip(poses, actor_transforms, actor_indices)
+        ):
+            render_gaussians = base_gaussians
+            actor_visible = True
+            actor_candidate_frames += 1
+            if actor_cull_enabled:
+                with _measure_stage(stage_seconds, "actor_visibility_sec"):
+                    camera_for_cull = renderer._pose_to_camera(pose)  # pylint: disable=protected-access
+                    sphere = transformed_actor_sphere(
+                        transform,
+                        radius_xy_m=actor_runtime.sequence.radius_xy,
+                        height_m=actor_runtime.sequence.height,
+                        margin_m=actor_cull_margin_m,
+                    )
+                    visibility = sphere_visible_in_camera(
+                        center_world=sphere.center_world,
+                        radius_m=sphere.radius_m,
+                        world_view_transform=camera_for_cull.world_view_transform.detach().cpu().numpy(),
+                        fov_x_rad=float(camera_for_cull.FoVx),
+                        fov_y_rad=float(camera_for_cull.FoVy),
+                        znear=float(camera_for_cull.znear),
+                        zfar=float(camera_for_cull.zfar),
+                        matrix_is_transposed=True,
+                    )
+                actor_visible = bool(visibility.visible)
+                if not actor_visible:
+                    actor_culled_frames += 1
+            if actor_visible:
+                actor_visible_frames += 1
+                if gpu_actor_sequence is not None:
+                    with _measure_stage(stage_seconds, "actor_transform_sec"):
+                        actor_render = transform_gpu_actor_frame(
+                            gpu_actor_sequence,
+                            actor_idx,
+                            transform,
+                        )
+                else:
+                    sequence_frame = actor_runtime.sequence.frames[actor_idx]
+                    # Note: apply_transform_to_frame expects (ActorSequenceFrame, ActorSequence, transform).
+                    with _measure_stage(stage_seconds, "actor_transform_sec"):
+                        actor_data = apply_transform_to_frame(
+                            sequence_frame,
+                            actor_runtime.sequence,
+                            transform,
+                        )
+                    with _measure_stage(stage_seconds, "actor_tensor_pack_sec"):
+                        actor_render = actor_data_to_tensors(
+                            actor_data,
+                            actor_runtime.sequence,
+                            device=base_gaussians.get_xyz.device,
+                            target_rest_dim=scene_rest_dim,
+                        )
+                with _measure_stage(stage_seconds, "actor_merge_update_sec"):
+                    current_actor_size = int(actor_render.xyz.shape[0])
+                    if combined_model is None or combined_actor_size != current_actor_size:
+                        combined_actor_size = current_actor_size
+                        combined_model = CombinedGaussianModel(base_gaussians, actor_render)
+                    else:
+                        combined_model.update_actor(actor_render)
+                render_gaussians = combined_model
+                actor_rendered_frames += 1
+            else:
+                combined_actor_size = None
+            actor_frame_metadata.append(
+                {
+                    "frame": int(idx),
+                    "actors": [
+                        {
+                            "actor_id": actor_id or None,
+                            "candidate": True,
+                            "visible": bool(actor_visible),
+                            "rendered": bool(actor_visible),
+                            "animation_frame_index": int(actor_idx),
+                        }
+                    ],
+                }
+            )
+
+            if use_gpu_video:
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    render_tensor, depth_inv, camera = _render_custom_gaussians_ex(
+                        renderer,
+                        pose,
+                        render_gaussians,
+                        return_render_tensor=True,
+                        need_depth_inv=need_depth_inv,
+                    )
+                rgb = None
+                if args.rgb_frames:
+                    with _measure_stage(stage_seconds, "gpu_readback_sec"):
+                        rgb = (
+                            (render_tensor.clamp(0.0, 1.0) * 255.0)
+                            .to(torch.uint8)
+                            .permute(1, 2, 0)
+                            .detach()
+                            .cpu()
+                            .numpy()
+                        )
+            else:
+                with _measure_stage(stage_seconds, "gaussian_render_sec"):
+                    rgb, depth_inv, camera = _render_custom_gaussians(
+                        renderer,
+                        pose,
+                        render_gaussians,
+                        need_depth_inv=need_depth_inv,
+                    )
+            if not use_gpu_video:
+                if light_config is not None and light_config.enabled():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_light_filter_if_enabled(
+                            rgb,
+                            light_config,
+                            frame_index=idx,
+                            seed_offset=light_seed_offset,
+                        )
+                if cl_config is not None and cl_config.active():
+                    with _measure_stage(stage_seconds, "perframe_light_sec"):
+                        rgb = _apply_camera_light_if_enabled(
+                            rgb,
+                            depth_inv,
+                            camera,
+                            cl_config,
+                            cl_light_world=cl_light_world,
+                        )
+            if args.rotate_180:
+                if use_gpu_video:
+                    if rgb is not None:
+                        rgb = np.flipud(np.fliplr(rgb))
+                else:
+                    rgb = np.flipud(np.fliplr(rgb))
+            frames_rendered += 1
+            if args.save_camera_metadata:
+                with _measure_stage(stage_seconds, "camera_metadata_sec"):
+                    cam_payload = _serialize_camera(
+                        renderer=renderer,
+                        pose=pose,
+                        frame_size=tuple(args.resolution),
+                        fov_y_rad=fov_y_rad,
+                    )
+                    camera_frames.append({"frame": int(idx), **cam_payload})
+            if args.save_depth_maps and depth_inv is not None:
+                with _measure_stage(stage_seconds, "perframe_depth_sec"):
+                    _save_depth_map(
+                        depth_inv=depth_inv,
+                        frames_dir=frames_dir,
+                        frame_prefix=frame_prefix,
+                        frame_idx=idx,
+                        rotate_180=args.rotate_180,
+                    )
+            if args.rgb_frames:
+                frame_path = frames_dir / f"{frame_prefix}_{idx:04d}.png"
+                if rgb is None:
+                    raise RuntimeError("rgb frame requested but was not produced.")
+                with _measure_stage(stage_seconds, "perframe_png_sec"):
+                    imageio.imwrite(frame_path, rgb)
+
+            if args.video and writer is not None:
+                with _measure_stage(stage_seconds, video_stage):
+                    if use_gpu_video:
+                        frame_gpu = _render_tensor_to_gpu_format(
+                            render_tensor, gpu_format=GPU_VIDEO_FORMAT
+                        )
+                        if args.rotate_180:
+                            frame_gpu = frame_gpu.flip((0, 1))
+                        writer.append_data(frame_gpu.contiguous())
+                    else:
+                        writer.append_data(rgb)
+
+    if args.video:
+        w, h = int(args.resolution[0]), int(args.resolution[1])
+        writer = make_video_writer(
+            video_path,
+            fps=args.video_fps,
+            backend=video_backend,
+            nvenc_preset=args.video_nvenc_preset,
+            nvenc_bitrate=args.video_nvenc_bitrate,
+            width=w,
+            height=h,
+            gpu_format=GPU_VIDEO_FORMAT,
+            encode_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_encode_sec"))
+                if use_gpu_video
+                else None
+            ),
+            mux_timer=(
+                (lambda: _measure_stage(stage_seconds, "h264_mux_sec"))
+                if use_gpu_video
+                else None
+            ),
+        )
+        try:
+            _render_frames(writer=writer)
+        finally:
+            close_timer = (
+                contextlib.nullcontext()
+                if use_gpu_video
+                else _measure_stage(stage_seconds, "video_close_sec")
+            )
+            with close_timer:
+                writer.close()
+    else:
+        _render_frames(writer=None)
+
+    if args.save_camera_metadata:
+        with _measure_stage(stage_seconds, "camera_metadata_sec"):
+            _write_camera_metadata(scene_dir=scene_dir, label_id=label_id, camera_frames=camera_frames)
+
+    actor_metadata_path: Path | None = None
+    if bool(getattr(args, "save_actor_metadata", False)):
+        actor_metadata_path = scene_dir / f"{label_id}_actors.json"
+        actor_metadata_path.write_text(
+            json.dumps(
+                {
+                    "scene_id": args.scene,
+                    "label_id": label_id,
+                    "actor_plan_json": (
+                        str(getattr(args, "actor_plan_json"))
+                        if getattr(args, "actor_plan_json", None) is not None
+                        else None
+                    ),
+                    "candidate_frames": actor_candidate_frames,
+                    "visible_frames": actor_visible_frames,
+                    "culled_frames": actor_culled_frames,
+                    "rendered_frames": actor_rendered_frames,
+                    "frames": actor_frame_metadata,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     stage_payload = _finalize_stage_seconds(stage_seconds)
     duration = stage_payload["measured_total_sec"]
     return {
@@ -1478,6 +2144,10 @@ def render_label_with_actor(
         "duration_sec": duration,
         "stage_seconds": stage_payload,
         "actor_culled_frames": actor_culled_frames,
+        "actor_candidate_frames": actor_candidate_frames,
+        "actor_visible_frames": actor_visible_frames,
+        "actor_rendered_frames": actor_rendered_frames,
+        "actor_metadata_path": str(actor_metadata_path) if actor_metadata_path is not None else None,
         "actor_gpu_resident_requested": actor_gpu_requested,
         "actor_gpu_resident": gpu_actor_sequence is not None,
         "actor_gpu_cache_bytes": (
@@ -1627,6 +2297,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--light-vignette", type=float, default=0.0)
     parser.add_argument("--light-seed", type=int, default=0)
     parser.add_argument("--actor-seq-dir", type=Path, default=None)
+    parser.add_argument(
+        "--actor-plan-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional manifest actor motion plan. When provided, the actor is placed "
+            "from the plan and the camera remains on the label path."
+        ),
+    )
     parser.add_argument("--actor-pattern", default=DEFAULT_ACTOR_PATTERN)
     parser.add_argument("--actor-height", type=float, default=1.7)
     parser.add_argument("--actor-speed", type=float, default=DEFAULT_ACTOR_SPEED)
@@ -1673,6 +2352,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--actor-no-loop", dest="actor_loop", action="store_false")
     parser.set_defaults(actor_loop=True)
+    parser.add_argument(
+        "--save-actor-metadata",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Write per-frame actor candidate/visible/culled/rendered metadata.",
+    )
     args, unknown = parser.parse_known_args()
     if unknown:
         LOGGER.warning("Ignoring unsupported args: %s", " ".join(unknown))
@@ -1982,73 +2667,42 @@ def main() -> int:
     asset = build_scene_asset(scene_dir, gaussian_model, meta)
     renderer = build_renderer(asset, args)
 
+    actor_motion_plans: tuple[ActorMotionPlan, ...] = ()
+    actor_render_runtimes: tuple[ActorRenderRuntime, ...] = ()
+    if args.actor_plan_json is not None:
+        actor_motion_plans = load_actor_motion_plans(args.actor_plan_json)
+        args.actor_motion_plans = actor_motion_plans
+        args.actor_motion_plan = actor_motion_plans[0] if len(actor_motion_plans) == 1 else None
+    else:
+        args.actor_motion_plans = ()
+        args.actor_motion_plan = None
+
     actor_runtime: ActorRuntime | None = None
-    gpu_actor_sequence: GpuActorSequence | None = None
-    actor_gpu_error: str | None = None
-    actor_gpu_cache_upload_sec = 0.0
-    if args.actor_seq_dir is not None:
-        actor_options = ActorOptions(
-            sequence_dir=args.actor_seq_dir,
-            pattern=args.actor_pattern,
-            height=float(args.actor_height),
-            speed=float(args.actor_speed),
-            fps=float(args.actor_fps),
-            loop=bool(args.actor_loop),
-            foot_offset=float(args.actor_foot_offset),
-            follow_distance=float(args.follow_distance),
-            buffer_distance=float(args.follow_buffer),
-            animation_cycle_mod=int(args.animation_cycle_mod),
+    if actor_motion_plans:
+        actor_render_runtimes = tuple(
+            _load_actor_render_runtime(plan=plan, args=args, renderer=renderer)
+            for plan in actor_motion_plans
         )
-        if actor_options.fps <= 0.0:
-            raise ValueError("actor_fps must be positive.")
-        if actor_options.speed <= 0.0:
-            raise ValueError("actor_speed must be positive.")
-        if actor_options.buffer_distance > actor_options.follow_distance:
-            raise ValueError("follow_buffer must be <= follow_distance.")
-        actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
-        actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
-
-    if actor_runtime is not None and bool(getattr(args, "actor_gpu_resident", False)):
-        base_gaussians = renderer._gaussians  # pylint: disable=protected-access
-        base_device = base_gaussians.get_xyz.device
-        if base_device.type != "cuda":
-            actor_gpu_error = f"scene gaussians are on {base_device}, not CUDA"
-            LOGGER.warning("Actor GPU-resident cache disabled: %s", actor_gpu_error)
-        else:
-            cache_mb = float(getattr(args, "actor_gpu_cache_mb", 0.0) or 0.0)
-            memory_cap_mb = cache_mb if cache_mb > 0.0 else None
-            sh_mode = str(getattr(args, "actor_gpu_sh_mode", "copy"))
-            scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
-            start = time.perf_counter()
-            try:
-                gpu_actor_sequence = build_gpu_actor_sequence(
-                    actor_runtime.sequence,
-                    device=base_device,
-                    target_rest_dim=scene_rest_dim,
-                    memory_cap_mb=memory_cap_mb,
-                    sh_mode=sh_mode,
-                )
-                actor_gpu_cache_upload_sec = time.perf_counter() - start
-                LOGGER.info(
-                    "Actor GPU-resident cache enabled: frames=%d size=%s sh_mode=%s upload=%.3fs",
-                    gpu_actor_sequence.frame_count,
-                    _format_bytes(gpu_actor_sequence.bytes_allocated),
-                    gpu_actor_sequence.sh_mode,
-                    actor_gpu_cache_upload_sec,
-                )
-            except Exception as exc:  # pylint: disable=broad-except
-                actor_gpu_cache_upload_sec = time.perf_counter() - start
-                actor_gpu_error = str(exc)
-                if _strict_gpu_backends_enabled():
-                    raise RuntimeError(
-                        f"Actor GPU-resident cache failed in strict mode: {actor_gpu_error}"
-                    ) from exc
-                LOGGER.warning(
-                    "Actor GPU-resident cache disabled: %s; falling back to exact CPU/PLY transform path.",
-                    actor_gpu_error,
-                )
-
-    actor_gpu_cache_metric_pending = actor_gpu_cache_upload_sec
+    legacy_actor_render_runtime: ActorRenderRuntime | None = None
+    if not actor_motion_plans and args.actor_seq_dir is not None:
+        legacy_actor_render_runtime = _load_actor_render_runtime(
+            plan=ActorMotionPlan(
+                actor_id=str(getattr(args, "job_actor_id", "") or "") or None,
+                sequence_dir=args.actor_seq_dir,
+                frames=({"position": [0.0, 0.0, 0.0], "yaw_rad": 0.0},),
+                z_mode="floor",
+                yaw_offset_rad=0.0,
+                actor_height_m=float(args.actor_height),
+                actor_fps=float(args.actor_fps),
+                loop=bool(args.actor_loop),
+            ),
+            args=args,
+            renderer=renderer,
+        )
+        actor_runtime = legacy_actor_render_runtime.runtime
+    actor_gpu_cache_metric_pending = (
+        legacy_actor_render_runtime.gpu_cache_upload_sec if legacy_actor_render_runtime is not None else 0.0
+    )
     for path_file in pending_label_paths:
         label_id = path_file.stem
         if args.verbose:
@@ -2066,7 +2720,16 @@ def main() -> int:
         try:
             paths_attempted += 1
             record_path_status(label_id, STATUS_RETRY, error="started")
-            if actor_runtime is not None:
+            if actor_render_runtimes:
+                path_metrics = render_label_with_actor_plans(
+                    renderer=renderer,
+                    prepared=prepared,
+                    output_dir=args.output_dir,
+                    label_id=label_id,
+                    args=args,
+                    actor_render_runtimes=actor_render_runtimes,
+                )
+            elif actor_runtime is not None and legacy_actor_render_runtime is not None:
                 path_metrics = render_label_with_actor(
                     renderer=renderer,
                     prepared=prepared,
@@ -2074,8 +2737,8 @@ def main() -> int:
                     label_id=label_id,
                     args=args,
                     actor_runtime=actor_runtime,
-                    gpu_actor_sequence=gpu_actor_sequence,
-                    actor_gpu_error=actor_gpu_error,
+                    gpu_actor_sequence=legacy_actor_render_runtime.gpu_sequence,
+                    actor_gpu_error=legacy_actor_render_runtime.gpu_error,
                     actor_gpu_cache_upload_sec=actor_gpu_cache_metric_pending,
                 )
                 actor_gpu_cache_metric_pending = 0.0

@@ -197,6 +197,15 @@ Remaining:
 - [x] Add `--dry-run` / `--preflight-only` mode that validates configured
   assets, action clips, robot assets, sensor rigs, writable outputs, and CUDA
   device selections before reserving a GPU.
+- [x] Add a first manifest-driven render executor dry-run:
+  `scripts/massgen/render_manifest_jobs.py`.
+- [x] Materialize manifest robot trajectories into renderer-compatible
+  `label_paths/<job_id>.json` files for existing TeleSim label-path rendering.
+- [x] Materialize human-only manifest actors into renderer-compatible
+  `actor_plans/<job_id>.json` bundle files and pass them to
+  `render_label_paths_telesim.py --actor-plan-json`.
+- [x] Add `docs/mission_family_rollout_handoff.md` as the living per-family
+  progress, 5880 smoke-test, artifact-download, and cleanup tracker.
 - [x] Emit a compact run summary with manifest path, selected families,
   selected sensors, frame counts, output directories, and failure reasons.
 - [ ] Extend the run summary with command line and git commit.
@@ -206,6 +215,17 @@ Remaining:
   - one multi-robot family with all robot viewpoints.
 - [ ] Keep family-specific behavior in manifest adapters/executors rather than
   requiring users to edit shell scripts for each mission family.
+- [x] Connect manifest-native Gaussian actor-bundle composition so human-only
+  jobs render every manifest human instead of a camera-only command.
+- [x] Add local coverage for human-only `deliver_to_human`, `serve_queue`,
+  `human_guided_uncertain_region`,
+  `navigate_with_social_constraints:personal_space`,
+  `navigate_with_social_constraints:queue_order`,
+  `navigate_with_social_constraints:group_integrity`,
+  `navigate_with_social_constraints:pedestrian_yield`,
+  `dense_dynamic_humans`, and one-robot `dense_dynamic_avoidance`.
+- [ ] Connect multi-action clip switching when one human uses multiple distinct
+  PLY sequences within the same job.
 
 ### 7. Output Bottleneck Benchmarking
 
@@ -215,6 +235,9 @@ Remaining:
 - [x] Add `scripts/render/benchmark_output_backends.py` to run matched
   mode/backend benchmarks and emit JSON/Markdown reports plus one MP4 per video
   backend.
+- [x] Add `scripts/massgen/benchmark_simple_actor_render.py` to run paired
+  baseline CPU actor transforms vs optimized GPU-resident actor-cache renders
+  against the same human-only MassGen job.
 - [x] Document the safe 5880-host workflow in
   `docs/output_backend_benchmark.md`, including dirty-tree inspection before
   branch switching.
@@ -264,10 +287,25 @@ Local macOS:
 - [x] Scenario-manifest conversion tests with tiny fixture JSONs.
 - [x] CLI smoke conversion against Pathplanner
   `minimal_passing_mission_stream.json`.
+- [x] `python3 -m py_compile navdp_datagen/massgen/render_executor.py scripts/massgen/render_manifest_jobs.py tests/test_massgen_render_executor.py`
+- [x] `/Users/dongjk/miniconda3/bin/python3.13 -m pytest tests/test_massgen_render_executor.py tests/test_massgen_render_run_config.py tests/test_massgen_render_manifest.py`
+- [x] `python3 -m py_compile render_label_paths_telesim.py scripts/massgen/benchmark_simple_actor_render.py`
+- [x] Human-only executor tests cover `deliver_to_human`,
+  `serve_queue`, `human_guided_uncertain_region`,
+  `navigate_with_social_constraints:personal_space`,
+  `navigate_with_social_constraints:queue_order`,
+  `navigate_with_social_constraints:group_integrity`,
+  `navigate_with_social_constraints:pedestrian_yield`,
+  `dense_dynamic_humans`, and one-robot `dense_dynamic_avoidance`.
+- [x] Multi-human human-only executor tests cover actor bundles for
+  `serve_queue`, `navigate_with_social_constraints:queue_order`, and
+  `dense_dynamic_humans`.
 
 Server/platform:
 
 - [ ] One `deliver_to_human` render job with visible target human.
+- [ ] One human-only actor baseline/optimized benchmark report on 5880 using
+  `scripts/massgen/benchmark_simple_actor_render.py`.
 - [ ] One `serve_queue` render job with queue actors.
 - [ ] One `dense_multi_robot` render with at least two robot viewpoints.
 - [ ] One `dense_dynamic_combined` render with humans plus peer robots.
@@ -278,10 +316,12 @@ Server/platform:
 
 ## Next Implementation Step
 
-Build the manifest-driven render executor. It should materialize each job into
-camera frames, compose visible human Gaussian PLY action segments, render/cull
-peer GLB robots, and launch with `GAUSSIAN_RENDER_BACKEND=gsplat` on the server.
+Run 5880 smoke renders for `deliver_to_human`, a multi-human `serve_queue`, and
+a moving-human/dense-human job, then capture the paired baseline/optimized
+actor-bundle benchmark. After visual validation, optimize the multi-target
+hot path using the benchmark stage totals.
 
 Fresh-context handoff for that work:
 
 - `docs/per_mission_family_rendering_handoff.md`
+- `docs/mission_family_rollout_handoff.md`

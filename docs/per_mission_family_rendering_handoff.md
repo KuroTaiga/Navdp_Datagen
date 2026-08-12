@@ -7,6 +7,13 @@ Starting point before this handoff doc: `9f1cfa6`
 This is the fresh-context handoff for implementing MassGen rendering one mission
 family at a time. Read this before editing code.
 
+For the living per-family progress tracker, including 5880 smoke-test outputs,
+downloaded review artifacts, and cleanup status, also maintain:
+
+```text
+docs/mission_family_rollout_handoff.md
+```
+
 ## Current State
 
 `Navdp_Datagen` is now clean enough to move on from cleanup:
@@ -321,7 +328,7 @@ Acceptance criteria:
 Before moving-human families, add:
 
 - multi-action segment materialization for humans;
-- per-frame human visibility culling before PLY merge;
+- server validation for the manifest actor-bundle path;
 - debug counters per frame/job:
   - candidate humans;
   - visible humans;
@@ -381,8 +388,8 @@ writes, human PLY transform/tensor-pack/merge, or Gaussian rendering.
 
 - Local macOS cannot validate CUDA rendering. GPU validation must run on the
   render server.
-- The current renderer hot path still needs manifest-driven multi-human,
-  multi-action composition.
+- The current renderer hot path has manifest-driven human-only actor bundles;
+  it still needs server smoke validation and multi-action clip switching.
 - Generated Kimodo/STMC action requests are represented in manifests but must be
   materialized into renderer-ready assets before strict rendering.
 - Peer robots are represented in manifest jobs, but multi-peer GLB composition

@@ -714,6 +714,116 @@ class CombinedGaussianModel:
         return self.rotation_activation(self._rotation)
 
 
+class MultiActorCombinedGaussianModel:
+    """Scene gaussians plus N actor slices concatenated in GPU memory."""
+
+    def __init__(self, base: GaussianModel, actor_frames: Sequence[ActorRenderFrame]):
+        if not actor_frames:
+            raise ValueError("actor_frames cannot be empty.")
+
+        device = base.get_xyz.device
+        base_xyz = base._xyz.detach()  # pylint: disable=protected-access
+        base_dc = base._features_dc.detach()  # pylint: disable=protected-access
+        base_rest = base._features_rest.detach()  # pylint: disable=protected-access
+        base_opacity = base._opacity.detach()  # pylint: disable=protected-access
+        base_scaling = base._scaling.detach()  # pylint: disable=protected-access
+        base_rotation = base._rotation.detach()  # pylint: disable=protected-access
+
+        self.base_size = int(base_xyz.shape[0])
+        self.actor_sizes = tuple(int(frame.xyz.shape[0]) for frame in actor_frames)
+        total = self.base_size + int(sum(self.actor_sizes))
+
+        self.active_sh_degree = base.active_sh_degree
+        self.max_sh_degree = base.max_sh_degree
+
+        self._xyz = torch.empty((total, 3), device=device, dtype=base_xyz.dtype)
+        self._features_dc = torch.empty(
+            (total, base_dc.shape[1], base_dc.shape[2]),
+            device=device,
+            dtype=base_dc.dtype,
+        )
+        if base_rest.shape[1] > 0:
+            self._features_rest = torch.empty(
+                (total, base_rest.shape[1], base_rest.shape[2]),
+                device=device,
+                dtype=base_rest.dtype,
+            )
+        else:
+            self._features_rest = torch.zeros((total, 0, 0), device=device, dtype=base_rest.dtype)
+        self._opacity = torch.empty((total, 1), device=device, dtype=base_opacity.dtype)
+        self._scaling = torch.empty((total, base_scaling.shape[1]), device=device, dtype=base_scaling.dtype)
+        self._rotation = torch.empty((total, base_rotation.shape[1]), device=device, dtype=base_rotation.dtype)
+
+        self._xyz[: self.base_size] = base_xyz
+        self._features_dc[: self.base_size] = base_dc
+        if self._features_rest.shape[1] > 0:
+            self._features_rest[: self.base_size] = base_rest
+        self._opacity[: self.base_size] = base_opacity
+        self._scaling[: self.base_size] = base_scaling
+        self._rotation[: self.base_size] = base_rotation
+
+        self._actor_slices: list[slice] = []
+        cursor = self.base_size
+        for frame in actor_frames:
+            size = int(frame.xyz.shape[0])
+            segment = slice(cursor, cursor + size)
+            self._actor_slices.append(segment)
+            cursor += size
+
+        self.update_actors(actor_frames)
+
+        self.scaling_activation = torch.exp
+        self.scaling_inverse_activation = torch.log
+        self.opacity_activation = torch.sigmoid
+        self.inverse_opacity_activation = inverse_sigmoid
+        self.rotation_activation = torch.nn.functional.normalize
+
+    def update_actors(self, actor_frames: Sequence[ActorRenderFrame]) -> None:
+        if len(actor_frames) != len(self._actor_slices):
+            raise ValueError("Actor count mismatch while updating combined model.")
+        for segment, frame in zip(self._actor_slices, actor_frames):
+            self._xyz[segment] = frame.xyz
+            self._features_dc[segment] = frame.features_dc
+            if self._features_rest.shape[1] > 0:
+                self._features_rest[segment] = frame.features_rest
+            self._opacity[segment] = frame.opacity
+            if frame.scaling.shape[1] == 0:
+                self._scaling[segment] = 0.0
+            else:
+                self._scaling[segment] = frame.scaling
+            self._rotation[segment] = frame.rotation
+
+    @property
+    def get_xyz(self) -> torch.Tensor:
+        return self._xyz
+
+    @property
+    def get_features_dc(self) -> torch.Tensor:
+        return self._features_dc
+
+    @property
+    def get_features_rest(self) -> torch.Tensor:
+        return self._features_rest
+
+    @property
+    def get_features(self) -> torch.Tensor:
+        if self._features_rest.shape[1] == 0:
+            return self._features_dc
+        return torch.cat((self._features_dc, self._features_rest), dim=1)
+
+    @property
+    def get_opacity(self) -> torch.Tensor:
+        return self.opacity_activation(self._opacity)
+
+    @property
+    def get_scaling(self) -> torch.Tensor:
+        return self.scaling_activation(self._scaling)
+
+    @property
+    def get_rotation(self) -> torch.Tensor:
+        return self.rotation_activation(self._rotation)
+
+
 def build_path_metadata(
     *,
     scene_id: str,

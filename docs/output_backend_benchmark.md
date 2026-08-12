@@ -118,3 +118,35 @@ Use the report as the optimization guide:
   considering C++/CUDA.
 - If `gaussian_render_sec` dominates, backend render performance is the main
   bottleneck.
+
+## Human-Only Actor Baseline Vs Optimized
+
+For MassGen human-only jobs, use
+`scripts/massgen/benchmark_simple_actor_render.py` before and after actor
+composition optimization. It runs the same manifest job twice:
+
+- `baseline_cpu_actor`: exact CPU actor transform/tensor-pack path.
+- `optimized_gpu_actor_cache`: renderer `--actor-gpu-resident` path.
+
+Remote command shape:
+
+```bash
+python3 scripts/massgen/benchmark_simple_actor_render.py \
+  --manifest-json <remote_render_manifest.json> \
+  --family deliver_to_human \
+  --output-root /mnt/DATA/dongjk/navdp_data/outputs/massgen_family_smoke/actor_benchmark/<commit_or_date> \
+  --video-backend nvenc \
+  --minimal-frames 120 \
+  --limit 1
+```
+
+Open:
+
+```bash
+less /mnt/DATA/dongjk/navdp_data/outputs/massgen_family_smoke/actor_benchmark/<commit_or_date>/simple_actor_benchmark_report.md
+```
+
+Use the actor-stage deltas to decide whether the next multi-target optimization
+should focus on keeping actor frames resident on GPU, reducing per-frame tensor
+packing, or changing how multiple actor slices are merged into the Gaussian
+model.
