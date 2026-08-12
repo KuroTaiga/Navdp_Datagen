@@ -20,6 +20,25 @@ Do not place an object by using a mesh center as the ground point. The renderer
 expects the pose translation to be the object's ground-contact origin after
 local asset normalization.
 
+## Pathplanner to GS Coordinates
+
+Pathplanner `map_pose` and scenario trajectories use the left-handed planning
+world. Gaussian-splat rendering uses the occupancy/GS frame. The MassGen
+executor converts every generated camera label path and human actor plan by
+mirroring XY about the occupancy center before handing data to TeleSim:
+
+```text
+gs_x = left + right - pathplanner_x
+gs_y = top + bottom - pathplanner_y
+```
+
+The generated label JSON records `metadata.coordinate_frame:
+gs_right_handed`, `metadata.source_coordinate_frame:
+pathplanner_left_handed`, and `metadata.coordinate_transform:
+mirror_xy_about_occupancy_center`. Its `raster_world` values are already in GS
+space, and `raster_pixel` is computed from those GS coordinates. Do not apply a
+second mirror to MassGen-generated label paths.
+
 ## Asset Normalization
 
 Every foreground asset should be converted into a local frame where local

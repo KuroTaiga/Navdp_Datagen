@@ -325,6 +325,7 @@ def _build_job_plan(
         human_ids,
         base_dir=manifest_base,
         actor_plan_path=tasks_root / scene_id / "actor_plans" / f"{job_id}.json",
+        scene_dir=scene_dir,
         frame_count_hint=len(_trajectory_world_points(job.get("camera", {}).get("trajectory", []))),
     )
     blockers.extend(human_blockers)
@@ -445,8 +446,12 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
     if len(points) < 2:
         raise ValueError("job.camera.trajectory must contain at least two distinct positions")
     meta = _load_occupancy_metadata_for_label(scene_dir)
-    raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in points]
-    raster_pixel = [list(_world_to_pixel(meta, float(x), float(y))) for x, y, _ in points]
+    gs_points = [
+        (*_pathplanner_xy_to_gs_xy(meta, float(x), float(y)), float(z))
+        for x, y, z in points
+    ]
+    raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in gs_points]
+    raster_pixel = [list(_gs_xy_to_pixel(meta, float(x), float(y))) for x, y, _ in gs_points]
     payload = {
         "ins_id": str(job.get("job_id") or label_path.stem),
         "scene_id": str(job.get("scene_id") or scene_dir.name),
@@ -459,6 +464,9 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
             "viewpoint_robot_id": job.get("viewpoint_robot_id"),
             "mission_families": list(job.get("mission_families", [])),
             "assigned_mission_ids": list(job.get("assigned_mission_ids", [])),
+            "coordinate_frame": "gs_right_handed",
+            "source_coordinate_frame": "pathplanner_left_handed",
+            "coordinate_transform": "mirror_xy_about_occupancy_center",
         },
     }
     label_path.parent.mkdir(parents=True, exist_ok=True)
@@ -508,10 +516,29 @@ def _read_png_size(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _world_to_pixel(meta: Mapping[str, Any], x: float, y: float) -> tuple[int, int]:
+def _pathplanner_xy_to_gs_xy(meta: Mapping[str, Any], x: float, y: float) -> tuple[float, float]:
+    center_x = 0.5 * (float(meta["left"]) + float(meta["right"]))
+    center_y = 0.5 * (float(meta["top"]) + float(meta["bottom"]))
+    return 2.0 * center_x - float(x), 2.0 * center_y - float(y)
+
+
+def _pathplanner_yaw_to_gs_actor_sample_yaw(yaw_rad: float) -> float:
+    """Convert conventional Pathplanner yaw to the sample yaw used by human actor placement."""
+
+    planner_yaw = float(yaw_rad)
+    gs_dx = -math.cos(planner_yaw)
+    gs_dy = -math.sin(planner_yaw)
+    return math.atan2(gs_dx, gs_dy)
+
+
+def _gs_xy_to_pixel(meta: Mapping[str, Any], x: float, y: float) -> tuple[int, int]:
     u = int(round((float(x) - float(meta["left"])) / float(meta["scale"])))
     v = int(round((float(meta["top"]) - float(y)) / float(meta["scale"])))
     return u, v
+
+
+def _wrap_angle(value: float) -> float:
+    return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _trajectory_world_points(trajectory: Sequence[Any]) -> list[tuple[float, float, float]]:
@@ -600,6 +627,7 @@ def _human_actor_plan_bundle(
     *,
     base_dir: Path,
     actor_plan_path: Path,
+    scene_dir: Path,
     frame_count_hint: int,
 ) -> tuple[JsonDict | None, Path | None, list[str], list[str]]:
     if not human_ids:
@@ -617,6 +645,10 @@ def _human_actor_plan_bundle(
     camera_times = _trajectory_times(job.get("camera", {}).get("trajectory", []))
     if not camera_times:
         camera_times = [float(index) for index in range(max(1, int(frame_count_hint)))]
+    try:
+        coord_meta = _load_occupancy_metadata_for_label(scene_dir)
+    except Exception as exc:  # pylint: disable=broad-except
+        return None, None, [f"unable to load scene occupancy metadata for actor coordinates: {exc}"], warnings
     actor_plans: list[JsonDict] = []
     for human_id in human_ids:
         human_id = str(human_id)
@@ -631,6 +663,7 @@ def _human_actor_plan_bundle(
             human_id,
             base_dir=base_dir,
             camera_times=camera_times,
+            coord_meta=coord_meta,
         )
         blockers.extend(actor_blockers)
         warnings.extend(actor_warnings)
@@ -659,6 +692,7 @@ def _human_actor_plans(
     *,
     base_dir: Path,
     camera_times: Sequence[float],
+    coord_meta: Mapping[str, Any],
 ) -> tuple[list[JsonDict], list[str], list[str]]:
     blockers: list[str] = []
     warnings: list[str] = []
@@ -670,7 +704,7 @@ def _human_actor_plans(
     if not segments:
         return [], [f"human {human_id} has no action segments"], warnings
 
-    human_frames = _sample_human_motion_frames(human, camera_times)
+    human_frames = _sample_human_motion_frames(human, camera_times, coord_meta=coord_meta)
     if not human_frames:
         return [], [f"human {human_id} has no usable trajectory or start_pose"], warnings
 
@@ -757,8 +791,13 @@ def _trajectory_times(trajectory: Any) -> list[float]:
     return times
 
 
-def _sample_human_motion_frames(human: Mapping[str, Any], times: Sequence[float]) -> list[JsonDict]:
-    samples = _human_motion_samples(human)
+def _sample_human_motion_frames(
+    human: Mapping[str, Any],
+    times: Sequence[float],
+    *,
+    coord_meta: Mapping[str, Any],
+) -> list[JsonDict]:
+    samples = _human_motion_samples(human, coord_meta=coord_meta)
     if not samples:
         return []
     return [
@@ -803,7 +842,11 @@ def _optional_float(value: Any) -> float | None:
     return float(value)
 
 
-def _human_motion_samples(human: Mapping[str, Any]) -> list[tuple[float, tuple[float, float, float], float]]:
+def _human_motion_samples(
+    human: Mapping[str, Any],
+    *,
+    coord_meta: Mapping[str, Any],
+) -> list[tuple[float, tuple[float, float, float], float]]:
     samples: list[tuple[float, tuple[float, float, float], float]] = []
     trajectory = human.get("trajectory", [])
     if isinstance(trajectory, Sequence):
@@ -813,11 +856,14 @@ def _human_motion_samples(human: Mapping[str, Any]) -> list[tuple[float, tuple[f
             raw_position = raw.get("position")
             if not isinstance(raw_position, Sequence) or len(raw_position) < 2:
                 continue
-            x = float(raw_position[0])
-            y = float(raw_position[1])
+            x, y = _pathplanner_xy_to_gs_xy(
+                coord_meta,
+                float(raw_position[0]),
+                float(raw_position[1]),
+            )
             z = float(raw_position[2]) if len(raw_position) > 2 else 0.0
             time_s = float(raw.get("time_s", raw.get("t", index)) or 0.0)
-            yaw = float(raw.get("yaw_rad", 0.0) or 0.0)
+            yaw = _pathplanner_yaw_to_gs_actor_sample_yaw(float(raw.get("yaw_rad", 0.0) or 0.0))
             samples.append((time_s, (x, y, z), yaw))
     if not samples:
         start_pose = human.get("start_pose")
@@ -825,12 +871,12 @@ def _human_motion_samples(human: Mapping[str, Any]) -> list[tuple[float, tuple[f
             samples.append(
                 (
                     0.0,
-                    (
+                    (*_pathplanner_xy_to_gs_xy(
+                        coord_meta,
                         float(start_pose.get("x", 0.0) or 0.0),
                         float(start_pose.get("y", 0.0) or 0.0),
-                        0.0,
-                    ),
-                    float(start_pose.get("yaw_rad", 0.0) or 0.0),
+                    ), 0.0),
+                    _pathplanner_yaw_to_gs_actor_sample_yaw(float(start_pose.get("yaw_rad", 0.0) or 0.0)),
                 )
             )
     return sorted(samples, key=lambda item: item[0])

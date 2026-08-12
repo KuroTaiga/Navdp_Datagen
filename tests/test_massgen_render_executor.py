@@ -213,7 +213,11 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert Path(job_plan["label_path"]).is_file()
     assert Path(job_plan["actor_plan_path"]).is_file()
     label_payload = json.loads(Path(job_plan["label_path"]).read_text(encoding="utf-8"))
-    assert label_payload["path"]["raster_world"][0]["x"] == 1.0
+    assert label_payload["metadata"]["coordinate_frame"] == "gs_right_handed"
+    assert label_payload["metadata"]["source_coordinate_frame"] == "pathplanner_left_handed"
+    assert label_payload["path"]["raster_world"][0]["x"] == 15.0
+    assert label_payload["path"]["raster_world"][0]["y"] == 15.0
+    assert label_payload["path"]["raster_pixel"][0] == [30, 2]
     assert len(label_payload["path"]["raster_world"]) == 3
     actor_payload = json.loads(Path(job_plan["actor_plan_path"]).read_text(encoding="utf-8"))
     assert actor_payload["schema_version"] == "massgen_actor_bundle.v1"
@@ -221,7 +225,7 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     actor = actor_payload["actors"][0]
     assert actor["actor_id"] == "human_target"
     assert actor["action"]["render_action_id"] == "receive_item"
-    assert actor["frames"][0]["position"][:2] == [6.0, 4.5]
+    assert actor["frames"][0]["position"][:2] == [10.0, 11.5]
     assert len(actor["frames"]) == 3
 
 
