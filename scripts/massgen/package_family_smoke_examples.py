@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from utils.massgen_render_manifest import scenario_file_to_render_manifest, write_json  # noqa: E402
+from navdp_datagen.sensors import pinhole_from_fov_y  # noqa: E402
 
 
 DEFAULT_SOURCE_ROOT = (
@@ -302,6 +303,52 @@ def _prune_peer_robots_for_human_only(manifest: dict[str, Any]) -> None:
         job["peer_robot_pose_tracks"] = []
 
 
+def _attach_smoke_sensor(manifest: dict[str, Any], *, width: int = 320, height: int = 240) -> None:
+    rig_id = "massgen_smoke_fpv_320x240"
+    sensor_name = "fpv_rgb"
+    manifest["sensor_rigs"] = {
+        rig_id: {
+            "rig_id": rig_id,
+            "profile": rig_id,
+            "source": {
+                "kind": "massgen_family_smoke_package",
+                "provisional": False,
+            },
+            "sensors": [
+                {
+                    "name": sensor_name,
+                    "type": "camera",
+                    "profile": rig_id,
+                    "enabled": True,
+                    "frame": "robot_base",
+                    "transform": {
+                        "translation_m": [0.0, 0.0, 0.3],
+                        "rotation_rpy_deg": [0.0, 0.0, 0.0],
+                        "convention": "+X forward, +Y left, +Z up",
+                    },
+                    "intrinsics": pinhole_from_fov_y(width, height, 70.0),
+                    "clipping_range_m": [0.001, 30.0],
+                    "rate_hz": 10.0,
+                    "modalities": ["rgb", "camera_metadata"],
+                    "notes": "Low-resolution smoke camera for 5880 family rollout.",
+                }
+            ],
+        }
+    }
+    for job in manifest.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        job["sensors"] = [
+            {
+                "rig_id": rig_id,
+                "sensor_name": sensor_name,
+                "type": "camera",
+                "modalities": ["rgb", "camera_metadata"],
+                "profile": rig_id,
+            }
+        ]
+
+
 def _copy_or_generate_visual(
     *,
     visual_root: Path,
@@ -355,6 +402,7 @@ def main() -> int:
         )
         if "dense_dynamic_combined" not in render_family and "dense_multi_robot" not in render_family:
             _prune_peer_robots_for_human_only(manifest)
+        _attach_smoke_sensor(manifest)
         write_json(family_dir / "render_manifest.json", manifest)
         generated_visual = _copy_or_generate_visual(
             visual_root=args.visual_root,

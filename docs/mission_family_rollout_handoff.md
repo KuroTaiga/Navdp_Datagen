@@ -226,15 +226,15 @@ git ls-files --others --exclude-standard
 
 | Step | Family | Status | Local Evidence | 5880 Evidence | Downloaded Artifacts | Cleanup |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `deliver_to_human` | 5880 smoke passed | Actor-bundle materialization added. Planned command passes `--actor-plan-json`, visibility culling, actor metadata, and `GAUSSIAN_RENDER_BACKEND=gsplat`. Local tests pass. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_rendered_frames=3`, MP4 written. Initial `nvenc` attempt failed because imageio ffmpeg lacks `h264_nvenc`. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/deliver_smoke_001/` plus logs. | Remote smoke root removed after download. |
-| 2 | `serve_queue` | 5880 smoke passed | One-human and multi-human queue manifests use actor bundles with `queue_wait`; per-frame actor metadata records visible/culled/rendered actors. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_count=2`, `actor_rendered_frames=6`, MP4 written. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/serve_queue_smoke_001/` plus logs. | Remote smoke root removed after download. |
-| 3 | `human_guided_uncertain_region` | Local human-only path ready | Informant + one robot is covered by actor-bundle tests with `wave` action selection. | Not run. | None. | None. |
-| 4 | `navigate_with_social_constraints:personal_space` | Local human-only path ready | One human + one robot is covered by social-law family selection and actor-bundle tests. | Not run. | None. | None. |
-| 5 | `navigate_with_social_constraints:queue_order` | Local human-only path ready | One-human and multi-human queue-order manifests use actor bundles with `queue_wait`. | Not run. | None. | None. |
-| 6 | `navigate_with_social_constraints:group_integrity` | Local human-only path ready | One-human group-integrity social-law selection maps to `stand`; multi-human grouping can use the same actor-bundle renderer if assets are present. | Not run. | None. | None. |
-| 7 | `navigate_with_social_constraints:pedestrian_yield` | Local human-only path ready | One moving human + one robot is covered by actor-plan interpolation tests with `walk` action selection. | Not run. | None. | None. |
-| 8 | `dense_dynamic_humans` | 5880 smoke passed | One-human and multi-human moving-human manifests use actor bundles; culling counters are emitted per actor/frame. | `25f647d`, CPU video backend: `paths_ok=1`, `paths_fatal=0`, `frames_total=3`, `actor_count=2`, `actor_rendered_frames=6`, MP4 written. | `out/massgen_5880_smoke/25f647d/runs_25f647d_cpu/dense_humans_smoke_001/` plus logs. | Remote smoke root removed after download. |
-| 9 | `dense_dynamic_avoidance` | Local one-robot/human-only path ready | One-robot moving-human jobs use actor bundles; jobs with peer robots still block on GLB overlay integration. | Not run. | None. | None. |
+| 1 | `deliver_to_human` | 5880 smoke passed | Actor-bundle materialization added. Planned command passes `--actor-plan-json`, visibility culling, actor metadata, and `GAUSSIAN_RENDER_BACKEND=gsplat`. Local tests pass. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=4`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/deliver_to_human/` | Remote smoke root removed after download. |
+| 2 | `serve_queue` | 5880 smoke passed | Multi-human queue manifests use actor bundles with `queue_wait`; per-frame actor metadata records visible/culled/rendered actors. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=8`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/serve_queue/` | Remote smoke root removed after download. |
+| 3 | `human_guided_uncertain_region` | 5880 smoke passed | Informant + one robot is covered by actor-bundle tests with action-segment selection. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=2`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/human_guided_uncertain_region/` | Remote smoke root removed after download. |
+| 4 | `navigate_with_social_constraints:personal_space` | 5880 smoke passed | Social-law family selection maps humans to actor bundles. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=10`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/personal_space/` | Remote smoke root removed after download. |
+| 5 | `navigate_with_social_constraints:queue_order` | 5880 smoke passed | Multi-human queue-order manifests use actor bundles with `queue_wait`. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=10`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/queue_order/` | Remote smoke root removed after download. |
+| 6 | `navigate_with_social_constraints:group_integrity` | 5880 smoke passed | Group-integrity social-law manifests use actor bundles with per-frame actor metadata. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=8`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/group_integrity/` | Remote smoke root removed after download. |
+| 7 | `navigate_with_social_constraints:pedestrian_yield` | 5880 smoke passed | Moving human actor-plan interpolation uses `walk` action selection. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=1`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/pedestrian_yield/` | Remote smoke root removed after download. |
+| 8 | `dense_dynamic_humans` | 5880 smoke passed | Multi-human moving-human manifests use actor bundles; culling counters are emitted per actor/frame. | `b225ecd`, CPU video backend: `paths_ok=1`, `frames_total=3`, `actor_count=6`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/dense_dynamic_humans/` | Remote smoke root removed after download. |
+| 9 | `dense_dynamic_avoidance` | 5880 smoke passed with reduced humans | One-robot moving-human jobs use actor bundles; jobs with peer robots still block on GLB overlay integration. | Full six-human smoke OOMed because other 5880 GPU workloads left <0.5 GiB free; reduced two-human retry passed with `paths_ok=1`, `frames_total=3`, MP4 written. | `out/massgen_family_rollout/b225ecd/families/dense_dynamic_avoidance/` | Remote smoke root removed after download. |
 | 10 | `dense_multi_robot` | Not started | Requires peer-robot GLB overlay integration. | Not run. | None. | None. |
 | 11 | `dense_dynamic_combined` | Not started | Requires moving humans plus peer robots. | Not run. | None. | None. |
 | 12 | `mission_stream` | Not started | Requires multi-robot viewpoint support and child mission metadata. | Not run. | None. | None. |
@@ -284,9 +284,10 @@ The renderer keeps the camera on the robot path and places every actor from the
 manifest plan bundle. It writes `<label>_actors.json` with per-frame
 candidate, visible, culled, and rendered actor records.
 
-The executor still blocks jobs with peer robots and humans that use multiple
-distinct PLY action sequences in one job. Peer robots require the GLB overlay
-path before `dense_multi_robot`, `mission_stream`, and peer-robot variants of
+The executor supports multiple manifest humans and multiple timed PLY action
+segments for the same human by emitting one actor-bundle entry per segment and
+marking inactive frames. Peer robots still require the GLB overlay path before
+`dense_multi_robot`, `mission_stream`, and peer-robot variants of
 `dense_dynamic_avoidance` / `dense_dynamic_combined` can be considered complete.
 
 ## Baseline/Optimized Actor Benchmark

@@ -224,7 +224,7 @@ Remaining:
   `navigate_with_social_constraints:group_integrity`,
   `navigate_with_social_constraints:pedestrian_yield`,
   `dense_dynamic_humans`, and one-robot `dense_dynamic_avoidance`.
-- [ ] Connect multi-action clip switching when one human uses multiple distinct
+- [x] Connect multi-action clip switching when one human uses multiple distinct
   PLY sequences within the same job.
 
 ### 7. Output Bottleneck Benchmarking
@@ -310,6 +310,10 @@ Server/platform:
   `scripts/massgen/benchmark_simple_actor_render.py`.
 - [x] One `serve_queue` render job with queue actors.
 - [x] One `dense_dynamic_humans` render job with moving human actors.
+- [x] 5880 smoke renders for human-only/social families:
+  `human_guided_uncertain_region`, `personal_space`, `queue_order`,
+  `group_integrity`, `pedestrian_yield`, and reduced-human
+  `dense_dynamic_avoidance`.
 - [ ] One `dense_multi_robot` render with at least two robot viewpoints.
 - [ ] One `dense_dynamic_combined` render with humans plus peer robots.
 - [ ] One output-backend benchmark run on the 5880 host with report and MP4s
