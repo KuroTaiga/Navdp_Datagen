@@ -379,12 +379,16 @@ def actor_data_to_tensors(
         if copy_dim > 0:
             features_rest[:, :copy_dim] = features_rest_src[:, :copy_dim]
 
-    opacity_np = np.asarray(data["opacity"], dtype=np.float32).reshape(-1, 1)
+    opacity_np = np.array(data["opacity"], dtype=np.float32, copy=True).reshape(-1, 1)
     opacity = torch.from_numpy(opacity_np).to(device)
 
     if sequence.scale_names:
         if sequence.uniform_scale:
-            scale_values = np.asarray(data[sequence.scale_names[0]], dtype=np.float32).reshape(-1, 1)
+            scale_values = np.array(
+                data[sequence.scale_names[0]],
+                dtype=np.float32,
+                copy=True,
+            ).reshape(-1, 1)
             scales_np = np.repeat(scale_values, 3, axis=1)
         else:
             scales_np = np.stack(
