@@ -203,6 +203,159 @@ def _metric_payloads(path: Path) -> list[dict[str, Any]]:
     return payloads
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _valid_metrics(metrics: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [metric for metric in metrics if isinstance(metric, Mapping) and not metric.get("error")]
+
+
+def _render_overhead_summary(
+    metrics: list[dict[str, Any]],
+    *,
+    outer_render_elapsed_sec: float,
+) -> dict[str, Any]:
+    valid = _valid_metrics(metrics)
+    frames_total = sum(_as_int(metric.get("frames_total")) for metric in valid)
+    paths_total = sum(_as_int(metric.get("paths_total")) for metric in valid)
+    paths_ok = sum(_as_int(metric.get("paths_ok")) for metric in valid)
+    nested_duration_total_sec = sum(_as_float(metric.get("duration_total_sec")) for metric in valid)
+
+    nested_render_loop_sec = 0.0
+    nested_process_total_sec = 0.0
+    nested_setup_load_process_sec = 0.0
+    process_total_count = 0
+    for metric in valid:
+        lifecycle = metric.get("lifecycle_seconds")
+        if isinstance(lifecycle, Mapping):
+            render_loop = _as_float(lifecycle.get("render_loop_sec"), _as_float(metric.get("duration_total_sec")))
+            process_total = _as_float(lifecycle.get("process_total_sec"))
+            setup_total = _as_float(lifecycle.get("process_minus_render_loop_sec"))
+            if setup_total <= 0.0 and process_total > 0.0:
+                setup_total = max(0.0, process_total - render_loop)
+            nested_render_loop_sec += render_loop
+            nested_process_total_sec += process_total
+            nested_setup_load_process_sec += setup_total
+            if process_total > 0.0:
+                process_total_count += 1
+        else:
+            nested_render_loop_sec += _as_float(metric.get("duration_total_sec"))
+
+    outer = max(0.0, float(outer_render_elapsed_sec or 0.0))
+    hidden_overhead_sec = max(0.0, outer - nested_render_loop_sec)
+    process_launches = len(valid)
+    has_complete_process_totals = bool(valid) and process_total_count == len(valid)
+    nested_process_total_value: float | None = (
+        nested_process_total_sec if has_complete_process_totals else None
+    )
+    nested_setup_value: float | None = (
+        nested_setup_load_process_sec if has_complete_process_totals else None
+    )
+    process_wrapper_overhead_sec = (
+        max(0.0, outer - nested_process_total_sec)
+        if has_complete_process_totals
+        else None
+    )
+    return {
+        "outer_render_elapsed_sec": outer,
+        "renderer_process_count": process_launches,
+        "nested_paths_total": paths_total,
+        "nested_paths_ok": paths_ok,
+        "nested_frames_total": frames_total,
+        "nested_duration_total_sec": nested_duration_total_sec,
+        "nested_render_loop_sec": nested_render_loop_sec,
+        "nested_process_total_sec": nested_process_total_value,
+        "nested_setup_load_process_sec": nested_setup_value,
+        "hidden_overhead_sec": hidden_overhead_sec,
+        "hidden_overhead_pct": (
+            (hidden_overhead_sec / outer) * 100.0 if outer > 0.0 else None
+        ),
+        "process_wrapper_overhead_sec": process_wrapper_overhead_sec,
+        "process_launches_per_1000_frames": (
+            (float(process_launches) / float(frames_total)) * 1000.0
+            if frames_total > 0
+            else None
+        ),
+        "setup_seconds_per_frame": (
+            hidden_overhead_sec / float(frames_total) if frames_total > 0 else None
+        ),
+        "renderer_setup_seconds_per_frame": (
+            nested_setup_load_process_sec / float(frames_total)
+            if frames_total > 0 and has_complete_process_totals
+            else None
+        ),
+    }
+
+
+def _summarize_render_overhead(records: list[dict[str, Any]]) -> dict[str, Any]:
+    overheads = [
+        record.get("render_overhead")
+        for record in records
+        if record.get("status") == "success" and isinstance(record.get("render_overhead"), Mapping)
+    ]
+    if not overheads:
+        return {}
+    outer = sum(_as_float(item.get("outer_render_elapsed_sec")) for item in overheads)
+    render_loop = sum(_as_float(item.get("nested_render_loop_sec")) for item in overheads)
+    duration_total = sum(_as_float(item.get("nested_duration_total_sec")) for item in overheads)
+    frames = sum(_as_int(item.get("nested_frames_total")) for item in overheads)
+    paths = sum(_as_int(item.get("nested_paths_total")) for item in overheads)
+    processes = sum(_as_int(item.get("renderer_process_count")) for item in overheads)
+    process_totals = [
+        _as_float(item.get("nested_process_total_sec"))
+        for item in overheads
+        if item.get("nested_process_total_sec") is not None
+    ]
+    setup_totals = [
+        _as_float(item.get("nested_setup_load_process_sec"))
+        for item in overheads
+        if item.get("nested_setup_load_process_sec") is not None
+    ]
+    has_complete_process_totals = len(process_totals) == len(overheads)
+    has_complete_setup_totals = len(setup_totals) == len(overheads)
+    process_total = sum(process_totals) if has_complete_process_totals else None
+    setup_total = sum(setup_totals) if has_complete_setup_totals else None
+    hidden = max(0.0, outer - render_loop)
+    return {
+        "record_count": len(overheads),
+        "outer_render_elapsed_sec": outer,
+        "renderer_process_count": processes,
+        "nested_paths_total": paths,
+        "nested_frames_total": frames,
+        "nested_duration_total_sec": duration_total,
+        "nested_render_loop_sec": render_loop,
+        "nested_process_total_sec": process_total,
+        "nested_setup_load_process_sec": setup_total,
+        "hidden_overhead_sec": hidden,
+        "hidden_overhead_pct": (hidden / outer) * 100.0 if outer > 0.0 else None,
+        "process_wrapper_overhead_sec": (
+            max(0.0, outer - process_total) if process_total is not None else None
+        ),
+        "process_launches_per_1000_frames": (
+            (float(processes) / float(frames)) * 1000.0 if frames > 0 else None
+        ),
+        "setup_seconds_per_frame": hidden / float(frames) if frames > 0 else None,
+        "renderer_setup_seconds_per_frame": (
+            setup_total / float(frames) if frames > 0 and setup_total is not None else None
+        ),
+    }
+
+
 def _entry_output_root(results_root: Path, entry: Mapping[str, Any]) -> Path:
     return (
         results_root
@@ -293,6 +446,10 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
     videos = sorted(output_root.glob("renders/**/*.mp4"))
     output_bytes = _dir_size_bytes(output_root)
     first_metric = metrics[0] if metrics else {}
+    render_overhead = _render_overhead_summary(
+        metrics,
+        outer_render_elapsed_sec=render_elapsed,
+    )
     return {
         "entry_index": int(entry.get("entry_index", index)),
         "family": entry.get("family"),
@@ -309,10 +466,15 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
         "render_elapsed_sec": render_elapsed,
         "status": "success" if render_returncode == 0 and videos else str(plan_payload.get("status")),
         "job_count": plan_payload.get("job_count"),
-        "frames_total": first_metric.get("frames_total"),
-        "duration_total_sec": first_metric.get("duration_total_sec"),
+        "frames_total": render_overhead.get("nested_frames_total") or first_metric.get("frames_total"),
+        "duration_total_sec": (
+            render_overhead.get("nested_duration_total_sec")
+            or first_metric.get("duration_total_sec")
+        ),
         "time_per_frame_sec": first_metric.get("time_per_frame_sec"),
-        "paths_ok": first_metric.get("paths_ok"),
+        "paths_ok": render_overhead.get("nested_paths_ok") or first_metric.get("paths_ok"),
+        "renderer_process_count": render_overhead.get("renderer_process_count"),
+        "render_overhead": render_overhead,
         "metrics": metrics,
         "videos": [str(path) for path in videos],
         "output_root": str(output_root),
@@ -426,6 +588,7 @@ def main() -> int:
     summary["total_render_sec"] = total_render_sec
     summary["total_output_bytes"] = total_output_bytes
     summary["avg_time_per_frame_sec"] = total_render_sec / total_frames if total_frames else None
+    summary["render_overhead_summary"] = _summarize_render_overhead(summary["records"])
     summary["status"] = "success" if success else "failed"
     _write_json(args.results_root / "benchmark_summary.json", summary)
     print(

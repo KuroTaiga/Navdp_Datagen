@@ -8,6 +8,11 @@ writes MP4 + optional camera metadata for quick pipeline validation.
 
 from __future__ import annotations
 
+import time as _bootstrap_time
+
+_PROCESS_START_PERF_SEC = _bootstrap_time.perf_counter()
+_PROCESS_START_UNIX_SEC = _bootstrap_time.time()
+
 import argparse
 import contextlib
 import json
@@ -75,6 +80,8 @@ from utils.actor_visibility import sphere_visible_in_camera, transformed_actor_s
 from utils.glb_robot_compositor import quantize_depth_meters
 from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 
+_PYTHON_IMPORT_DONE_PERF_SEC = _bootstrap_time.perf_counter()
+
 LOGGER = logging.getLogger("render_label_paths_telesim")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 
@@ -104,10 +111,43 @@ TELESIM_STAGE_KEYS = (
     "video_close_sec",
 )
 TELESIM_ALIAS_STAGE_KEYS = ("render", "encode", "measured_total_sec")
+TELESIM_LIFECYCLE_KEYS = (
+    "process_start_sec",
+    "python_import_sec",
+    "argument_parse_sec",
+    "output_preflight_sec",
+    "scene_metadata_load_sec",
+    "label_collect_sec",
+    "manifest_plan_sec",
+    "precheck_sec",
+    "scene_ply_load_sec",
+    "scene_asset_build_sec",
+    "renderer_init_sec",
+    "actor_plan_load_sec",
+    "actor_sequence_load_sec",
+    "actor_gpu_cache_upload_sec",
+    "path_prepare_sec",
+    "first_frame_latency_sec",
+    "render_loop_sec",
+    "renderer_shutdown_sec",
+    "writer_close_sec",
+    "output_bookkeeping_sec",
+    "process_total_sec",
+)
 
 
 def _new_stage_seconds() -> dict[str, float]:
     return {stage: 0.0 for stage in TELESIM_STAGE_KEYS}
+
+
+def _new_lifecycle_seconds() -> dict[str, float]:
+    payload = {stage: 0.0 for stage in TELESIM_LIFECYCLE_KEYS}
+    payload["process_start_sec"] = float(_PROCESS_START_UNIX_SEC)
+    payload["python_import_sec"] = max(
+        0.0,
+        float(_PYTHON_IMPORT_DONE_PERF_SEC - _PROCESS_START_PERF_SEC),
+    )
+    return payload
 
 
 @contextlib.contextmanager
@@ -117,6 +157,17 @@ def _measure_stage(stage_seconds: dict[str, float], stage: str):
         yield
     finally:
         stage_seconds[stage] = stage_seconds.get(stage, 0.0) + (time.perf_counter() - start)
+
+
+@contextlib.contextmanager
+def _measure_lifecycle(lifecycle_seconds: dict[str, float], stage: str):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        lifecycle_seconds[stage] = lifecycle_seconds.get(stage, 0.0) + (
+            time.perf_counter() - start
+        )
 
 
 def _finalize_stage_seconds(stage_seconds: dict[str, float]) -> dict[str, float]:
@@ -137,6 +188,51 @@ def _finalize_stage_seconds(stage_seconds: dict[str, float]) -> dict[str, float]
     stage_seconds["encode"] = encode_sec
     stage_seconds["measured_total_sec"] = measured_total_sec
     return dict(stage_seconds)
+
+
+def _finalize_lifecycle_seconds(
+    lifecycle_seconds: dict[str, float],
+    *,
+    render_loop_sec: float,
+) -> dict[str, float]:
+    payload = {
+        key: max(0.0, float(lifecycle_seconds.get(key, 0.0)))
+        for key in TELESIM_LIFECYCLE_KEYS
+    }
+    payload["process_start_sec"] = float(_PROCESS_START_UNIX_SEC)
+    payload["python_import_sec"] = max(
+        payload.get("python_import_sec", 0.0),
+        float(_PYTHON_IMPORT_DONE_PERF_SEC - _PROCESS_START_PERF_SEC),
+    )
+    payload["render_loop_sec"] = max(0.0, float(render_loop_sec))
+    payload["process_total_sec"] = max(
+        0.0,
+        float(time.perf_counter() - _PROCESS_START_PERF_SEC),
+    )
+    setup_keys = (
+        "python_import_sec",
+        "argument_parse_sec",
+        "output_preflight_sec",
+        "scene_metadata_load_sec",
+        "label_collect_sec",
+        "manifest_plan_sec",
+        "precheck_sec",
+        "scene_ply_load_sec",
+        "scene_asset_build_sec",
+        "renderer_init_sec",
+        "actor_plan_load_sec",
+        "actor_sequence_load_sec",
+        "actor_gpu_cache_upload_sec",
+        "path_prepare_sec",
+        "renderer_shutdown_sec",
+        "output_bookkeeping_sec",
+    )
+    payload["setup_load_process_sec"] = sum(float(payload.get(key, 0.0)) for key in setup_keys)
+    payload["process_minus_render_loop_sec"] = max(
+        0.0,
+        float(payload["process_total_sec"]) - float(payload["render_loop_sec"]),
+    )
+    return payload
 
 
 def _format_seconds(seconds: float | None) -> str:
@@ -459,9 +555,21 @@ def _ensure_bev(
     return bev_path, float(meters_per_pixel)
 
 
-def build_scene_asset(scene_dir: Path, gaussian_model: Path, meta: dict) -> SceneAsset:
+def build_scene_asset(
+    scene_dir: Path,
+    gaussian_model: Path,
+    meta: dict,
+    *,
+    lifecycle_seconds: dict[str, float] | None = None,
+) -> SceneAsset:
     ply_path = gaussian_model.expanduser().resolve()
+    ply_t0 = time.perf_counter()
     ply = GaussianPly.read(ply_path)
+    if lifecycle_seconds is not None:
+        lifecycle_seconds["scene_ply_load_sec"] = lifecycle_seconds.get("scene_ply_load_sec", 0.0) + (
+            time.perf_counter() - ply_t0
+        )
+    asset_t0 = time.perf_counter()
     xs = ply.data["x"].astype(np.float64)
     ys = ply.data["y"].astype(np.float64)
     zs = ply.data["z"].astype(np.float64)
@@ -478,7 +586,7 @@ def build_scene_asset(scene_dir: Path, gaussian_model: Path, meta: dict) -> Scen
     metadata_path.write_text(json.dumps(metadata_payload), encoding="utf-8")
 
     navmesh_placeholder = ply_path.with_suffix(".navmesh")
-    return SceneAsset(
+    asset = SceneAsset(
         scene_id=ply_path.stem,
         metadata_path=metadata_path,
         scene_glb=ply_path,
@@ -493,6 +601,11 @@ def build_scene_asset(scene_dir: Path, gaussian_model: Path, meta: dict) -> Scen
         splat_model_path=ply_path,
         splat_bev_path=None,
     )
+    if lifecycle_seconds is not None:
+        lifecycle_seconds["scene_asset_build_sec"] = lifecycle_seconds.get("scene_asset_build_sec", 0.0) + (
+            time.perf_counter() - asset_t0
+        )
+    return asset
 
 
 def build_renderer(asset: SceneAsset, args: argparse.Namespace) -> GaussianRendererBackend:
@@ -2408,7 +2521,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
-    args = parse_args()
+    lifecycle_seconds = _new_lifecycle_seconds()
+    with _measure_lifecycle(lifecycle_seconds, "argument_parse_sec"):
+        args = parse_args()
     if args.view_mode not in ("forward", ""):
         LOGGER.warning("view-mode '%s' is not supported; using 'forward'.", args.view_mode)
     if args.path_handedness == "auto":
@@ -2468,7 +2583,8 @@ def main() -> int:
     # Preflight output directory once. If a file blocks any parent component (e.g. "navdata"),
     # mkdir will raise FileExistsError with that filename; failing fast avoids spamming per-path errors.
     try:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        with _measure_lifecycle(lifecycle_seconds, "output_preflight_sec"):
+            args.output_dir.mkdir(parents=True, exist_ok=True)
     except FileExistsError as exc:
         LOGGER.error(
             "Output directory cannot be created (a file exists where a directory is expected): "
@@ -2481,26 +2597,29 @@ def main() -> int:
         LOGGER.error("Output directory cannot be created: output_dir=%s error=%s", args.output_dir, exc)
         return 2
 
-    scene_dir = resolve_scene_dir(args.scenes_dir, args.scene)
-    scene_id = scene_dir.name
-    args.scene = scene_id
-    tasks_scene_dir = resolve_scene_dir(args.tasks_dir, scene_id)
-    label_dir = resolve_label_directory(tasks_scene_dir)
+    with _measure_lifecycle(lifecycle_seconds, "scene_metadata_load_sec"):
+        scene_dir = resolve_scene_dir(args.scenes_dir, args.scene)
+        scene_id = scene_dir.name
+        args.scene = scene_id
+        tasks_scene_dir = resolve_scene_dir(args.tasks_dir, scene_id)
+        label_dir = resolve_label_directory(tasks_scene_dir)
     if label_dir is None:
         raise FileNotFoundError(f"No label JSONs under {tasks_scene_dir}")
 
-    gaussian_model = _resolve_gaussian_model(scene_dir, args.gaussian_model)
-    if not gaussian_model.exists():
-        candidates = sorted(scene_dir.glob("*.ply"))
-        if not candidates:
-            raise FileNotFoundError(f"No Gaussian PLY found under {scene_dir}")
-        gaussian_model = candidates[0]
-        LOGGER.warning("gaussian_model not found; using %s", gaussian_model.name)
+    with _measure_lifecycle(lifecycle_seconds, "scene_metadata_load_sec"):
+        gaussian_model = _resolve_gaussian_model(scene_dir, args.gaussian_model)
+        if not gaussian_model.exists():
+            candidates = sorted(scene_dir.glob("*.ply"))
+            if not candidates:
+                raise FileNotFoundError(f"No Gaussian PLY found under {scene_dir}")
+            gaussian_model = candidates[0]
+            LOGGER.warning("gaussian_model not found; using %s", gaussian_model.name)
 
-    label_paths = collect_labels(label_dir, args.label_id, args.max_labels, args.exclude_detailed_labels)
-    completed_labels: set[str] = set()
-    if args.skip_completed_log is not None and args.skip_completed_log.is_file():
-        completed_labels = _parse_resume_log(args.skip_completed_log).get(scene_id, set())
+    with _measure_lifecycle(lifecycle_seconds, "label_collect_sec"):
+        label_paths = collect_labels(label_dir, args.label_id, args.max_labels, args.exclude_detailed_labels)
+        completed_labels: set[str] = set()
+        if args.skip_completed_log is not None and args.skip_completed_log.is_file():
+            completed_labels = _parse_resume_log(args.skip_completed_log).get(scene_id, set())
     if not label_paths:
         LOGGER.warning("No label paths found under %s", label_dir)
         return 1
@@ -2651,8 +2770,9 @@ def main() -> int:
             continue
         pending_label_paths.append(path_file)
 
+    precheck_sec = max(0.0, time.monotonic() - precheck_t0)
+    lifecycle_seconds["precheck_sec"] = lifecycle_seconds.get("precheck_sec", 0.0) + precheck_sec
     if args.path_progress:
-        precheck_sec = max(0.0, time.monotonic() - precheck_t0)
         LOGGER.info(
             "[PRECHECK] scene=%s planned=%d pending=%d skipped_completed_log=%d skipped_outputs_exist=%d precheck_sec=%.2f",
             scene_id,
@@ -2665,6 +2785,7 @@ def main() -> int:
 
     if not pending_label_paths:
         # Nothing to do for this scene; write metrics/status for resume accounting and exit early.
+        bookkeeping_t0 = time.perf_counter()
         metrics = {
             "paths_planned": paths_planned,
             "paths_done": paths_done,
@@ -2688,6 +2809,13 @@ def main() -> int:
             "paths": paths_payload,
             "path_statuses": list(path_statuses.values()),
         }
+        lifecycle_seconds["output_bookkeeping_sec"] = lifecycle_seconds.get(
+            "output_bookkeeping_sec", 0.0
+        ) + (time.perf_counter() - bookkeeping_t0)
+        metrics["lifecycle_seconds"] = _finalize_lifecycle_seconds(
+            lifecycle_seconds,
+            render_loop_sec=total_duration,
+        )
         if args.metrics_json is not None:
             args.metrics_json.parent.mkdir(parents=True, exist_ok=True)
             args.metrics_json.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -2706,14 +2834,22 @@ def main() -> int:
         return 0
 
     # From here on we have pending work; now load metadata + scene assets.
-    meta = load_occupancy_metadata(scene_dir)
-    asset = build_scene_asset(scene_dir, gaussian_model, meta)
-    renderer = build_renderer(asset, args)
+    with _measure_lifecycle(lifecycle_seconds, "scene_metadata_load_sec"):
+        meta = load_occupancy_metadata(scene_dir)
+    asset = build_scene_asset(
+        scene_dir,
+        gaussian_model,
+        meta,
+        lifecycle_seconds=lifecycle_seconds,
+    )
+    with _measure_lifecycle(lifecycle_seconds, "renderer_init_sec"):
+        renderer = build_renderer(asset, args)
 
     actor_motion_plans: tuple[ActorMotionPlan, ...] = ()
     actor_render_runtimes: tuple[ActorRenderRuntime, ...] = ()
     if args.actor_plan_json is not None:
-        actor_motion_plans = load_actor_motion_plans(args.actor_plan_json)
+        with _measure_lifecycle(lifecycle_seconds, "actor_plan_load_sec"):
+            actor_motion_plans = load_actor_motion_plans(args.actor_plan_json)
         args.actor_motion_plans = actor_motion_plans
         args.actor_motion_plan = actor_motion_plans[0] if len(actor_motion_plans) == 1 else None
     else:
@@ -2722,12 +2858,24 @@ def main() -> int:
 
     actor_runtime: ActorRuntime | None = None
     if actor_motion_plans:
+        actor_load_t0 = time.perf_counter()
         actor_render_runtimes = tuple(
             _load_actor_render_runtime(plan=plan, args=args, renderer=renderer)
             for plan in actor_motion_plans
         )
+        actor_gpu_upload_sec = sum(
+            max(0.0, float(item.gpu_cache_upload_sec or 0.0))
+            for item in actor_render_runtimes
+        )
+        lifecycle_seconds["actor_gpu_cache_upload_sec"] = lifecycle_seconds.get(
+            "actor_gpu_cache_upload_sec", 0.0
+        ) + actor_gpu_upload_sec
+        lifecycle_seconds["actor_sequence_load_sec"] = lifecycle_seconds.get(
+            "actor_sequence_load_sec", 0.0
+        ) + max(0.0, (time.perf_counter() - actor_load_t0) - actor_gpu_upload_sec)
     legacy_actor_render_runtime: ActorRenderRuntime | None = None
     if not actor_motion_plans and args.actor_seq_dir is not None:
+        actor_load_t0 = time.perf_counter()
         legacy_actor_render_runtime = _load_actor_render_runtime(
             plan=ActorMotionPlan(
                 actor_id=str(getattr(args, "job_actor_id", "") or "") or None,
@@ -2742,6 +2890,16 @@ def main() -> int:
             args=args,
             renderer=renderer,
         )
+        actor_gpu_upload_sec = max(
+            0.0,
+            float(legacy_actor_render_runtime.gpu_cache_upload_sec or 0.0),
+        )
+        lifecycle_seconds["actor_gpu_cache_upload_sec"] = lifecycle_seconds.get(
+            "actor_gpu_cache_upload_sec", 0.0
+        ) + actor_gpu_upload_sec
+        lifecycle_seconds["actor_sequence_load_sec"] = lifecycle_seconds.get(
+            "actor_sequence_load_sec", 0.0
+        ) + max(0.0, (time.perf_counter() - actor_load_t0) - actor_gpu_upload_sec)
         actor_runtime = legacy_actor_render_runtime.runtime
     actor_gpu_cache_metric_pending = (
         legacy_actor_render_runtime.gpu_cache_upload_sec if legacy_actor_render_runtime is not None else 0.0
@@ -2750,19 +2908,25 @@ def main() -> int:
         label_id = path_file.stem
         if args.verbose:
             LOGGER.info("  -> %s", label_id)
-        prepared = prepare_path_data(
-            path_file,
-            meta,
-            stride=args.stride,
-            resample_step=args.resample_step,
-            mirror_translation=args.mirror_translation,
-            swap_xy=args.swap_xy,
-            handedness=args.path_handedness,
-            negate_xy=args.negate_xy,
-        )
+        with _measure_lifecycle(lifecycle_seconds, "path_prepare_sec"):
+            prepared = prepare_path_data(
+                path_file,
+                meta,
+                stride=args.stride,
+                resample_step=args.resample_step,
+                mirror_translation=args.mirror_translation,
+                swap_xy=args.swap_xy,
+                handedness=args.path_handedness,
+                negate_xy=args.negate_xy,
+            )
         try:
             paths_attempted += 1
             record_path_status(label_id, STATUS_RETRY, error="started")
+            if lifecycle_seconds.get("first_frame_latency_sec", 0.0) <= 0.0:
+                lifecycle_seconds["first_frame_latency_sec"] = max(
+                    0.0,
+                    time.perf_counter() - _PROCESS_START_PERF_SEC,
+                )
             if actor_render_runtimes:
                 path_metrics = render_label_with_actor_plans(
                     renderer=renderer,
@@ -2857,8 +3021,15 @@ def main() -> int:
                 with args.error_log.open("a", encoding="utf-8") as handle:
                     handle.write(f"Scene={scene_id} Label={path_file.name} Error={exc}\n")
 
-    renderer.shutdown()
+    with _measure_lifecycle(lifecycle_seconds, "renderer_shutdown_sec"):
+        renderer.shutdown()
 
+    lifecycle_seconds["writer_close_sec"] = sum(
+        float((path_metrics.get("stage_seconds") or {}).get("video_close_sec", 0.0))
+        for path_metrics in paths_payload
+        if isinstance(path_metrics, Mapping)
+    )
+    bookkeeping_t0 = time.perf_counter()
     metrics = {
         "paths_planned": paths_planned,
         "paths_done": paths_done,
@@ -2884,6 +3055,13 @@ def main() -> int:
         "paths": paths_payload,
         "path_statuses": list(path_statuses.values()),
     }
+    lifecycle_seconds["output_bookkeeping_sec"] = lifecycle_seconds.get(
+        "output_bookkeeping_sec", 0.0
+    ) + (time.perf_counter() - bookkeeping_t0)
+    metrics["lifecycle_seconds"] = _finalize_lifecycle_seconds(
+        lifecycle_seconds,
+        render_loop_sec=total_duration,
+    )
 
     if args.metrics_json is not None:
         args.metrics_json.parent.mkdir(parents=True, exist_ok=True)
