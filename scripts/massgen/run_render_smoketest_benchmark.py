@@ -61,6 +61,12 @@ def _parse_args() -> argparse.Namespace:
             "label IDs in one renderer process per group."
         ),
     )
+    parser.add_argument(
+        "--actor-gpu-resident",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Forward --actor-gpu-resident to MassGen render jobs.",
+    )
     parser.add_argument("--clean", action="store_true")
     return parser.parse_args()
 
@@ -636,6 +642,8 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
         base_cmd.extend(["--render-script", str(args.render_script)])
     if args.minimal_frames is not None and int(args.minimal_frames) > 0:
         base_cmd.extend(["--minimal-frames", str(int(args.minimal_frames))])
+    if bool(args.actor_gpu_resident):
+        base_cmd.append("--actor-gpu-resident")
 
     plan_completed, plan_elapsed = _run_capture(
         base_cmd,
@@ -742,6 +750,7 @@ def _render_group(
                 video_backend=str(args.video_backend),
                 device=str(args.device),
                 minimal_frames=args.minimal_frames,
+                actor_gpu_resident=bool(args.actor_gpu_resident),
             )
         except Exception as exc:  # pylint: disable=broad-except
             plan_payload = {"status": "invalid", "job_count": 0, "plans": [], "error": str(exc)}
@@ -874,6 +883,7 @@ def main() -> int:
         "renders_per_family_source_scene": int(args.renders_per_family_source_scene),
         "workers": int(args.workers),
         "skip_expected_blocked": bool(args.skip_expected_blocked),
+        "actor_gpu_resident": bool(args.actor_gpu_resident),
         "execution_mode": "grouped_same_scene" if bool(args.group_same_scene) else "per_manifest",
         "selected_count": len(selected),
         "records": [],
