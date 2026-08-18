@@ -175,6 +175,55 @@ def test_grouped_render_command_combines_labels_and_actor_plan_mappings(tmp_path
     assert bench._single_option_value(command, "--metrics-json") == str(tmp_path / "metrics" / "group_0000.json")
 
 
+def test_grouped_render_command_chunks_compatible_labels(tmp_path) -> None:
+    base = [
+        "python",
+        "render_label_paths_telesim.py",
+        "--scene",
+        "scene_a",
+        "--tasks-dir",
+        str(tmp_path / "tasks"),
+        "--output-dir",
+        str(tmp_path / "renders"),
+        "--video-backend",
+        "cpu",
+    ]
+    plans = [
+        {
+            "command": [
+                *base,
+                "--label-id",
+                f"job_{index}",
+                "--actor-plan-json",
+                str(tmp_path / f"actors_{index}.json"),
+                "--metrics-json",
+                str(tmp_path / f"{index}.json"),
+            ],
+            "blockers": [],
+            "robot_overlay_commands": [],
+        }
+        for index in range(5)
+    ]
+
+    grouped = bench._build_grouped_render_commands(
+        plans,
+        metrics_root=tmp_path / "metrics",
+        max_labels_per_command=2,
+    )
+
+    assert len(grouped) == 3
+    assert [bench._option_values(command, "--label-id") for command in grouped] == [
+        ["job_0", "job_1"],
+        ["job_2", "job_3"],
+        ["job_4"],
+    ]
+    assert [bench._single_option_value(command, "--metrics-json") for command in grouped] == [
+        str(tmp_path / "metrics" / "group_0000.json"),
+        str(tmp_path / "metrics" / "group_0001.json"),
+        str(tmp_path / "metrics" / "group_0002.json"),
+    ]
+
+
 def test_grouped_render_command_keeps_incompatible_render_options_separate(tmp_path) -> None:
     plans = [
         {

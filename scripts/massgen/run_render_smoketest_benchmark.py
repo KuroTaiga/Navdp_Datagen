@@ -62,6 +62,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--group-max-labels-per-command",
+        type=int,
+        default=0,
+        help=(
+            "When --group-same-scene is enabled, split compatible scene groups into "
+            "renderer commands with at most this many label plans. 0 keeps each "
+            "compatible scene bucket in one command."
+        ),
+    )
+    parser.add_argument(
         "--actor-gpu-resident",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -577,6 +587,7 @@ def _build_grouped_render_commands(
     plans: list[Mapping[str, Any]],
     *,
     metrics_root: Path,
+    max_labels_per_command: int = 0,
 ) -> list[list[str]]:
     buckets: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
     for plan in plans:
@@ -589,23 +600,35 @@ def _build_grouped_render_commands(
         buckets.setdefault(key, []).append(plan)
 
     grouped_commands: list[list[str]] = []
-    for group_index, group_plans in enumerate(buckets.values()):
-        first_command = [str(item) for item in group_plans[0].get("command", [])]
-        command = _command_without_group_specific_options(first_command)
-        metrics_json = metrics_root / f"group_{group_index:04d}.json"
-        command.extend(["--metrics-json", str(metrics_json)])
-        for plan in group_plans:
-            plan_command = [str(item) for item in plan.get("command", [])]
-            label_ids = _option_values(plan_command, "--label-id")
-            if not label_ids:
-                continue
-            for label_id in label_ids:
-                command.extend(["--label-id", label_id])
-            actor_plan = _single_option_value(plan_command, "--actor-plan-json")
-            if actor_plan:
+    group_index = 0
+    chunk_size = int(max_labels_per_command or 0)
+    for bucket_plans in buckets.values():
+        plan_chunks = (
+            [
+                bucket_plans[index : index + chunk_size]
+                for index in range(0, len(bucket_plans), chunk_size)
+            ]
+            if chunk_size > 0
+            else [bucket_plans]
+        )
+        for group_plans in plan_chunks:
+            first_command = [str(item) for item in group_plans[0].get("command", [])]
+            command = _command_without_group_specific_options(first_command)
+            metrics_json = metrics_root / f"group_{group_index:04d}.json"
+            command.extend(["--metrics-json", str(metrics_json)])
+            for plan in group_plans:
+                plan_command = [str(item) for item in plan.get("command", [])]
+                label_ids = _option_values(plan_command, "--label-id")
+                if not label_ids:
+                    continue
                 for label_id in label_ids:
-                    command.extend(["--label-actor-plan-json", f"{label_id}={actor_plan}"])
-        grouped_commands.append(command)
+                    command.extend(["--label-id", label_id])
+                actor_plan = _single_option_value(plan_command, "--actor-plan-json")
+                if actor_plan:
+                    for label_id in label_ids:
+                        command.extend(["--label-actor-plan-json", f"{label_id}={actor_plan}"])
+            grouped_commands.append(command)
+            group_index += 1
     return grouped_commands
 
 
@@ -764,7 +787,15 @@ def _render_group(
                 all_plans.append(plan)
 
     blocked = [plan for plan in all_plans if plan.get("blockers")]
-    grouped_commands = [] if blocked else _build_grouped_render_commands(all_plans, metrics_root=metrics_root)
+    grouped_commands = (
+        []
+        if blocked
+        else _build_grouped_render_commands(
+            all_plans,
+            metrics_root=metrics_root,
+            max_labels_per_command=args.group_max_labels_per_command,
+        )
+    )
     render_elapsed = 0.0
     render_returncode = 2 if blocked or plan_errors else 0
     if not blocked and not plan_errors and grouped_commands:
@@ -813,6 +844,7 @@ def _render_group(
         "status": status,
         "job_count": len(all_plans),
         "grouped_command_count": len(grouped_commands),
+        "group_max_labels_per_command": int(args.group_max_labels_per_command or 0),
         "frames_total": render_overhead.get("nested_frames_total"),
         "duration_total_sec": render_overhead.get("nested_duration_total_sec"),
         "time_per_frame_sec": (
