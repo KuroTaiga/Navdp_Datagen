@@ -16,6 +16,10 @@ from typing import Any, Mapping
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from navdp_datagen.massgen.render_executor import build_render_plans, load_render_manifest  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -47,6 +51,15 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of render manifests to execute concurrently on the selected device.",
+    )
+    parser.add_argument(
+        "--group-same-scene",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Group compatible selected manifests by family/source/scene and render many "
+            "label IDs in one renderer process per group."
+        ),
     )
     parser.add_argument("--clean", action="store_true")
     return parser.parse_args()
@@ -376,6 +389,220 @@ def _entry_log_stem(entry: Mapping[str, Any]) -> Path:
     )
 
 
+def _entry_group_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(entry.get("family")),
+        str(entry.get("source")),
+        str(entry.get("scene")),
+    )
+
+
+def _group_output_root(results_root: Path, key: tuple[str, str, str]) -> Path:
+    family, source, scene = key
+    return (
+        results_root
+        / "grouped_renders"
+        / _safe_component(family)
+        / _safe_component(source)
+        / _safe_component(scene)
+    )
+
+
+def _group_log_stem(key: tuple[str, str, str]) -> Path:
+    family, source, scene = key
+    return Path(_safe_component(family)) / _safe_component(source) / _safe_component(scene)
+
+
+_COMMAND_OPTIONS_WITH_VALUE = {
+    "--scenes-dir",
+    "--tasks-dir",
+    "--scene",
+    "--output-dir",
+    "--metrics-json",
+    "--error-log",
+    "--skip-completed-log",
+    "--label-id",
+    "--max-labels",
+    "--stride",
+    "--resample-step",
+    "--path-handedness",
+    "--look-ahead",
+    "--look-down",
+    "--height-offset",
+    "--resolution",
+    "--fov-deg",
+    "--znear",
+    "--zfar",
+    "--device",
+    "--sh-degree",
+    "--gaussian-model",
+    "--video-fps",
+    "--minimal-frames",
+    "--view-mode",
+    "--path-progress-space-interval-sec",
+    "--video-backend",
+    "--video-nvenc-preset",
+    "--video-nvenc-bitrate",
+    "--depth-bit-depth",
+    "--ply-transform-backend",
+    "--cl-light-mode",
+    "--cl-shading-model",
+    "--cl-strength",
+    "--cl-color",
+    "--cl-ambient",
+    "--cl-base-scale",
+    "--cl-diffuse",
+    "--cl-specular",
+    "--cl-shininess",
+    "--cl-range",
+    "--cl-offset",
+    "--cl-light-world",
+    "--cl-light-center-z",
+    "--cl-normal-smooth",
+    "--cl-normal-filter",
+    "--cl-normal-kernel",
+    "--cl-normal-sigma-range",
+    "--cl-normal-sigma-domain",
+    "--cl-shadow-bias",
+    "--cl-shadow-strength",
+    "--cl-shadow-pcf",
+    "--cl-shadow-compare",
+    "--npc-count",
+    "--npc-max-count",
+    "--npc-density-coverage",
+    "--npc-priority",
+    "--npc-density-mode",
+    "--npc-zone-ratio",
+    "--npc-max-range",
+    "--npc-free-threshold",
+    "--npc-placement-backend",
+    "--npc-seed",
+    "--npc-actor-root",
+    "--npc-frame-pool-size",
+    "--job-slot",
+    "--job-name",
+    "--job-actor-id",
+    "--light-mode",
+    "--light-strength",
+    "--light-radius",
+    "--light-center",
+    "--light-jitter",
+    "--light-temp-k",
+    "--light-seed",
+    "--actor-seq-dir",
+    "--actor-plan-json",
+    "--label-actor-plan-json",
+    "--actor-pattern",
+    "--actor-height",
+    "--actor-speed",
+    "--actor-fps",
+    "--follow-distance",
+    "--follow-buffer",
+    "--actor-foot-offset",
+    "--animation-cycle-mod",
+    "--actor-cull-margin-m",
+    "--actor-gpu-cache-mb",
+    "--actor-gpu-sh-mode",
+}
+
+_GROUP_IGNORED_OPTIONS = {
+    "--label-id",
+    "--metrics-json",
+    "--actor-plan-json",
+    "--label-actor-plan-json",
+}
+
+
+def _option_values(command: list[str], option: str) -> list[str]:
+    values: list[str] = []
+    index = 0
+    while index < len(command):
+        item = command[index]
+        if item == option and index + 1 < len(command):
+            values.append(str(command[index + 1]))
+            index += 2
+            continue
+        index += 1
+    return values
+
+
+def _single_option_value(command: list[str], option: str) -> str | None:
+    values = _option_values(command, option)
+    return values[-1] if values else None
+
+
+def _command_without_group_specific_options(command: list[str]) -> list[str]:
+    out: list[str] = []
+    index = 0
+    while index < len(command):
+        item = command[index]
+        if item in _GROUP_IGNORED_OPTIONS:
+            index += 2 if item in _COMMAND_OPTIONS_WITH_VALUE else 1
+            continue
+        out.append(item)
+        if item in _COMMAND_OPTIONS_WITH_VALUE and index + 1 < len(command):
+            out.append(command[index + 1])
+            index += 2
+        else:
+            index += 1
+    return out
+
+
+def _replace_command_option(command: list[str], option: str, values: list[str]) -> list[str]:
+    out: list[str] = []
+    index = 0
+    while index < len(command):
+        item = command[index]
+        if item == option:
+            index += 2 if item in _COMMAND_OPTIONS_WITH_VALUE else 1
+            continue
+        out.append(item)
+        if item in _COMMAND_OPTIONS_WITH_VALUE and index + 1 < len(command):
+            out.append(command[index + 1])
+            index += 2
+        else:
+            index += 1
+    for value in values:
+        out.extend([option, str(value)])
+    return out
+
+
+def _build_grouped_render_commands(
+    plans: list[Mapping[str, Any]],
+    *,
+    metrics_root: Path,
+) -> list[list[str]]:
+    buckets: dict[tuple[str, ...], list[Mapping[str, Any]]] = {}
+    for plan in plans:
+        if plan.get("blockers") or plan.get("robot_overlay_commands"):
+            continue
+        command = [str(item) for item in plan.get("command", [])]
+        if not command:
+            continue
+        key = tuple(_command_without_group_specific_options(command))
+        buckets.setdefault(key, []).append(plan)
+
+    grouped_commands: list[list[str]] = []
+    for group_index, group_plans in enumerate(buckets.values()):
+        first_command = [str(item) for item in group_plans[0].get("command", [])]
+        command = _command_without_group_specific_options(first_command)
+        metrics_json = metrics_root / f"group_{group_index:04d}.json"
+        command.extend(["--metrics-json", str(metrics_json)])
+        for plan in group_plans:
+            plan_command = [str(item) for item in plan.get("command", [])]
+            label_ids = _option_values(plan_command, "--label-id")
+            if not label_ids:
+                continue
+            for label_id in label_ids:
+                command.extend(["--label-id", label_id])
+            actor_plan = _single_option_value(plan_command, "--actor-plan-json")
+            if actor_plan:
+                for label_id in label_ids:
+                    command.extend(["--label-actor-plan-json", f"{label_id}={actor_plan}"])
+        grouped_commands.append(command)
+    return grouped_commands
+
+
 def _passes_filters(entry: Mapping[str, Any], families: list[str] | None, sources: list[str] | None) -> bool:
     if families and str(entry.get("family")) not in set(families):
         return False
@@ -483,6 +710,119 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
     }
 
 
+def _render_group(
+    args: argparse.Namespace,
+    key: tuple[str, str, str],
+    entries: list[Mapping[str, Any]],
+    index: int,
+) -> dict[str, Any]:
+    output_root = _group_output_root(args.results_root, key)
+    log_stem = _group_log_stem(key)
+    plans_root = output_root / "render_plans"
+    metrics_root = output_root / "metrics"
+    all_plans: list[Mapping[str, Any]] = []
+    plan_elapsed = 0.0
+    plan_errors: list[str] = []
+    plan_statuses: list[str] = []
+
+    for entry_offset, entry in enumerate(entries):
+        manifest_path = Path(str(entry["render_manifest_json"]))
+        if not manifest_path.is_absolute():
+            manifest_path = args.package_root / manifest_path
+        t0 = time.perf_counter()
+        try:
+            manifest = load_render_manifest(manifest_path)
+            plan_payload = build_render_plans(
+                manifest,
+                manifest_path=manifest_path,
+                output_root=output_root,
+                render_script=args.render_script if args.render_script is not None else REPO_ROOT / "render_label_paths_telesim.py",
+                python_bin=str(args.python_bin),
+                write_inputs=True,
+                video_backend=str(args.video_backend),
+                device=str(args.device),
+                minimal_frames=args.minimal_frames,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            plan_payload = {"status": "invalid", "job_count": 0, "plans": [], "error": str(exc)}
+            plan_errors.append(f"{manifest_path}: {exc}")
+        plan_elapsed += time.perf_counter() - t0
+        plan_statuses.append(str(plan_payload.get("status")))
+        plan_path = plans_root / f"{entry_offset:04d}_{Path(str(entry['render_manifest_json'])).stem}.json"
+        _write_json(plan_path, plan_payload)
+        for plan in plan_payload.get("plans", []):
+            if isinstance(plan, Mapping):
+                all_plans.append(plan)
+
+    blocked = [plan for plan in all_plans if plan.get("blockers")]
+    grouped_commands = [] if blocked else _build_grouped_render_commands(all_plans, metrics_root=metrics_root)
+    render_elapsed = 0.0
+    render_returncode = 2 if blocked or plan_errors else 0
+    if not blocked and not plan_errors and grouped_commands:
+        for command_index, command in enumerate(grouped_commands):
+            completed, elapsed = _run_capture(
+                command,
+                cwd=args.repo_root,
+                log_path=args.results_root / "logs" / f"{log_stem}_group_{command_index:04d}.log",
+            )
+            render_elapsed += elapsed
+            render_returncode = int(completed.returncode)
+            if render_returncode != 0:
+                break
+
+    metrics = _metric_payloads(output_root)
+    videos = sorted(output_root.glob("renders/**/*.mp4"))
+    output_bytes = _dir_size_bytes(output_root)
+    render_overhead = _render_overhead_summary(
+        metrics,
+        outer_render_elapsed_sec=render_elapsed,
+    )
+    family, source, scene = key
+    status = "success" if render_returncode == 0 and videos else "failed"
+    if blocked:
+        status = "blocked"
+    elif plan_errors:
+        status = "invalid"
+    return {
+        "entry_index": int(index),
+        "record_type": "grouped_same_scene",
+        "entry_count": len(entries),
+        "family": family,
+        "source": source,
+        "scene": scene,
+        "scenario_id": None,
+        "video_backend": args.video_backend,
+        "minimal_frames": args.minimal_frames,
+        "expected_renderer_blocked": False,
+        "plan_status": "ready" if all(status == "ready" for status in plan_statuses) else ",".join(sorted(set(plan_statuses))),
+        "plan_returncode": 0 if not plan_errors else 2,
+        "plan_elapsed_sec": plan_elapsed,
+        "plan_errors": plan_errors,
+        "blocked_plan_count": len(blocked),
+        "render_returncode": render_returncode,
+        "render_elapsed_sec": render_elapsed,
+        "status": status,
+        "job_count": len(all_plans),
+        "grouped_command_count": len(grouped_commands),
+        "frames_total": render_overhead.get("nested_frames_total"),
+        "duration_total_sec": render_overhead.get("nested_duration_total_sec"),
+        "time_per_frame_sec": (
+            float(render_overhead.get("nested_duration_total_sec") or 0.0)
+            / float(render_overhead.get("nested_frames_total") or 1)
+            if render_overhead.get("nested_frames_total")
+            else None
+        ),
+        "paths_ok": render_overhead.get("nested_paths_ok"),
+        "renderer_process_count": render_overhead.get("renderer_process_count"),
+        "render_overhead": render_overhead,
+        "metrics": metrics,
+        "videos": [str(path) for path in videos],
+        "output_root": str(output_root),
+        "output_bytes": output_bytes,
+        "gpu_summary": {},
+    }
+
+
 def main() -> int:
     args = _parse_args()
     args.package_root = args.package_root.expanduser().resolve()
@@ -534,6 +874,7 @@ def main() -> int:
         "renders_per_family_source_scene": int(args.renders_per_family_source_scene),
         "workers": int(args.workers),
         "skip_expected_blocked": bool(args.skip_expected_blocked),
+        "execution_mode": "grouped_same_scene" if bool(args.group_same_scene) else "per_manifest",
         "selected_count": len(selected),
         "records": [],
     }
@@ -541,7 +882,48 @@ def main() -> int:
     gpu_samples_path = args.results_root / "gpu_samples.jsonl"
     benchmark_t0 = time.perf_counter()
     with GpuMonitor(float(args.gpu_sample_interval_sec), log_path=gpu_samples_path) as run_monitor:
-        if int(args.workers) <= 1:
+        if bool(args.group_same_scene):
+            grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+            for entry in selected:
+                grouped.setdefault(_entry_group_key(entry), []).append(entry)
+            group_items = list(grouped.items())
+            summary["execution_record_count"] = len(group_items)
+            if int(args.workers) <= 1:
+                for index, (key, group_entries) in enumerate(group_items):
+                    record = _render_group(args, key, group_entries, index)
+                    summary["records"].append(record)
+                    with jsonl_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    print(
+                        f"{index + 1}/{len(group_items)} group={record['family']} "
+                        f"{record['source']} {record['scene']} entries={record['entry_count']} "
+                        f"status={record['status']} frames={record.get('frames_total')} "
+                        f"render={record['render_elapsed_sec']:.2f}s bytes={record['output_bytes']}",
+                        flush=True,
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
+                    futures = {
+                        pool.submit(_render_group, args, key, group_entries, index): index
+                        for index, (key, group_entries) in enumerate(group_items)
+                    }
+                    completed_count = 0
+                    for future in as_completed(futures):
+                        index = futures[future]
+                        record = future.result()
+                        completed_count += 1
+                        summary["records"].append(record)
+                        with jsonl_path.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(record, sort_keys=True) + "\n")
+                        print(
+                            f"{completed_count}/{len(group_items)} group={index} "
+                            f"{record['family']} {record['source']} {record['scene']} "
+                            f"entries={record['entry_count']} status={record['status']} "
+                            f"frames={record.get('frames_total')} render={record['render_elapsed_sec']:.2f}s "
+                            f"bytes={record['output_bytes']}",
+                            flush=True,
+                        )
+        elif int(args.workers) <= 1:
             for index, entry in enumerate(selected):
                 record = _render_entry(args, entry, index)
                 summary["records"].append(record)

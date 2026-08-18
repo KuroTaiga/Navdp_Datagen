@@ -266,6 +266,21 @@ def _format_bytes(num_bytes: int | float | None) -> str:
     return f"{value:.2f}{units[idx]}"
 
 
+def _parse_label_actor_plan_map(items: Sequence[str] | None) -> dict[str, Path]:
+    mapping: dict[str, Path] = {}
+    for item in items or []:
+        raw = str(item)
+        if "=" not in raw:
+            raise ValueError(f"--label-actor-plan-json must be LABEL=PATH, got: {raw}")
+        label_id, _, path = raw.partition("=")
+        label_id = label_id.strip()
+        path = path.strip()
+        if not label_id or not path:
+            raise ValueError(f"--label-actor-plan-json must be LABEL=PATH, got: {raw}")
+        mapping[label_id] = Path(path)
+    return mapping
+
+
 def _dir_size_bytes(path: Path) -> int | None:
     """Best-effort directory size (fast path via du, fallback via stat walk)."""
     try:
@@ -2462,6 +2477,16 @@ def parse_args() -> argparse.Namespace:
             "from the plan and the camera remains on the label path."
         ),
     )
+    parser.add_argument(
+        "--label-actor-plan-json",
+        action="append",
+        default=None,
+        metavar="LABEL=PATH",
+        help=(
+            "Optional per-label actor motion plan mapping for grouped renderer invocations. "
+            "When present, each listed label uses its own actor plan."
+        ),
+    )
     parser.add_argument("--actor-pattern", default=DEFAULT_ACTOR_PATTERN)
     parser.add_argument("--actor-height", type=float, default=1.7)
     parser.add_argument("--actor-speed", type=float, default=DEFAULT_ACTOR_SPEED)
@@ -2524,6 +2549,11 @@ def main() -> int:
     lifecycle_seconds = _new_lifecycle_seconds()
     with _measure_lifecycle(lifecycle_seconds, "argument_parse_sec"):
         args = parse_args()
+    label_actor_plan_map = _parse_label_actor_plan_map(
+        getattr(args, "label_actor_plan_json", None)
+    )
+    if label_actor_plan_map and args.actor_plan_json is not None:
+        raise ValueError("--actor-plan-json cannot be combined with --label-actor-plan-json")
     if args.view_mode not in ("forward", ""):
         LOGGER.warning("view-mode '%s' is not supported; using 'forward'.", args.view_mode)
     if args.path_handedness == "auto":
@@ -2847,7 +2877,7 @@ def main() -> int:
 
     actor_motion_plans: tuple[ActorMotionPlan, ...] = ()
     actor_render_runtimes: tuple[ActorRenderRuntime, ...] = ()
-    if args.actor_plan_json is not None:
+    if args.actor_plan_json is not None and not label_actor_plan_map:
         with _measure_lifecycle(lifecycle_seconds, "actor_plan_load_sec"):
             actor_motion_plans = load_actor_motion_plans(args.actor_plan_json)
         args.actor_motion_plans = actor_motion_plans
@@ -2922,12 +2952,43 @@ def main() -> int:
         try:
             paths_attempted += 1
             record_path_status(label_id, STATUS_RETRY, error="started")
+            label_actor_runtimes: tuple[ActorRenderRuntime, ...] = ()
+            label_actor_plan_path = label_actor_plan_map.get(label_id)
+            if label_actor_plan_path is not None:
+                with _measure_lifecycle(lifecycle_seconds, "actor_plan_load_sec"):
+                    label_actor_motion_plans = load_actor_motion_plans(label_actor_plan_path)
+                actor_load_t0 = time.perf_counter()
+                label_actor_runtimes = tuple(
+                    _load_actor_render_runtime(plan=plan, args=args, renderer=renderer)
+                    for plan in label_actor_motion_plans
+                )
+                actor_gpu_upload_sec = sum(
+                    max(0.0, float(item.gpu_cache_upload_sec or 0.0))
+                    for item in label_actor_runtimes
+                )
+                lifecycle_seconds["actor_gpu_cache_upload_sec"] = lifecycle_seconds.get(
+                    "actor_gpu_cache_upload_sec", 0.0
+                ) + actor_gpu_upload_sec
+                lifecycle_seconds["actor_sequence_load_sec"] = lifecycle_seconds.get(
+                    "actor_sequence_load_sec", 0.0
+                ) + max(0.0, (time.perf_counter() - actor_load_t0) - actor_gpu_upload_sec)
+
             if lifecycle_seconds.get("first_frame_latency_sec", 0.0) <= 0.0:
                 lifecycle_seconds["first_frame_latency_sec"] = max(
                     0.0,
                     time.perf_counter() - _PROCESS_START_PERF_SEC,
                 )
-            if actor_render_runtimes:
+
+            if label_actor_runtimes:
+                path_metrics = render_label_with_actor_plans(
+                    renderer=renderer,
+                    prepared=prepared,
+                    output_dir=args.output_dir,
+                    label_id=label_id,
+                    args=args,
+                    actor_render_runtimes=label_actor_runtimes,
+                )
+            elif actor_render_runtimes:
                 path_metrics = render_label_with_actor_plans(
                     renderer=renderer,
                     prepared=prepared,
