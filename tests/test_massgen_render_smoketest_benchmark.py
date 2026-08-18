@@ -224,6 +224,22 @@ def test_grouped_render_command_chunks_compatible_labels(tmp_path) -> None:
     ]
 
 
+def test_group_entry_tasks_chunks_manifest_groups() -> None:
+    grouped = {
+        ("family", "source", "scene_a"): [{"id": index} for index in range(5)],
+        ("family", "source", "scene_b"): [{"id": index} for index in range(2)],
+    }
+
+    tasks = bench._group_entry_tasks(grouped, max_manifests_per_task=2)
+
+    assert [(key[2], [entry["id"] for entry in entries], chunk, count) for key, entries, _, chunk, count in tasks] == [
+        ("scene_a", [0, 1], 0, 3),
+        ("scene_a", [2, 3], 1, 3),
+        ("scene_a", [4], 2, 3),
+        ("scene_b", [0, 1], 0, 1),
+    ]
+
+
 def test_grouped_render_command_keeps_incompatible_render_options_separate(tmp_path) -> None:
     plans = [
         {

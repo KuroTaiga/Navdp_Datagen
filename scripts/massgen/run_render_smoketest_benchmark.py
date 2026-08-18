@@ -72,6 +72,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--group-max-manifests-per-task",
+        type=int,
+        default=0,
+        help=(
+            "When --group-same-scene is enabled, split each family/source/scene "
+            "group into independent outer scheduler tasks with at most this many "
+            "manifests. 0 keeps one outer task per scene group."
+        ),
+    )
+    parser.add_argument(
         "--actor-gpu-resident",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -413,20 +423,35 @@ def _entry_group_key(entry: Mapping[str, Any]) -> tuple[str, str, str]:
     )
 
 
-def _group_output_root(results_root: Path, key: tuple[str, str, str]) -> Path:
+def _group_output_root(
+    results_root: Path,
+    key: tuple[str, str, str],
+    *,
+    chunk_index: int | None = None,
+) -> Path:
     family, source, scene = key
-    return (
+    root = (
         results_root
         / "grouped_renders"
         / _safe_component(family)
         / _safe_component(source)
         / _safe_component(scene)
     )
+    if chunk_index is not None:
+        root = root / f"chunk_{chunk_index:04d}"
+    return root
 
 
-def _group_log_stem(key: tuple[str, str, str]) -> Path:
+def _group_log_stem(
+    key: tuple[str, str, str],
+    *,
+    chunk_index: int | None = None,
+) -> Path:
     family, source, scene = key
-    return Path(_safe_component(family)) / _safe_component(source) / _safe_component(scene)
+    stem = Path(_safe_component(family)) / _safe_component(source) / _safe_component(scene)
+    if chunk_index is not None:
+        stem = stem / f"chunk_{chunk_index:04d}"
+    return stem
 
 
 _COMMAND_OPTIONS_WITH_VALUE = {
@@ -746,9 +771,12 @@ def _render_group(
     key: tuple[str, str, str],
     entries: list[Mapping[str, Any]],
     index: int,
+    *,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
 ) -> dict[str, Any]:
-    output_root = _group_output_root(args.results_root, key)
-    log_stem = _group_log_stem(key)
+    output_root = _group_output_root(args.results_root, key, chunk_index=chunk_index)
+    log_stem = _group_log_stem(key, chunk_index=chunk_index)
     plans_root = output_root / "render_plans"
     metrics_root = output_root / "metrics"
     all_plans: list[Mapping[str, Any]] = []
@@ -845,6 +873,9 @@ def _render_group(
         "job_count": len(all_plans),
         "grouped_command_count": len(grouped_commands),
         "group_max_labels_per_command": int(args.group_max_labels_per_command or 0),
+        "group_max_manifests_per_task": int(args.group_max_manifests_per_task or 0),
+        "group_chunk_index": chunk_index,
+        "group_chunk_count": chunk_count,
         "frames_total": render_overhead.get("nested_frames_total"),
         "duration_total_sec": render_overhead.get("nested_duration_total_sec"),
         "time_per_frame_sec": (
@@ -862,6 +893,27 @@ def _render_group(
         "output_bytes": output_bytes,
         "gpu_summary": {},
     }
+
+
+def _group_entry_tasks(
+    grouped: Mapping[tuple[str, str, str], list[Mapping[str, Any]]],
+    *,
+    max_manifests_per_task: int,
+) -> list[tuple[tuple[str, str, str], list[Mapping[str, Any]], int, int | None, int | None]]:
+    tasks: list[tuple[tuple[str, str, str], list[Mapping[str, Any]], int, int | None, int | None]] = []
+    chunk_size = int(max_manifests_per_task or 0)
+    for key, group_entries in grouped.items():
+        if chunk_size <= 0:
+            tasks.append((key, group_entries, len(tasks), None, None))
+            continue
+        chunks = [
+            group_entries[index : index + chunk_size]
+            for index in range(0, len(group_entries), chunk_size)
+        ]
+        chunk_count = len(chunks)
+        for chunk_index, chunk_entries in enumerate(chunks):
+            tasks.append((key, chunk_entries, len(tasks), chunk_index, chunk_count))
+    return tasks
 
 
 def main() -> int:
@@ -917,6 +969,8 @@ def main() -> int:
         "skip_expected_blocked": bool(args.skip_expected_blocked),
         "actor_gpu_resident": bool(args.actor_gpu_resident),
         "execution_mode": "grouped_same_scene" if bool(args.group_same_scene) else "per_manifest",
+        "group_max_labels_per_command": int(args.group_max_labels_per_command),
+        "group_max_manifests_per_task": int(args.group_max_manifests_per_task),
         "selected_count": len(selected),
         "records": [],
     }
@@ -929,16 +983,29 @@ def main() -> int:
             for entry in selected:
                 grouped.setdefault(_entry_group_key(entry), []).append(entry)
             group_items = list(grouped.items())
-            summary["execution_record_count"] = len(group_items)
+            group_tasks = _group_entry_tasks(
+                grouped,
+                max_manifests_per_task=int(args.group_max_manifests_per_task),
+            )
+            summary["scene_group_count"] = len(group_items)
+            summary["execution_record_count"] = len(group_tasks)
             if int(args.workers) <= 1:
-                for index, (key, group_entries) in enumerate(group_items):
-                    record = _render_group(args, key, group_entries, index)
+                for completed_count, (key, group_entries, index, chunk_index, chunk_count) in enumerate(group_tasks, start=1):
+                    record = _render_group(
+                        args,
+                        key,
+                        group_entries,
+                        index,
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                    )
                     summary["records"].append(record)
                     with jsonl_path.open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps(record, sort_keys=True) + "\n")
                     print(
-                        f"{index + 1}/{len(group_items)} group={record['family']} "
+                        f"{completed_count}/{len(group_tasks)} group={record['family']} "
                         f"{record['source']} {record['scene']} entries={record['entry_count']} "
+                        f"chunk={record.get('group_chunk_index')} "
                         f"status={record['status']} frames={record.get('frames_total')} "
                         f"render={record['render_elapsed_sec']:.2f}s bytes={record['output_bytes']}",
                         flush=True,
@@ -946,8 +1013,16 @@ def main() -> int:
             else:
                 with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
                     futures = {
-                        pool.submit(_render_group, args, key, group_entries, index): index
-                        for index, (key, group_entries) in enumerate(group_items)
+                        pool.submit(
+                            _render_group,
+                            args,
+                            key,
+                            group_entries,
+                            index,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                        ): index
+                        for key, group_entries, index, chunk_index, chunk_count in group_tasks
                     }
                     completed_count = 0
                     for future in as_completed(futures):
@@ -958,9 +1033,10 @@ def main() -> int:
                         with jsonl_path.open("a", encoding="utf-8") as handle:
                             handle.write(json.dumps(record, sort_keys=True) + "\n")
                         print(
-                            f"{completed_count}/{len(group_items)} group={index} "
+                            f"{completed_count}/{len(group_tasks)} group={index} "
                             f"{record['family']} {record['source']} {record['scene']} "
-                            f"entries={record['entry_count']} status={record['status']} "
+                            f"entries={record['entry_count']} chunk={record.get('group_chunk_index')} "
+                            f"status={record['status']} "
                             f"frames={record.get('frames_total')} render={record['render_elapsed_sec']:.2f}s "
                             f"bytes={record['output_bytes']}",
                             flush=True,
