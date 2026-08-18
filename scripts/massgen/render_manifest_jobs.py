@@ -76,6 +76,30 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Write per-frame actor candidate/visible/culled/rendered metadata.",
     )
+    parser.add_argument(
+        "--robot-overlay-script",
+        type=Path,
+        default=REPO_ROOT / "scripts" / "render" / "assets" / "render_glb_robot_overlay.py",
+    )
+    parser.add_argument(
+        "--robot-glb",
+        type=Path,
+        default=REPO_ROOT / "assets" / "robots" / "g1_29dof_mode_16.glb",
+    )
+    parser.add_argument(
+        "--robot-urdf",
+        type=Path,
+        default=REPO_ROOT / "data" / "g1_description" / "g1_29dof_mode_16.urdf",
+    )
+    parser.add_argument(
+        "--kimodo-smplx-dir",
+        type=Path,
+        default=REPO_ROOT / "assets" / "walking_kimodo",
+        help="Kimodo SMPL-X frames used to retarget G1 AMO/joint poses for robot overlays.",
+    )
+    parser.add_argument("--robot-compose-mode", choices=["foreground", "depth"], default="depth")
+    parser.add_argument("--robot-glb-up-axis", choices=["y", "z"], default="z")
+    parser.add_argument("--robot-target-height", type=float, default=None)
     parser.add_argument("--json", action="store_true", help="Print the plan as JSON.")
     parser.add_argument(
         "--allow-blocked-summary",
@@ -123,6 +147,13 @@ def main() -> int:
         minimal_frames=args.minimal_frames,
         actor_gpu_resident=bool(args.actor_gpu_resident),
         save_actor_metadata=bool(args.save_actor_metadata),
+        robot_overlay_script=args.robot_overlay_script,
+        robot_glb=args.robot_glb,
+        robot_urdf=args.robot_urdf,
+        kimodo_smplx_dir=args.kimodo_smplx_dir,
+        robot_compose_mode=str(args.robot_compose_mode),
+        robot_glb_up_axis=str(args.robot_glb_up_axis),
+        robot_target_height=args.robot_target_height,
     )
     if summary is not None:
         plan_payload["summary_status"] = summary.get("status") if isinstance(summary, dict) else None

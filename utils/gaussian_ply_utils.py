@@ -243,7 +243,7 @@ def apply_transform_inplace(
         axis=1,
     )
 
-    xyz = xyz @ rotation.T
+    xyz = (xyz * scale) @ rotation.T
     if translate:
         xyz = xyz + t[None, :]
 

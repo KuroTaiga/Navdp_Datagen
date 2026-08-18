@@ -20,24 +20,67 @@ Do not place an object by using a mesh center as the ground point. The renderer
 expects the pose translation to be the object's ground-contact origin after
 local asset normalization.
 
-## Pathplanner to GS Coordinates
+## Pathplanner to TeleSim Coordinates
 
-Pathplanner `map_pose` and scenario trajectories use the left-handed planning
-world. Gaussian-splat rendering uses the occupancy/GS frame. The MassGen
-executor converts every generated camera label path and human actor plan by
-mirroring XY about the occupancy center before handing data to TeleSim:
+MassGen scenario files store robot and human trajectories as Pathplanner
+`map_pose` values. For the CHINGMU Pathplanner scenarios used by the MassGen
+rollouts, those `map_pose.x` / `map_pose.y` values already align with the
+TeleSim scene BEV and occupancy metadata. The MassGen render bridge must not
+mirror XY about the occupancy center before rendering; doing so moves cameras
+and humans to the opposite side of the map.
+
+The exact pipeline for generated camera label paths is:
 
 ```text
-gs_x = left + right - pathplanner_x
-gs_y = top + bottom - pathplanner_y
+Pathplanner scenario:
+  robots[].trajectory[].map_pose.{x,y,yaw}
+
+utils.massgen_render_manifest:
+  camera.trajectory[].position = [map_pose.x, map_pose.y, 0.0]
+  camera.trajectory[].yaw_rad = map_pose.yaw
+
+navdp_datagen.massgen.render_executor label path:
+  raster_world.{x,y,z} = camera.trajectory[].position
+  raster_pixel.u = round((raster_world.x - occupancy.left) / occupancy.scale)
+  raster_pixel.v = round((occupancy.top - raster_world.y) / occupancy.scale)
+  metadata.coordinate_transform = identity_xy
+
+render_label_paths_telesim:
+  load raster_world and raster_pixel
+  derive affine transform from raster_world to raster_pixel
+  render with --no-mirror-translation
 ```
 
-The generated label JSON records `metadata.coordinate_frame:
-gs_right_handed`, `metadata.source_coordinate_frame:
-pathplanner_left_handed`, and `metadata.coordinate_transform:
-mirror_xy_about_occupancy_center`. Its `raster_world` values are already in GS
-space, and `raster_pixel` is computed from those GS coordinates. Do not apply a
-second mirror to MassGen-generated label paths.
+The exact pipeline for generated human actor placement is:
+
+```text
+Pathplanner scenario:
+  humans[].trajectory[].map_pose.{x,y,yaw}
+
+utils.massgen_render_manifest:
+  actor trajectory position = [map_pose.x, map_pose.y, 0.0]
+  actor trajectory yaw_rad = map_pose.yaw
+
+navdp_datagen.massgen.render_executor actor plan:
+  actor frame position.{x,y,z} = actor trajectory position
+  actor sample yaw = atan2(cos(pathplanner_yaw), sin(pathplanner_yaw))
+  actor frame yaw_rad = actor sample yaw + pi
+
+render_label_paths_telesim:
+  apply actor frame position directly as world translation
+  apply actor frame yaw_rad + actor plan yaw_offset_rad
+  use floor z when actor z_mode is "floor"
+```
+
+Generated label JSON records this under
+`metadata.coordinate_pipeline`. Generated actor bundle JSON records the same
+contract under top-level `coordinate_pipeline`.
+
+MassGen actor plans set `yaw_offset_rad` to `0.0`; the `+pi` is applied before
+the bundle frame is written so stationary actors use the same canonical human
+asset convention as moving actors (`atan2(direction_x, direction_y) + pi`). Do
+not pre-negate Pathplanner yaw before this step: that double-compensates the
+asset convention and flips queue/group humans outward by 180 degrees.
 
 ## Asset Normalization
 
@@ -128,6 +171,20 @@ theta = math.atan2(direction_xy[0], direction_xy[1]) + math.pi
 
 That formula is correct for the aligned human PLY actor source, but it should
 not be copied blindly to GLB/URDF assets.
+
+Stationary MassGen human actors carry conventional Pathplanner yaw in
+`map_pose.yaw`, where the intended map-forward vector is
+`[cos(yaw), sin(yaw)]`. The MassGen render executor stores the corresponding
+human actor sample yaw internally as:
+
+```python
+sample_yaw = math.atan2(math.cos(pathplanner_yaw), math.sin(pathplanner_yaw))
+```
+
+It then writes actor-plan frame yaw as `sample_yaw + math.pi`; TeleSim applies
+that frame yaw plus the plan's `yaw_offset_rad`, which MassGen sets to `0.0`.
+Negating the planner forward vector before this step flips queue and group
+actors outward by 180 degrees.
 
 ## Follow-Camera Placement
 

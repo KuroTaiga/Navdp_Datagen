@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import math
 import sys
 from pathlib import Path
 
 from navdp_datagen.massgen.render_executor import build_render_plans, format_plan_text
 from navdp_datagen.massgen.run_config import prepare_render_run
+
+
+def _wrap_angle(value: float) -> float:
+    return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
 
 
 def _pose(x: float, y: float, yaw: float = 0.0) -> dict[str, float]:
@@ -68,6 +73,20 @@ def _write_action_catalog(tmp_path: Path) -> Path:
     path = tmp_path / "action_catalog.json"
     path.write_text(json.dumps(catalog), encoding="utf-8")
     return path
+
+
+def _write_kimodo_smplx_dir(tmp_path: Path) -> Path:
+    frame_dir = tmp_path / "walking_kimodo"
+    frame_dir.mkdir()
+    frame = {
+        "root_pose": [0.0, 0.0, 0.0],
+        "body_pose": [[0.0, 0.0, 0.0] for _ in range(21)],
+        "trans": [0.0, 0.0, 1.0],
+    }
+    frame["body_pose"][3] = [0.5, 0.0, 0.0]
+    frame["body_pose"][4] = [0.1, 0.0, 0.0]
+    (frame_dir / "000000.json").write_text(json.dumps(frame), encoding="utf-8")
+    return frame_dir
 
 
 def _write_simple_scenario(
@@ -213,20 +232,82 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert Path(job_plan["label_path"]).is_file()
     assert Path(job_plan["actor_plan_path"]).is_file()
     label_payload = json.loads(Path(job_plan["label_path"]).read_text(encoding="utf-8"))
-    assert label_payload["metadata"]["coordinate_frame"] == "gs_right_handed"
+    assert label_payload["metadata"]["coordinate_frame"] == "pathplanner_left_handed"
     assert label_payload["metadata"]["source_coordinate_frame"] == "pathplanner_left_handed"
-    assert label_payload["path"]["raster_world"][0]["x"] == 15.0
-    assert label_payload["path"]["raster_world"][0]["y"] == 15.0
-    assert label_payload["path"]["raster_pixel"][0] == [30, 2]
+    assert label_payload["metadata"]["coordinate_transform"] == "identity_xy"
+    assert label_payload["metadata"]["coordinate_pipeline"][0]["stage"] == "massgen_render_manifest"
+    assert (
+        label_payload["metadata"]["coordinate_pipeline"][1]["operation"]
+        == "identity XY into raster_world"
+    )
+    assert label_payload["path"]["raster_world"][0]["x"] == 1.0
+    assert label_payload["path"]["raster_world"][0]["y"] == 1.0
+    assert label_payload["path"]["raster_pixel"][0] == [2, 30]
     assert len(label_payload["path"]["raster_world"]) == 3
     actor_payload = json.loads(Path(job_plan["actor_plan_path"]).read_text(encoding="utf-8"))
     assert actor_payload["schema_version"] == "massgen_actor_bundle.v1"
+    assert actor_payload["coordinate_pipeline"][0]["stage"] == "massgen_render_manifest"
+    assert (
+        actor_payload["coordinate_pipeline"][1]["operation"]
+        == "identity XY into actor frame positions"
+    )
     assert len(actor_payload["actors"]) == 1
     actor = actor_payload["actors"][0]
     assert actor["actor_id"] == "human_target"
     assert actor["action"]["render_action_id"] == "receive_item"
-    assert actor["frames"][0]["position"][:2] == [10.0, 11.5]
+    assert actor["frames"][0]["position"][:2] == [6.0, 4.5]
     assert len(actor["frames"]) == 3
+
+
+def test_stationary_human_actor_yaw_preserves_planner_facing(tmp_path) -> None:
+    planner_yaw = math.radians(97.0)
+    scene_ply = _write_scene(tmp_path / "scenes" / "scene_001")
+    scenario_json = _write_simple_scenario(
+        tmp_path,
+        scene_ply,
+        scenario_id="queue_facing_easy_001",
+        mission_type="serve_queue",
+        human_tags=["queue_participant", "queue_wait", "stationary"],
+        behavior_label="queue_wait",
+    )
+    scenario = json.loads(scenario_json.read_text(encoding="utf-8"))
+    human = scenario["humans"][0]
+    human["start_map_pose"]["yaw"] = planner_yaw
+    for frame in human["trajectory"]:
+        frame["map_pose"]["yaw"] = planner_yaw
+    scenario_json.write_text(json.dumps(scenario), encoding="utf-8")
+    action_catalog_json = _write_action_catalog(tmp_path)
+    result = prepare_render_run(
+        {
+            "scenario_json": str(scenario_json),
+            "action_catalog_json": str(action_catalog_json),
+            "output_root": str(tmp_path / "out"),
+            "sensor_profile": "navdp_legacy_fpv",
+            "selected_sensors": ["fpv_rgb"],
+            "strict_assets": False,
+        },
+        config_path=tmp_path / "config.json",
+        write_outputs=False,
+    )
+    manifest = result["manifest"]
+    output_root = tmp_path / "out"
+
+    plan = build_render_plans(
+        manifest,
+        manifest_path=scenario_json,
+        output_root=output_root,
+        families=["serve_queue"],
+        write_inputs=True,
+        python_bin=sys.executable,
+    )
+
+    actor_payload = json.loads(Path(plan["plans"][0]["actor_plan_path"]).read_text(encoding="utf-8"))
+    actor_yaw = actor_payload["actors"][0]["frames"][0]["yaw_rad"]
+
+    expected_actor_yaw = math.atan2(math.cos(planner_yaw), math.sin(planner_yaw)) + math.pi
+    old_actor_yaw = math.atan2(-math.cos(planner_yaw), -math.sin(planner_yaw)) + math.pi
+    assert abs(_wrap_angle(actor_yaw - expected_actor_yaw)) < 1e-9
+    assert abs(abs(_wrap_angle(old_actor_yaw - expected_actor_yaw)) - math.pi) < 1e-9
 
 
 def test_executor_family_selection_and_text_output(tmp_path) -> None:
@@ -499,12 +580,44 @@ def test_executor_supports_multi_sequence_same_human_bundle(tmp_path) -> None:
     wave = next(actor for actor in actor_payload["actors"] if actor["action"]["render_action_id"] == "wave")
     assert [frame["active"] for frame in stand["frames"]] == [True, True, False]
     assert [frame["active"] for frame in wave["frames"]] == [False, True, True]
+    assert stand["action"]["animation_frame_policy"] == "first_frame_static"
+    assert wave["action"]["animation_frame_policy"] == "first_frame_static"
+    assert {frame["animation_frame_index"] for frame in stand["frames"]} == {0}
+    assert {frame["animation_frame_index"] for frame in wave["frames"]} == {0}
     assert "uses 2 renderer action segments" in "\n".join(job_plan["warnings"])
 
 
-def test_executor_blocks_peer_robot_jobs_until_robot_overlay_is_connected(tmp_path) -> None:
+def test_executor_plans_chained_peer_robot_overlays(tmp_path) -> None:
     manifest, scenario_json, output_root = _prepared_manifest(tmp_path)
-    manifest["jobs"][0]["peer_robot_ids"] = ["robot_beta"]
+    robot_glb = tmp_path / "robot.glb"
+    robot_glb.write_bytes(b"glb")
+    robot_urdf = tmp_path / "g1.urdf"
+    robot_urdf.write_text("<robot name='g1' />", encoding="utf-8")
+    overlay_script = tmp_path / "render_glb_robot_overlay.py"
+    overlay_script.write_text("#!/usr/bin/env python\n", encoding="utf-8")
+    kimodo_smplx_dir = _write_kimodo_smplx_dir(tmp_path)
+
+    manifest["jobs"][0]["peer_robot_ids"] = ["robot_beta", "robot_gamma"]
+    manifest["jobs"][0]["peer_robot_pose_tracks"] = [
+        {
+            "actor_id": "robot_beta",
+            "asset": {"glb_path": str(robot_glb), "urdf_path": str(robot_urdf)},
+            "trajectory": [
+                {"t": 0.0, "position": [2.0, 2.0, 0.0], "yaw_rad": 0.0},
+                {"t": 1.0, "position": [3.0, 2.0, 0.0], "yaw_rad": 0.0},
+                {"t": 2.0, "position": [4.0, 2.0, 0.0], "yaw_rad": 0.0},
+            ],
+        },
+        {
+            "actor_id": "robot_gamma",
+            "asset": {"glb_path": str(robot_glb), "urdf_path": str(robot_urdf)},
+            "trajectory": [
+                {"t": 0.0, "position": [2.0, 3.0, 0.0], "yaw_rad": 0.0},
+                {"t": 1.0, "position": [3.0, 3.0, 0.0], "yaw_rad": 0.0},
+                {"t": 2.0, "position": [4.0, 3.0, 0.0], "yaw_rad": 0.0},
+            ],
+        },
+    ]
 
     plan = build_render_plans(
         manifest,
@@ -513,7 +626,28 @@ def test_executor_blocks_peer_robot_jobs_until_robot_overlay_is_connected(tmp_pa
         families=["deliver_to_human"],
         write_inputs=True,
         python_bin=sys.executable,
+        robot_overlay_script=overlay_script,
+        robot_glb=robot_glb,
+        robot_urdf=robot_urdf,
+        kimodo_smplx_dir=kimodo_smplx_dir,
     )
 
-    assert plan["status"] == "blocked"
-    assert any("peer robot rendering" in item for item in plan["plans"][0]["blockers"])
+    assert plan["status"] == "ready"
+    job_plan = plan["plans"][0]
+    assert job_plan["status"] == "ready"
+    assert "--rgb-frames" in job_plan["command"]
+    assert len(job_plan["robot_overlay_commands"]) == 2
+    first, second = job_plan["robot_overlay_commands"]
+    assert first["actor_id"] == "robot_beta"
+    assert second["actor_id"] == "robot_gamma"
+    assert first["video"] is None
+    assert second["video"].endswith("__with_peer_robots.mp4")
+    assert second["input_frames_dir"] == first["output_frames_dir"]
+    assert Path(first["poses_json"]).is_file()
+    assert Path(first["amo_poses_json"]).is_file()
+    pose_payload = json.loads(Path(first["poses_json"]).read_text(encoding="utf-8"))
+    amo_payload = json.loads(Path(first["amo_poses_json"]).read_text(encoding="utf-8"))
+    assert pose_payload["schema_version"] == "massgen_robot_overlay_poses.v1"
+    assert len(pose_payload["frames"]) == 3
+    assert amo_payload["schema_version"] == "g1_amo_retarget.v1"
+    assert amo_payload["frames"][0]["joint_positions"]["left_shoulder_roll_joint"] == 0.18

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -9,6 +10,21 @@ from typing import Any, Iterable
 import numpy as np
 
 EPS = 1e-6
+REPO_ROOT = Path(__file__).resolve().parents[1]
+RENDER_ASSETS_DIR = REPO_ROOT / "scripts" / "render" / "assets"
+
+DEPTH_ENCODING_SPECS = {
+    16: {"step_m": 0.001, "max_m": 0.001 * ((1 << 16) - 1)},
+    12: {"step_m": 0.001, "max_m": 0.001 * ((1 << 12) - 1)},
+    10: {"step_m": 0.002, "max_m": 0.002 * ((1 << 10) - 1)},
+    8: {"step_m": 0.04, "max_m": 0.04 * ((1 << 8) - 1)},
+}
+
+
+def _ensure_render_asset_import_path() -> None:
+    assets_dir = str(RENDER_ASSETS_DIR)
+    if assets_dir not in sys.path:
+        sys.path.insert(0, assets_dir)
 
 
 @dataclass(frozen=True)
@@ -363,16 +379,21 @@ def compose_rgba_over_rgb(
     return np.clip(composed, 0.0, 255.0).astype(np.uint8)
 
 
-def decode_quantized_depth(depth_image: np.ndarray, *, bit_depth: int) -> np.ndarray:
-    steps = {
-        16: 0.001,
-        12: 0.001,
-        10: 0.002,
-        8: 0.04,
-    }
-    if bit_depth not in steps:
+def quantize_depth_meters(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
+    if bit_depth not in DEPTH_ENCODING_SPECS:
         raise ValueError(f"Unsupported depth bit depth: {bit_depth}")
-    return depth_image.astype(np.float32) * steps[bit_depth]
+    spec = DEPTH_ENCODING_SPECS[bit_depth]
+    depth = depth_m.astype(np.float32, copy=False)
+    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
+    depth_clipped = np.clip(depth, 0.0, float(spec["max_m"]))
+    depth_quant = np.rint(depth_clipped / float(spec["step_m"]))
+    return depth_quant.astype(np.uint16 if bit_depth > 8 else np.uint8)
+
+
+def decode_quantized_depth(depth_image: np.ndarray, *, bit_depth: int) -> np.ndarray:
+    if bit_depth not in DEPTH_ENCODING_SPECS:
+        raise ValueError(f"Unsupported depth bit depth: {bit_depth}")
+    return depth_image.astype(np.float32) * float(DEPTH_ENCODING_SPECS[bit_depth]["step_m"])
 
 
 class GlbRobotRenderer:
@@ -476,12 +497,13 @@ class GlbRobotRenderer:
         bind_joint_positions: dict[str, float] | None,
     ) -> None:
         try:
-            from scripts.convert_urdf_visuals_to_glb import (  # pylint: disable=import-outside-toplevel
+            _ensure_render_asset_import_path()
+            from convert_urdf_visuals_to_glb import (  # pylint: disable=import-outside-toplevel
                 compute_link_transforms,
                 parse_urdf_visuals,
             )
         except ImportError as exc:
-            raise RuntimeError("URDF articulation requires scripts.convert_urdf_visuals_to_glb.") from exc
+            raise RuntimeError("URDF articulation requires convert_urdf_visuals_to_glb.py.") from exc
 
         _, joints, links = parse_urdf_visuals(urdf_path, package_root=package_root)
         bind_transforms = compute_link_transforms(
@@ -520,7 +542,8 @@ class GlbRobotRenderer:
             return None
         if self.joints is None or self.links is None or self.link_bind_transforms is None:
             return None
-        from scripts.convert_urdf_visuals_to_glb import compute_link_transforms  # pylint: disable=import-outside-toplevel
+        _ensure_render_asset_import_path()
+        from convert_urdf_visuals_to_glb import compute_link_transforms  # pylint: disable=import-outside-toplevel
 
         return compute_link_transforms(
             self.links,

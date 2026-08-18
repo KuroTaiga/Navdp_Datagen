@@ -13,6 +13,18 @@ from typing import Any
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_repo_root_str = str(REPO_ROOT)
+if not sys.path or sys.path[0] != _repo_root_str:
+    sys.path = [item for item in sys.path if item != _repo_root_str]
+    sys.path.insert(0, _repo_root_str)
+_render_assets_str = str(REPO_ROOT / "scripts" / "render" / "assets")
+if _render_assets_str not in sys.path:
+    sys.path.insert(1, _render_assets_str)
+
+from retarget_smplx_kimodo_to_g1 import (  # noqa: E402
+    load_smplx_frame_paths,
+    retarget_smplx_frames,
+)
 
 
 def _natural_label_key(path: Path) -> tuple[int, str]:
@@ -56,6 +68,20 @@ def _select_labels(tasks_dir: Path, scene_id: str, count: int) -> list[str]:
     return labels
 
 
+def _base_outputs_complete(base_dir: Path, scene_id: str, label: str) -> bool:
+    scene_dir = base_dir / scene_id
+    frames_dir = scene_dir / label
+    if not (scene_dir / f"{label}_camera.json").is_file():
+        return False
+    if not frames_dir.is_dir():
+        return False
+    if not any(frames_dir.glob("frame_*.png")):
+        return False
+    if not any(frames_dir.glob("frame_*_depth.png")):
+        return False
+    return True
+
+
 def _load_scene_floor_z(scenes_dir: Path, scene_id: str) -> float:
     occupancy_path = scenes_dir / scene_id / "occupancy.json"
     with occupancy_path.open("r", encoding="utf-8") as fh:
@@ -90,6 +116,7 @@ def _yaw_from_direction(dx: float, dy: float, *, forward_axis: str) -> float:
 def _generate_robot_poses(
     *,
     follow_metadata_path: Path,
+    camera_metadata_path: Path | None,
     output_path: Path,
     floor_z: float,
     foot_offset: float,
@@ -97,18 +124,11 @@ def _generate_robot_poses(
     forward_axis: str,
     follow_distance: float,
 ) -> int:
-    with follow_metadata_path.open("r", encoding="utf-8") as fh:
-        follow_payload = json.load(fh)
-    frames = follow_payload.get("frames")
-    if not isinstance(frames, list):
-        raise ValueError(f"Missing frames in follow metadata: {follow_metadata_path}")
-
-    person_xy: list[np.ndarray] = []
-    for idx, frame in enumerate(frames):
-        value = frame.get("person_world")
-        if not isinstance(value, list) or len(value) < 2:
-            raise ValueError(f"Frame {idx} missing person_world in {follow_metadata_path}")
-        person_xy.append(np.asarray([float(value[0]), float(value[1])], dtype=np.float64))
+    person_xy = _load_follow_person_xy(
+        follow_metadata_path,
+        camera_metadata_path=camera_metadata_path,
+        follow_distance=float(follow_distance),
+    )
 
     pose_frames: list[dict[str, Any]] = []
     last_yaw = yaw_offset_rad
@@ -151,6 +171,67 @@ def _generate_robot_poses(
     return len(pose_frames)
 
 
+def _load_follow_person_xy(
+    follow_metadata_path: Path,
+    *,
+    camera_metadata_path: Path | None,
+    follow_distance: float,
+) -> list[np.ndarray]:
+    try:
+        with follow_metadata_path.open("r", encoding="utf-8") as fh:
+            follow_payload = json.load(fh)
+        frames = follow_payload.get("frames")
+        if not isinstance(frames, list):
+            raise ValueError(f"Missing frames in follow metadata: {follow_metadata_path}")
+        person_xy: list[np.ndarray] = []
+        for idx, frame in enumerate(frames):
+            value = frame.get("person_world")
+            if not isinstance(value, list) or len(value) < 2:
+                raise ValueError(f"Frame {idx} missing person_world in {follow_metadata_path}")
+            person_xy.append(np.asarray([float(value[0]), float(value[1])], dtype=np.float64))
+        return person_xy
+    except (json.JSONDecodeError, OSError, ValueError) as exc:
+        if camera_metadata_path is None:
+            raise
+        print(
+            f"[WARN] Could not use follow metadata {follow_metadata_path}: {exc}; "
+            f"falling back to camera path {camera_metadata_path}",
+            flush=True,
+        )
+        return _camera_path_robot_xy(camera_metadata_path, follow_distance=float(follow_distance))
+
+
+def _camera_path_robot_xy(camera_metadata_path: Path, *, follow_distance: float) -> list[np.ndarray]:
+    with camera_metadata_path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    frames = payload.get("frames")
+    if not isinstance(frames, list):
+        raise ValueError(f"Missing frames in camera metadata: {camera_metadata_path}")
+    centers: list[np.ndarray] = []
+    for idx, frame in enumerate(frames):
+        value = frame.get("camera_center_world")
+        if not isinstance(value, list) or len(value) < 2:
+            raise ValueError(f"Frame {idx} missing camera_center_world in {camera_metadata_path}")
+        centers.append(np.asarray([float(value[0]), float(value[1])], dtype=np.float64))
+    if not centers:
+        raise ValueError(f"No camera frames in {camera_metadata_path}")
+
+    robot_xy: list[np.ndarray] = []
+    last_direction = np.asarray([1.0, 0.0], dtype=np.float64)
+    for idx, center in enumerate(centers):
+        if len(centers) == 1:
+            direction = last_direction
+        elif idx < len(centers) - 1:
+            direction = centers[idx + 1] - center
+        else:
+            direction = center - centers[idx - 1]
+        norm = float(np.linalg.norm(direction))
+        if norm > 1e-8:
+            last_direction = direction / norm
+        robot_xy.append(center + last_direction * float(follow_distance))
+    return robot_xy
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -181,6 +262,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--follow-distance", type=float, default=1.5)
     parser.add_argument("--robot-foot-offset", type=float, default=0.0)
     parser.add_argument("--robot-yaw-offset-deg", type=float, default=0.0)
+    parser.add_argument(
+        "--kimodo-smplx-dir",
+        type=Path,
+        default=None,
+        help="Optional Kimodo SMPL-X frame directory used to drive G1 AMO/joint animation.",
+    )
+    parser.add_argument("--kimodo-stride", type=int, default=1, help="Source SMPL-X frame stride for AMO retargeting.")
+    parser.add_argument("--kimodo-scale", type=float, default=1.0, help="Retargeted AMO joint amplitude scale.")
     parser.add_argument("--compose-mode", choices=("foreground", "depth"), default="foreground")
     parser.add_argument("--depth-bit-depth", type=int, choices=(8, 10, 12, 16), default=16)
     parser.add_argument("--video", action=argparse.BooleanOptionalAction, default=True)
@@ -214,6 +303,9 @@ def main() -> int:
     pose_dir = output_dir / "robot_poses"
     robot_dir = output_dir / "robot_overlay"
     python_exe = str(args.python)
+    kimodo_frame_paths = None
+    if args.kimodo_smplx_dir is not None:
+        kimodo_frame_paths = load_smplx_frame_paths(args.kimodo_smplx_dir.resolve())
 
     scene_id = _find_scene(tasks_dir, str(args.scene_prefix))
     labels = _select_labels(tasks_dir, scene_id, int(args.path_count))
@@ -263,7 +355,14 @@ def main() -> int:
     for label in labels:
         render_cmd.extend(["--label-id", label])
     render_cmd.extend(args.extra_render_arg)
-    _run(render_cmd, dry_run=bool(args.dry_run))
+    base_outputs_ready = all(_base_outputs_complete(base_dir, scene_id, label) for label in labels)
+    if args.overwrite or not base_outputs_ready:
+        _run(render_cmd, dry_run=bool(args.dry_run))
+    else:
+        print(
+            f"[SKIP] Base GS render already exists for {scene_id} labels {', '.join(labels)}",
+            flush=True,
+        )
 
     overlay_outputs: list[dict[str, Any]] = []
     yaw_offset_rad = math.radians(float(args.robot_yaw_offset_deg))
@@ -272,6 +371,7 @@ def main() -> int:
         camera_json = base_dir / scene_id / f"{label}_camera.json"
         frames_dir = base_dir / scene_id / label
         pose_json = pose_dir / scene_id / f"{label}_robot_poses.json"
+        amo_json = pose_dir / scene_id / f"{label}_g1_amo_from_kimodo.json"
         out_frames = robot_dir / scene_id / label
         out_video = robot_dir / scene_id / f"{label}_g1_robot.mp4"
 
@@ -284,6 +384,7 @@ def main() -> int:
         else:
             pose_frame_count = _generate_robot_poses(
                 follow_metadata_path=follow_metadata_path,
+                camera_metadata_path=camera_json,
                 output_path=pose_json,
                 floor_z=floor_z,
                 foot_offset=float(args.robot_foot_offset),
@@ -291,6 +392,17 @@ def main() -> int:
                 forward_axis=str(args.robot_forward_axis),
                 follow_distance=float(args.follow_distance),
             )
+
+        use_kimodo_amo = kimodo_frame_paths is not None
+        if use_kimodo_amo and not args.dry_run and (args.overwrite or not amo_json.exists()):
+            amo_payload = retarget_smplx_frames(
+                kimodo_frame_paths,
+                frame_count=int(pose_frame_count),
+                stride=int(args.kimodo_stride),
+                scale=float(args.kimodo_scale),
+            )
+            amo_json.parent.mkdir(parents=True, exist_ok=True)
+            amo_json.write_text(json.dumps(amo_payload, indent=2), encoding="utf-8")
 
         overlay_cmd = [
             python_exe,
@@ -312,6 +424,17 @@ def main() -> int:
             "--glb-up-axis",
             str(args.robot_glb_up_axis),
         ]
+        if use_kimodo_amo:
+            overlay_cmd.extend(
+                [
+                    "--robot-urdf",
+                    str(args.urdf),
+                    "--robot-package-root",
+                    str(args.urdf.parent),
+                    "--amo-poses-json",
+                    str(amo_json),
+                ]
+            )
         if args.compose_mode == "depth":
             overlay_cmd.extend(["--depth-dir", str(frames_dir)])
         if args.video:
@@ -326,6 +449,7 @@ def main() -> int:
             {
                 "label": label,
                 "pose_json": str(pose_json),
+                "amo_json": str(amo_json) if use_kimodo_amo else None,
                 "pose_frames": int(pose_frame_count),
                 "frames_dir": str(out_frames),
                 "video": str(out_video) if args.video else None,
@@ -340,8 +464,10 @@ def main() -> int:
         "scenes_dir": str(scenes_dir),
         "base_render_dir": str(base_dir),
         "robot_glb": str(args.robot_glb),
+        "robot_urdf": str(args.urdf),
         "robot_glb_up_axis": str(args.robot_glb_up_axis),
         "robot_forward_axis": str(args.robot_forward_axis),
+        "kimodo_smplx_dir": str(args.kimodo_smplx_dir) if args.kimodo_smplx_dir is not None else None,
         "follow_distance": float(args.follow_distance),
         "compose_mode": str(args.compose_mode),
         "outputs": overlay_outputs,

@@ -32,7 +32,12 @@ DEFAULT_ACTOR_DIR = (
     "/home/dongjk/project_files/NavDP_Jiankun_ver/navdp_api/gaussian_splatting/"
     "debug_npc_ply/0001_839920/73"
 )
+DEFAULT_HUMAN_GS_SOURCE_ROOT = (
+    "/home/dongjk/project_files/NavDP_Jiankun_ver/navdp_api/gaussian_splatting/"
+    "data/human_gs_source"
+)
 DEFAULT_REMOTE_SCENE_PLY = "/mnt/DATA/dongjk/navdp_data/scenes/0030_839913/3dgs_compressed.ply"
+PLANNER_VISUAL_SUFFIXES = (".png", ".gif")
 
 FAMILY_SOURCES = {
     "deliver_to_human": ("deliver_to_human", "deliver_to_human"),
@@ -71,9 +76,43 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--action-catalog-json", type=Path, default=None)
     parser.add_argument("--actor-ply-frame-dir", default=DEFAULT_ACTOR_DIR)
+    parser.add_argument(
+        "--actor-source-root",
+        default=None,
+        help=(
+            "Optional root whose child directories are stable human identities. "
+            "Each mission human is assigned one child directory and keeps it for all actions."
+        ),
+    )
+    parser.add_argument(
+        "--actor-source-id",
+        action="append",
+        default=None,
+        help=(
+            "Human identity subdirectory under --actor-source-root. Repeat to use a remote "
+            "root that is not visible on this machine."
+        ),
+    )
     parser.add_argument("--remote-scene-id", default="0030_839913")
     parser.add_argument("--remote-scene-ply", default=DEFAULT_REMOTE_SCENE_PLY)
+    parser.add_argument(
+        "--preserve-scene",
+        action="store_true",
+        help="Keep each scenario scene_id and only inject a splat path if missing.",
+    )
+    parser.add_argument(
+        "--no-thin-trajectories",
+        action="store_true",
+        help="Keep full robot and human trajectories instead of reducing them to six points.",
+    )
     parser.add_argument("--limit", type=int, default=1)
+    parser.add_argument(
+        "--scenario-override",
+        action="append",
+        default=None,
+        metavar="FAMILY=PATH",
+        help="Override the selected source scenario for a family key. Repeat as needed.",
+    )
     return parser.parse_args()
 
 
@@ -89,24 +128,49 @@ def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _candidate_scenario(source_root: Path, source_rel: str) -> Path:
+def _candidate_scenario(source_root: Path, source_rel: str, *, visual_root: Path | None = None) -> Path:
     json_dir = source_root / source_rel / "jsons"
     candidates = sorted(path for path in json_dir.glob("*.json") if not path.name.endswith("_cornercase_metadata.json"))
     if not candidates:
         raise FileNotFoundError(f"No scenario JSON files found in {json_dir}")
+    if visual_root is not None:
+        by_stem = {path.stem: path for path in candidates}
+        visual_dir = visual_root / source_rel / "visualizations"
+        visual_stems = sorted(
+            {
+                path.name.removesuffix("_bev_trajectory.png")
+                for path in visual_dir.glob("*_bev_trajectory.png")
+                if (visual_dir / f"{path.name.removesuffix('_bev_trajectory.png')}_bev_trajectory.gif").is_file()
+            }
+        )
+        for stem in visual_stems:
+            if stem in by_stem:
+                return by_stem[stem]
     return candidates[0]
 
 
-def _matching_visual(visual_root: Path, source_rel: str, scenario_stem: str) -> Path | None:
+def _scenario_overrides(raw_items: list[str] | None) -> dict[str, Path]:
+    overrides: dict[str, Path] = {}
+    for raw in raw_items or []:
+        if "=" not in raw:
+            raise ValueError(f"--scenario-override must be FAMILY=PATH, got: {raw}")
+        family_key, path = raw.split("=", 1)
+        family_key = family_key.strip()
+        path = path.strip()
+        if not family_key or not path:
+            raise ValueError(f"--scenario-override must be FAMILY=PATH, got: {raw}")
+        overrides[family_key] = Path(path).expanduser()
+    return overrides
+
+
+def _matching_visuals(visual_root: Path, source_rel: str, scenario_stem: str) -> list[Path]:
     vis_dir = visual_root / source_rel / "visualizations"
-    for suffix in (".png", ".gif"):
+    paths: list[Path] = []
+    for suffix in PLANNER_VISUAL_SUFFIXES:
         path = vis_dir / f"{scenario_stem}_bev_trajectory{suffix}"
         if path.is_file():
-            return path
-    candidates = sorted(vis_dir.glob("*_bev_trajectory.png")) if vis_dir.is_dir() else []
-    if not candidates and vis_dir.is_dir():
-        candidates = sorted(vis_dir.glob("*_bev_trajectory.gif"))
-    return candidates[0] if candidates else None
+            paths.append(path)
+    return paths
 
 
 def _scenario_times(scenario: Mapping[str, Any]) -> list[float]:
@@ -132,33 +196,95 @@ def _thin_trajectory(points: list[Any], *, max_points: int = 6) -> list[Any]:
     return [points[int(index)] for index in indices]
 
 
+def _actor_identity_dirs(
+    *,
+    actor_source_root: str | None,
+    actor_source_ids: list[str] | None,
+    actor_ply_frame_dir: str,
+) -> list[str]:
+    if actor_source_root:
+        root = Path(actor_source_root).expanduser()
+        ids = [str(item).strip() for item in (actor_source_ids or []) if str(item).strip()]
+        if ids:
+            return [
+                str(Path(item).expanduser()) if Path(item).is_absolute() else str(root / item)
+                for item in ids
+            ]
+        if root.is_dir():
+            dirs = [
+                path
+                for path in sorted(root.iterdir(), key=lambda item: _natural_identity_key(item.name))
+                if path.is_dir() and any(path.glob("*.ply"))
+            ]
+            if dirs:
+                return [str(path) for path in dirs]
+        raise FileNotFoundError(
+            "No actor identities found under "
+            f"{root}; pass --actor-source-id for remote roots that are not locally mounted."
+        )
+    return [str(actor_ply_frame_dir)]
+
+
+def _natural_identity_key(value: str) -> tuple[int, int | str]:
+    return (0, int(value)) if value.isdigit() else (1, value)
+
+
+def _human_actor_assignment(humans: Any, actor_dirs: list[str]) -> dict[str, str]:
+    if not actor_dirs:
+        raise ValueError("At least one actor identity directory is required.")
+    assignments: dict[str, str] = {}
+    index = 0
+    if not isinstance(humans, list):
+        return assignments
+    for human in humans:
+        if not isinstance(human, Mapping):
+            continue
+        human_id = str(human.get("human_id") or human.get("actor_id") or f"human_{index:03d}")
+        assignments[human_id] = actor_dirs[index % len(actor_dirs)]
+        index += 1
+    return assignments
+
+
 def _scenario_for_smoke(
     scenario: Mapping[str, Any],
     *,
-    scene_id: str,
-    scene_ply: str,
+    scene_id: str | None,
+    scene_ply: str | None,
     actor_ply_frame_dir: str,
+    actor_ply_frame_dirs: list[str] | None = None,
+    thin_trajectories: bool = True,
 ) -> dict[str, Any]:
     payload = json.loads(json.dumps(scenario))
-    payload["scene_id"] = scene_id
+    if scene_id:
+        payload["scene_id"] = scene_id
     scene_assets = dict(payload.get("scene_assets") or {})
-    scene_assets["splat_model_path"] = scene_ply
+    if scene_ply:
+        scene_assets["splat_model_path"] = scene_ply
     payload["scene_assets"] = scene_assets
     for robot in payload.get("robots", []):
-        if isinstance(robot, dict) and isinstance(robot.get("trajectory"), list):
+        if thin_trajectories and isinstance(robot, dict) and isinstance(robot.get("trajectory"), list):
             robot["trajectory"] = _thin_trajectory(robot["trajectory"])
+    actor_dirs = actor_ply_frame_dirs or [actor_ply_frame_dir]
+    actor_assignments = _human_actor_assignment(payload.get("humans", []), actor_dirs)
     for human in payload.get("humans", []):
-        if isinstance(human, dict) and isinstance(human.get("trajectory"), list):
+        if thin_trajectories and isinstance(human, dict) and isinstance(human.get("trajectory"), list):
             human["trajectory"] = _thin_trajectory(human["trajectory"])
         if isinstance(human, dict):
+            human_id = str(human.get("human_id") or human.get("actor_id") or "")
+            assigned_actor_dir = actor_assignments.get(human_id, actor_ply_frame_dir)
+            human.setdefault("metadata", {})
+            if isinstance(human["metadata"], dict):
+                human["metadata"]["renderer_actor_identity_dir"] = assigned_actor_dir
+                human["metadata"]["renderer_actor_identity_id"] = Path(assigned_actor_dir).name
             for sequence in human.get("action_sequences", []):
                 if not isinstance(sequence, dict):
                     continue
-                sequence["ply_frame_dir"] = actor_ply_frame_dir
+                sequence["ply_frame_dir"] = assigned_actor_dir
                 sequence["manifest_path"] = None
                 sequence["smplx_frame_dir"] = None
                 sequence["pre_generated"] = True
                 sequence["source"] = str(sequence.get("source") or "approved_action_codex")
+                sequence["renderer_actor_identity_id"] = Path(assigned_actor_dir).name
     return payload
 
 
@@ -357,40 +483,70 @@ def _copy_or_generate_visual(
     scenario_stem: str,
     family_dir: Path,
     family_key: str,
-) -> str:
-    copied = _matching_visual(visual_root, source_rel, scenario_stem)
+) -> dict[str, Any]:
+    copied = _matching_visuals(visual_root, source_rel, scenario_stem)
     generated_path = family_dir / "example_visualization.png"
-    if copied is not None:
-        shutil.copy2(copied, family_dir / copied.name)
+    visual_paths: list[str] = []
+    if copied:
+        for source_path in copied:
+            copied_path = family_dir / source_path.name
+            copied_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, copied_path)
+            visual_paths.append(str(copied_path))
+        return {
+            "primary": str(next((family_dir / path.name for path in copied if path.suffix.lower() == ".png"), family_dir / copied[0].name)),
+            "paths": sorted(visual_paths),
+            "source": "planner_exact",
+        }
     _generate_bev(scenario, generated_path, title=family_key)
-    return str(generated_path)
+    return {
+        "primary": str(generated_path),
+        "paths": [str(generated_path)],
+        "source": "generated_from_scenario",
+    }
 
 
 def main() -> int:
     args = _parse_args()
     out_root = args.output_root
     out_root.mkdir(parents=True, exist_ok=True)
+    scenario_overrides = _scenario_overrides(args.scenario_override)
+    actor_identity_dirs = _actor_identity_dirs(
+        actor_source_root=args.actor_source_root,
+        actor_source_ids=args.actor_source_id,
+        actor_ply_frame_dir=str(args.actor_ply_frame_dir),
+    )
     action_catalog = _action_catalog_for_actor(
         out_root / "action_catalog_5880_avatar.json",
-        actor_ply_frame_dir=str(args.actor_ply_frame_dir),
+        actor_ply_frame_dir=actor_identity_dirs[0],
     )
     index: dict[str, Any] = {
         "source_root": str(args.source_root),
         "visual_root": str(args.visual_root),
         "output_root": str(out_root),
-        "remote_scene_id": str(args.remote_scene_id),
-        "remote_scene_ply": str(args.remote_scene_ply),
+        "remote_scene_id": None if args.preserve_scene else str(args.remote_scene_id),
+        "remote_scene_ply": str(args.remote_scene_ply) if args.remote_scene_ply else None,
+        "preserve_scene": bool(args.preserve_scene),
+        "thin_trajectories": not bool(args.no_thin_trajectories),
+        "actor_source_root": str(args.actor_source_root) if args.actor_source_root else None,
+        "actor_identity_dirs": actor_identity_dirs,
         "action_catalog_json": str(action_catalog),
         "families": [],
     }
     for family_key, (source_rel, render_family) in FAMILY_SOURCES.items():
-        scenario_path = _candidate_scenario(args.source_root, source_rel)
+        scenario_path = scenario_overrides.get(family_key)
+        if scenario_path is None:
+            scenario_path = _candidate_scenario(args.source_root, source_rel, visual_root=args.visual_root)
+        if not scenario_path.is_file():
+            raise FileNotFoundError(f"Scenario override for {family_key} not found: {scenario_path}")
         scenario = _load_json(scenario_path)
         smoke_scenario = _scenario_for_smoke(
             scenario,
-            scene_id=str(args.remote_scene_id),
-            scene_ply=str(args.remote_scene_ply),
-            actor_ply_frame_dir=str(args.actor_ply_frame_dir),
+            scene_id=None if args.preserve_scene else str(args.remote_scene_id),
+            scene_ply=str(args.remote_scene_ply) if args.remote_scene_ply else None,
+            actor_ply_frame_dir=actor_identity_dirs[0],
+            actor_ply_frame_dirs=actor_identity_dirs,
+            thin_trajectories=not bool(args.no_thin_trajectories),
         )
         family_dir = out_root / family_key
         family_dir.mkdir(parents=True, exist_ok=True)
@@ -404,7 +560,7 @@ def main() -> int:
             _prune_peer_robots_for_human_only(manifest)
         _attach_smoke_sensor(manifest)
         write_json(family_dir / "render_manifest.json", manifest)
-        generated_visual = _copy_or_generate_visual(
+        visual_artifacts = _copy_or_generate_visual(
             visual_root=args.visual_root,
             source_rel=source_rel,
             scenario=scenario,
@@ -420,11 +576,18 @@ def main() -> int:
             "example_original_json": str(family_dir / "example_original.json"),
             "example_smoke_json": str(family_dir / "example_smoke.json"),
             "render_manifest_json": str(family_dir / "render_manifest.json"),
-            "example_visualization": generated_visual,
+            "example_visualization": visual_artifacts["primary"],
+            "example_visual_artifacts": visual_artifacts["paths"],
+            "example_visual_source": visual_artifacts["source"],
             "scenario_id": scenario.get("scenario_id"),
             "mission_families": manifest.get("mission_families", []),
             "job_count": len(manifest.get("jobs", [])),
             "human_count": len(manifest.get("actors", {}).get("humans", [])),
+            "human_actor_identity_dirs": [
+                human.get("metadata", {}).get("renderer_actor_identity_dir")
+                for human in smoke_scenario.get("humans", [])
+                if isinstance(human, Mapping)
+            ],
             "robot_count": len(manifest.get("actors", {}).get("robots", [])),
         }
         _write_json(family_dir / "family_package.json", family_info)

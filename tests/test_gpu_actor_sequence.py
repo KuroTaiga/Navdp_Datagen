@@ -3,14 +3,22 @@ from __future__ import annotations
 import math
 
 import numpy as np
-import torch
+import pytest
+
+torch = pytest.importorskip("torch")
+plyfile = pytest.importorskip("plyfile")
+PlyData = plyfile.PlyData
+PlyElement = plyfile.PlyElement
 
 from utils.ply_transform_utils import apply_transform_to_frame, build_transform_matrix, rotation_matrix_z_np
 from utils.telesim_actor_utils import (
     ActorSequence,
     ActorSequenceFrame,
+    ActorOptions,
     actor_data_to_tensors,
     build_gpu_actor_sequence,
+    load_gaussian_ply,
+    load_actor_sequence,
     transform_gpu_actor_frame,
 )
 from utils.sh_utils import RGB2SH
@@ -166,8 +174,100 @@ def test_actor_tensor_pack_accepts_rgb_axis_scale_schema() -> None:
     torch.testing.assert_close(render.features_dc[:, 0, :], torch.from_numpy(expected_dc))
     torch.testing.assert_close(render.rotation, torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1))
     np.testing.assert_allclose(
+        np.stack([transformed["x"], transformed["y"], transformed["z"]], axis=1),
+        np.array(
+            [
+                [1.0, 3.0, 3.4],
+                [3.0, 1.0, 5.4],
+            ],
+            dtype=np.float32,
+        ),
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
         transformed["scale_x"],
         data["scale_x"] + math.log(2.0),
         rtol=1e-6,
         atol=1e-6,
     )
+
+
+def test_load_gaussian_ply_filters_actor_mask(tmp_path) -> None:
+    dtype = np.dtype(
+        [
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("opacity", "f4"),
+            ("actor", "u1"),
+            ("r", "u1"),
+            ("g", "u1"),
+            ("b", "u1"),
+        ]
+    )
+    data = np.zeros(4, dtype=dtype)
+    data["x"] = [0.0, 1.0, 2.0, 3.0]
+    data["actor"] = [0, 1, 0, 1]
+    ply_path = tmp_path / "actor_masked.ply"
+    PlyData([PlyElement.describe(data, "vertex")]).write(ply_path)
+
+    ply = load_gaussian_ply(ply_path)
+
+    assert len(ply.data) == 2
+    np.testing.assert_array_equal(ply.data["x"], np.array([1.0, 3.0], dtype=np.float32))
+
+
+def test_load_actor_sequence_recenters_scene_space_z_up_frames(tmp_path) -> None:
+    dtype = np.dtype(
+        [
+            ("x", "f4"),
+            ("y", "f4"),
+            ("z", "f4"),
+            ("opacity", "f4"),
+            ("actor", "u1"),
+            ("r", "u1"),
+            ("g", "u1"),
+            ("b", "u1"),
+        ]
+    )
+    frame_specs = [
+        (10.0, -4.0, 0.20),
+        (12.0, -2.0, 0.25),
+    ]
+    for frame_idx, (root_x, root_y, root_z) in enumerate(frame_specs):
+        data = np.zeros(5, dtype=dtype)
+        data["x"] = root_x + np.array([-0.2, 0.0, 0.2, -0.1, 0.1], dtype=np.float32)
+        data["y"] = root_y + np.array([-0.1, 0.0, 0.1, 0.2, -0.2], dtype=np.float32)
+        data["z"] = root_z + np.array([0.0, 0.05, 0.6, 1.0, 1.8], dtype=np.float32)
+        data["opacity"] = 0.0
+        data["actor"] = 1
+        data["r"] = 230
+        data["g"] = 80
+        data["b"] = 60
+        PlyData([PlyElement.describe(data, "vertex")]).write(tmp_path / f"frame_{frame_idx:04d}.ply")
+
+    sequence = load_actor_sequence(
+        ActorOptions(
+            sequence_dir=tmp_path,
+            pattern="*.ply",
+            height=1.8,
+            follow_distance=0.0,
+            buffer_distance=0.0,
+            speed=1.3,
+            fps=10.0,
+            loop=True,
+            foot_offset=0.0,
+            animation_cycle_mod=1,
+        )
+    )
+
+    assert sequence.max_points == 5
+    for frame in sequence.frames:
+        xyz = np.stack(
+            [frame.base_data["x"], frame.base_data["y"], frame.base_data["z"]],
+            axis=1,
+        )
+        np.testing.assert_allclose(np.median(xyz[:, :2], axis=0), [0.0, 0.0], atol=1e-6)
+        np.testing.assert_allclose(float(np.min(xyz[:, 2])), 0.0, atol=1e-6)
+    np.testing.assert_allclose(sequence.height, 1.8, atol=1e-6)

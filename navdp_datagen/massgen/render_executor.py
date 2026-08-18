@@ -9,14 +9,30 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+_repo_root_str = str(REPO_ROOT)
+if not sys.path or sys.path[0] != _repo_root_str:
+    sys.path = [item for item in sys.path if item != _repo_root_str]
+    sys.path.insert(0, _repo_root_str)
+_render_assets_str = str(REPO_ROOT / "scripts" / "render" / "assets")
+if _render_assets_str not in sys.path:
+    sys.path.insert(1, _render_assets_str)
+
 from utils.massgen_render_manifest import load_json
+from retarget_smplx_kimodo_to_g1 import (
+    load_smplx_frame_paths,
+    retarget_smplx_frames,
+)
 
 
 JsonDict = dict[str, Any]
-REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RENDER_SCRIPT = REPO_ROOT / "render_label_paths_telesim.py"
 DEFAULT_VIDEO_BACKEND = "nvenc"
 DEFAULT_DEVICE = "cuda"
+DEFAULT_ROBOT_OVERLAY_SCRIPT = REPO_ROOT / "scripts" / "render" / "assets" / "render_glb_robot_overlay.py"
+DEFAULT_ROBOT_GLB = REPO_ROOT / "assets" / "robots" / "g1_29dof_mode_16.glb"
+DEFAULT_ROBOT_URDF = REPO_ROOT / "data" / "g1_description" / "g1_29dof_mode_16.urdf"
+DEFAULT_KIMODO_SMPLX_DIR = REPO_ROOT / "assets" / "walking_kimodo"
 
 
 def load_render_manifest(path: str | Path) -> JsonDict:
@@ -48,6 +64,13 @@ def build_render_plans(
     minimal_frames: int | None = None,
     actor_gpu_resident: bool = False,
     save_actor_metadata: bool = True,
+    robot_overlay_script: str | Path = DEFAULT_ROBOT_OVERLAY_SCRIPT,
+    robot_glb: str | Path = DEFAULT_ROBOT_GLB,
+    robot_urdf: str | Path = DEFAULT_ROBOT_URDF,
+    kimodo_smplx_dir: str | Path = DEFAULT_KIMODO_SMPLX_DIR,
+    robot_compose_mode: str = "depth",
+    robot_glb_up_axis: str = "z",
+    robot_target_height: float | None = None,
 ) -> JsonDict:
     """Build dry-run or executable plans for manifest jobs.
 
@@ -89,6 +112,13 @@ def build_render_plans(
             minimal_frames=minimal_frames,
             actor_gpu_resident=actor_gpu_resident,
             save_actor_metadata=save_actor_metadata,
+            robot_overlay_script=Path(robot_overlay_script).expanduser().resolve(),
+            robot_glb=Path(robot_glb).expanduser().resolve(),
+            robot_urdf=Path(robot_urdf).expanduser().resolve(),
+            kimodo_smplx_dir=Path(kimodo_smplx_dir).expanduser().resolve(),
+            robot_compose_mode=robot_compose_mode,
+            robot_glb_up_axis=robot_glb_up_axis,
+            robot_target_height=robot_target_height,
         )
         for job in selected_jobs
     ]
@@ -131,7 +161,59 @@ def execute_render_plans(plan_payload: Mapping[str, Any]) -> int:
         completed = subprocess.run(command, env=env, check=False)
         if completed.returncode != 0:
             return int(completed.returncode)
+        overlay_input_error = _validate_robot_overlay_base_inputs(plan)
+        if overlay_input_error is not None:
+            print(overlay_input_error, file=sys.stderr)
+            return 3
+        for overlay in plan.get("robot_overlay_commands", []):
+            if not isinstance(overlay, Mapping):
+                continue
+            overlay_command = [str(item) for item in overlay.get("command", [])]
+            if not overlay_command:
+                continue
+            completed = _run_overlay_command_with_retry(overlay_command, env=env, attempts=2)
+            if completed.returncode != 0:
+                return int(completed.returncode)
     return 0
+
+
+def _run_overlay_command_with_retry(
+    command: Sequence[str],
+    *,
+    env: Mapping[str, str],
+    attempts: int,
+) -> subprocess.CompletedProcess:
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(max(1, int(attempts))):
+        last = subprocess.run(command, env=env, check=False)
+        if last.returncode == 0:
+            return last
+        if attempt + 1 < attempts:
+            print(
+                f"robot overlay command failed with {last.returncode}; retrying once",
+                file=sys.stderr,
+            )
+    assert last is not None
+    return last
+
+
+def _validate_robot_overlay_base_inputs(plan: Mapping[str, Any]) -> str | None:
+    if not plan.get("robot_overlay_commands"):
+        return None
+    paths = plan.get("robot_overlay_paths", {})
+    if not isinstance(paths, Mapping):
+        return f"missing robot overlay paths for job {plan.get('job_id')}"
+    camera_json = paths.get("camera_json")
+    if isinstance(camera_json, str) and not Path(camera_json).is_file():
+        return f"missing camera metadata before robot overlays for job {plan.get('job_id')}: {camera_json}"
+    base_frames_dir = paths.get("base_frames_dir")
+    if isinstance(base_frames_dir, str):
+        base_path = Path(base_frames_dir)
+        if not base_path.is_dir():
+            return f"missing base RGB frame directory before robot overlays for job {plan.get('job_id')}: {base_frames_dir}"
+        if not any(base_path.glob("frame_*.png")):
+            return f"base RGB frame directory is empty before robot overlays for job {plan.get('job_id')}: {base_frames_dir}"
+    return None
 
 
 def format_plan_text(plan_payload: Mapping[str, Any]) -> str:
@@ -166,6 +248,13 @@ def format_plan_text(plan_payload: Mapping[str, Any]) -> str:
         )
         command = shlex.join([str(item) for item in plan.get("command", [])])
         lines.append(f"  command: {env_prefix} {command}".rstrip())
+        for overlay in plan.get("robot_overlay_commands", []):
+            if not isinstance(overlay, Mapping):
+                continue
+            overlay_command = shlex.join([str(item) for item in overlay.get("command", [])])
+            lines.append(
+                f"  robot_overlay[{overlay.get('actor_id')}]: {overlay_command}".rstrip()
+            )
     return "\n".join(lines)
 
 
@@ -240,6 +329,13 @@ def _build_job_plan(
     minimal_frames: int | None,
     actor_gpu_resident: bool,
     save_actor_metadata: bool,
+    robot_overlay_script: Path,
+    robot_glb: Path,
+    robot_urdf: Path,
+    kimodo_smplx_dir: Path,
+    robot_compose_mode: str,
+    robot_glb_up_axis: str,
+    robot_target_height: float | None,
 ) -> JsonDict:
     job_id = str(job.get("job_id") or job.get("outputs", {}).get("stem") or "massgen_job")
     scene_id = str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or "")
@@ -310,15 +406,40 @@ def _build_job_plan(
         command.extend(["--gaussian-model", str(gaussian_model)])
     if save_depth_maps:
         command.append("--save-depth-maps")
-    if save_rgb_frames:
+    needs_robot_overlay = bool(job.get("peer_robot_ids") or job.get("peer_robot_pose_tracks"))
+    effective_save_rgb_frames = bool(save_rgb_frames or needs_robot_overlay)
+    effective_save_depth_maps = bool(save_depth_maps or (needs_robot_overlay and str(robot_compose_mode) == "depth"))
+    if effective_save_depth_maps and "--save-depth-maps" not in command:
+        command.append("--save-depth-maps")
+    if effective_save_rgb_frames:
         command.append("--rgb-frames")
     if minimal_frames is not None and int(minimal_frames) > 0:
         command.extend(["--minimal-frames", str(int(minimal_frames))])
     human_ids = [str(item) for item in job.get("human_actor_ids", [])]
-    if job.get("peer_robot_ids"):
-        blockers.append(
-            "peer robot rendering is not connected in the simple human-only renderer path yet"
-        )
+    robot_overlay_commands, robot_overlay_paths, robot_blockers, robot_warnings = _peer_robot_overlay_bundle(
+        manifest,
+        job,
+        base_dir=manifest_base,
+        render_output_root=render_output_root,
+        tasks_root=tasks_root,
+        scene_id=scene_id,
+        label_id=job_id,
+        python_bin=python_bin,
+        robot_overlay_script=robot_overlay_script,
+        robot_glb=robot_glb,
+        robot_urdf=robot_urdf,
+        kimodo_smplx_dir=kimodo_smplx_dir,
+        robot_compose_mode=robot_compose_mode,
+        robot_glb_up_axis=robot_glb_up_axis,
+        robot_target_height=robot_target_height,
+        depth_bit_depth=16,
+        write_inputs=write_inputs,
+        fps=fps,
+        scene_dir=scene_dir,
+        frame_count_hint=len(_trajectory_world_points(job.get("camera", {}).get("trajectory", []))),
+    )
+    blockers.extend(robot_blockers)
+    warnings.extend(robot_warnings)
     actor_plan_payload, actor_plan_path, human_blockers, human_warnings = _human_actor_plan_bundle(
         manifest,
         job,
@@ -369,16 +490,332 @@ def _build_job_plan(
         },
         "env": {"GAUSSIAN_RENDER_BACKEND": "gsplat"},
         "command": command,
+        "robot_overlay_commands": robot_overlay_commands,
+        "robot_overlay_paths": robot_overlay_paths,
         "blockers": blockers,
         "warnings": warnings,
         "metadata": {
             "current_executor_boundary": (
-                "camera label materialization plus human Gaussian actor bundles; "
-                "peer robot GLB composition is still in progress"
+                "camera label materialization, human Gaussian actor bundles, "
+                "and peer robot GLB overlay commands"
             ),
             "output_root": str(output_root),
         },
     }
+
+
+def _peer_robot_overlay_bundle(
+    manifest: Mapping[str, Any],
+    job: Mapping[str, Any],
+    *,
+    base_dir: Path,
+    render_output_root: Path,
+    tasks_root: Path,
+    scene_id: str,
+    label_id: str,
+    python_bin: str,
+    robot_overlay_script: Path,
+    robot_glb: Path,
+    robot_urdf: Path,
+    kimodo_smplx_dir: Path,
+    robot_compose_mode: str,
+    robot_glb_up_axis: str,
+    robot_target_height: float | None,
+    depth_bit_depth: int,
+    write_inputs: bool,
+    fps: float,
+    scene_dir: Path,
+    frame_count_hint: int,
+) -> tuple[list[JsonDict], JsonDict, list[str], list[str]]:
+    tracks = [
+        track
+        for track in job.get("peer_robot_pose_tracks", [])
+        if isinstance(track, Mapping)
+    ]
+    if not tracks:
+        return [], {}, [], []
+
+    blockers: list[str] = []
+    warnings: list[str] = []
+    commands: list[JsonDict] = []
+    track_outputs: list[JsonDict] = []
+    if not robot_overlay_script.is_file():
+        blockers.append(f"robot overlay script does not exist: {robot_overlay_script}")
+    default_glb = _resolve_existing_or_candidate(robot_glb, base_dir=base_dir)
+    default_urdf = _resolve_existing_or_candidate(robot_urdf, base_dir=base_dir)
+    if not default_glb.is_file():
+        blockers.append(f"default robot GLB does not exist: {default_glb}")
+    if not default_urdf.is_file():
+        blockers.append(f"default robot URDF does not exist: {default_urdf}")
+    if not kimodo_smplx_dir.exists():
+        blockers.append(f"Kimodo SMPL-X directory does not exist: {kimodo_smplx_dir}")
+
+    try:
+        coord_meta = _load_occupancy_metadata_for_label(scene_dir)
+    except Exception as exc:  # pylint: disable=broad-except
+        blockers.append(f"unable to load scene occupancy metadata for robot coordinates: {exc}")
+        coord_meta = None
+
+    camera_times = _trajectory_times(job.get("camera", {}).get("trajectory", []))
+    if not camera_times:
+        camera_times = [float(index) for index in range(max(1, int(frame_count_hint)))]
+
+    base_frames_dir = render_output_root / scene_id / label_id
+    previous_frames_dir = base_frames_dir
+    camera_json = render_output_root / scene_id / f"{label_id}_camera.json"
+    depth_dir = base_frames_dir
+    overlay_root = render_output_root / scene_id / f"{label_id}__peer_robots"
+    robot_inputs_root = tasks_root / scene_id / "robot_overlays" / label_id
+    final_video = render_output_root / scene_id / f"{label_id}__with_peer_robots.mp4"
+
+    source_frame_paths = None
+    if not blockers:
+        try:
+            source_frame_paths = load_smplx_frame_paths(kimodo_smplx_dir)
+        except Exception as exc:  # pylint: disable=broad-except
+            blockers.append(f"unable to load Kimodo SMPL-X frames for robot AMO: {exc}")
+
+    for index, track in enumerate(tracks):
+        actor_id = str(track.get("actor_id") or f"peer_robot_{index:03d}")
+        safe_actor_id = _safe_filename_token(actor_id)
+        pose_json = robot_inputs_root / f"{safe_actor_id}_poses.json"
+        amo_json = robot_inputs_root / f"{safe_actor_id}_g1_amo_from_kimodo.json"
+        out_frames = overlay_root / f"{index:02d}_{safe_actor_id}"
+        asset = track.get("asset", {})
+        if isinstance(asset, Mapping):
+            glb_path = _resolve_existing_or_candidate(
+                _str_path_or_default(asset.get("glb_path"), default_glb),
+                base_dir=base_dir,
+            )
+            urdf_path = _resolve_existing_or_candidate(
+                _str_path_or_default(asset.get("urdf_path"), default_urdf),
+                base_dir=base_dir,
+            )
+        else:
+            glb_path = default_glb
+            urdf_path = default_urdf
+        if not glb_path.is_file():
+            blockers.append(f"peer robot {actor_id} GLB does not exist: {glb_path}")
+        if not urdf_path.is_file():
+            blockers.append(f"peer robot {actor_id} URDF does not exist: {urdf_path}")
+
+        if write_inputs and coord_meta is not None and source_frame_paths is not None:
+            try:
+                pose_payload = _robot_pose_payload(
+                    manifest,
+                    job,
+                    track,
+                    actor_id=actor_id,
+                    camera_times=camera_times,
+                    coord_meta=coord_meta,
+                    frame_count_hint=frame_count_hint,
+                )
+                pose_json.parent.mkdir(parents=True, exist_ok=True)
+                pose_json.write_text(
+                    json.dumps(pose_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                amo_payload = retarget_smplx_frames(
+                    source_frame_paths,
+                    frame_count=len(pose_payload["frames"]),
+                )
+                amo_json.write_text(json.dumps(amo_payload, indent=2), encoding="utf-8")
+            except Exception as exc:  # pylint: disable=broad-except
+                blockers.append(f"unable to materialize peer robot {actor_id} overlay inputs: {exc}")
+        else:
+            warnings.append("robot overlay inputs not written; pass --write-inputs before --execute")
+
+        command = [
+            str(python_bin),
+            str(robot_overlay_script),
+            "--camera-json",
+            str(camera_json),
+            "--frames-dir",
+            str(previous_frames_dir),
+            "--robot-glb",
+            str(glb_path),
+            "--robot-urdf",
+            str(urdf_path),
+            "--robot-package-root",
+            str(urdf_path.parent),
+            "--poses-json",
+            str(pose_json),
+            "--amo-poses-json",
+            str(amo_json),
+            "--output-dir",
+            str(out_frames),
+            "--compose-mode",
+            str(robot_compose_mode),
+            "--depth-bit-depth",
+            str(int(depth_bit_depth)),
+            "--glb-up-axis",
+            str(robot_glb_up_axis),
+            "--fps",
+            _float_arg(fps),
+            "--overwrite",
+        ]
+        if str(robot_compose_mode) == "depth":
+            command.extend(["--depth-dir", str(depth_dir)])
+        if robot_target_height is not None:
+            command.extend(["--target-height", _float_arg(robot_target_height)])
+        if index == len(tracks) - 1:
+            command.extend(["--video", str(final_video)])
+        commands.append(
+            {
+                "actor_id": actor_id,
+                "command": command,
+                "input_frames_dir": str(previous_frames_dir),
+                "output_frames_dir": str(out_frames),
+                "video": str(final_video) if index == len(tracks) - 1 else None,
+                "poses_json": str(pose_json),
+                "amo_poses_json": str(amo_json),
+                "robot_glb": str(glb_path),
+                "robot_urdf": str(urdf_path),
+            }
+        )
+        track_outputs.append(
+            {
+                "actor_id": actor_id,
+                "poses_json": str(pose_json),
+                "amo_poses_json": str(amo_json),
+                "frames_dir": str(out_frames),
+            }
+        )
+        previous_frames_dir = out_frames
+
+    paths: JsonDict = {
+        "camera_json": str(camera_json),
+        "base_frames_dir": str(base_frames_dir),
+        "overlay_root": str(overlay_root),
+        "final_video": str(final_video),
+        "tracks": track_outputs,
+    }
+    return commands, paths, blockers, warnings
+
+
+def _str_path_or_default(value: Any, default: Path) -> Path:
+    if isinstance(value, str) and value:
+        return Path(value)
+    return default
+
+
+def _resolve_existing_or_candidate(path: Path, *, base_dir: Path) -> Path:
+    expanded = Path(path).expanduser()
+    if expanded.is_absolute():
+        return expanded
+    for candidate in ((base_dir / expanded).resolve(), (REPO_ROOT / expanded).resolve()):
+        if candidate.exists():
+            return candidate
+    return (base_dir / expanded).resolve()
+
+
+def _safe_filename_token(value: str) -> str:
+    out = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value))
+    return out or "robot"
+
+
+def _robot_pose_payload(
+    manifest: Mapping[str, Any],
+    job: Mapping[str, Any],
+    track: Mapping[str, Any],
+    *,
+    actor_id: str,
+    camera_times: Sequence[float],
+    coord_meta: Mapping[str, Any],
+    frame_count_hint: int,
+) -> JsonDict:
+    samples = _robot_motion_samples(track, coord_meta=coord_meta)
+    if not samples:
+        raise ValueError(f"peer robot {actor_id} has no usable trajectory")
+    times = list(camera_times) or [float(index) for index in range(max(1, int(frame_count_hint)))]
+    frames = [
+        {
+            "frame": int(index),
+            "time_s": float(time_s),
+            "position": [float(position[0]), float(position[1]), float(position[2])],
+            "yaw_rad": float(yaw_rad),
+        }
+        for index, time_s in enumerate(times)
+        for position, yaw_rad in [_interpolate_robot_motion(samples, float(time_s))]
+    ]
+    return {
+        "schema_version": "massgen_robot_overlay_poses.v1",
+        "source": "massgen_render_executor",
+        "job_id": str(job.get("job_id") or ""),
+        "scene_id": str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
+        "actor_id": actor_id,
+        "coordinate_pipeline": _coordinate_pipeline_metadata(coord_meta)["label_path"],
+        "frames": frames,
+    }
+
+
+def _robot_motion_samples(
+    track: Mapping[str, Any],
+    *,
+    coord_meta: Mapping[str, Any],
+) -> list[tuple[float, tuple[float, float, float], float]]:
+    samples: list[tuple[float, tuple[float, float, float], float]] = []
+    for index, raw in enumerate(track.get("trajectory", [])):
+        if not isinstance(raw, Mapping):
+            continue
+        raw_position = raw.get("position")
+        if not isinstance(raw_position, Sequence) or len(raw_position) < 2:
+            continue
+        x, y = _pathplanner_xy_for_telesim_label(
+            coord_meta,
+            float(raw_position[0]),
+            float(raw_position[1]),
+        )
+        z = float(raw_position[2]) if len(raw_position) > 2 else float(coord_meta.get("lower_z", 0.0))
+        time_s = float(raw.get("time_s", raw.get("t", index)) or 0.0)
+        yaw_rad = float(raw.get("yaw_rad", 0.0) or 0.0)
+        samples.append((time_s, (x, y, z), yaw_rad))
+    return sorted(samples, key=lambda item: item[0])
+
+
+def _interpolate_robot_motion(
+    samples: Sequence[tuple[float, tuple[float, float, float], float]],
+    time_s: float,
+) -> tuple[tuple[float, float, float], float]:
+    if len(samples) == 1 or time_s <= samples[0][0]:
+        return samples[0][1], _robot_yaw_for_sample(samples, 0)
+    if time_s >= samples[-1][0]:
+        return samples[-1][1], _robot_yaw_for_sample(samples, len(samples) - 1)
+    for index in range(len(samples) - 1):
+        t0, p0, yaw0 = samples[index]
+        t1, p1, yaw1 = samples[index + 1]
+        if t0 <= time_s <= t1:
+            span = max(t1 - t0, 1e-6)
+            alpha = (time_s - t0) / span
+            position = tuple(float(p0[axis] + (p1[axis] - p0[axis]) * alpha) for axis in range(3))
+            direction = (p1[0] - p0[0], p1[1] - p0[1])
+            if math.hypot(direction[0], direction[1]) > 1e-4:
+                return position, math.atan2(direction[1], direction[0])
+            return position, _lerp_angle(yaw0, yaw1, alpha)
+    return samples[-1][1], _robot_yaw_for_sample(samples, len(samples) - 1)
+
+
+def _robot_yaw_for_sample(
+    samples: Sequence[tuple[float, tuple[float, float, float], float]],
+    index: int,
+) -> float:
+    current = samples[index][1]
+    if index + 1 < len(samples):
+        nxt = samples[index + 1][1]
+        dx, dy = nxt[0] - current[0], nxt[1] - current[1]
+        if math.hypot(dx, dy) > 1e-4:
+            return math.atan2(dy, dx)
+    if index > 0:
+        prev = samples[index - 1][1]
+        dx, dy = current[0] - prev[0], current[1] - prev[1]
+        if math.hypot(dx, dy) > 1e-4:
+            return math.atan2(dy, dx)
+    return float(samples[index][2])
+
+
+def _lerp_angle(start: float, end: float, alpha: float) -> float:
+    delta = _wrap_angle(float(end) - float(start))
+    return _wrap_angle(float(start) + delta * float(alpha))
 
 
 def _resolve_scene_paths(
@@ -446,12 +883,9 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
     if len(points) < 2:
         raise ValueError("job.camera.trajectory must contain at least two distinct positions")
     meta = _load_occupancy_metadata_for_label(scene_dir)
-    gs_points = [
-        (*_pathplanner_xy_to_gs_xy(meta, float(x), float(y)), float(z))
-        for x, y, z in points
-    ]
-    raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in gs_points]
-    raster_pixel = [list(_gs_xy_to_pixel(meta, float(x), float(y))) for x, y, _ in gs_points]
+    raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in points]
+    raster_pixel = [list(_scene_xy_to_pixel(meta, float(x), float(y))) for x, y, _ in points]
+    coordinate_pipeline = _coordinate_pipeline_metadata(meta)
     payload = {
         "ins_id": str(job.get("job_id") or label_path.stem),
         "scene_id": str(job.get("scene_id") or scene_dir.name),
@@ -464,9 +898,10 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
             "viewpoint_robot_id": job.get("viewpoint_robot_id"),
             "mission_families": list(job.get("mission_families", [])),
             "assigned_mission_ids": list(job.get("assigned_mission_ids", [])),
-            "coordinate_frame": "gs_right_handed",
+            "coordinate_frame": "pathplanner_left_handed",
             "source_coordinate_frame": "pathplanner_left_handed",
-            "coordinate_transform": "mirror_xy_about_occupancy_center",
+            "coordinate_transform": "identity_xy",
+            "coordinate_pipeline": coordinate_pipeline["label_path"],
         },
     }
     label_path.parent.mkdir(parents=True, exist_ok=True)
@@ -516,22 +951,108 @@ def _read_png_size(path: Path) -> tuple[int, int]:
     return width, height
 
 
-def _pathplanner_xy_to_gs_xy(meta: Mapping[str, Any], x: float, y: float) -> tuple[float, float]:
-    center_x = 0.5 * (float(meta["left"]) + float(meta["right"]))
-    center_y = 0.5 * (float(meta["top"]) + float(meta["bottom"]))
-    return 2.0 * center_x - float(x), 2.0 * center_y - float(y)
+def _pathplanner_xy_for_telesim_label(meta: Mapping[str, Any], x: float, y: float) -> tuple[float, float]:
+    """Return MassGen scenario XY in the frame consumed by TeleSim label rendering.
+
+    Existing CHINGMU Pathplanner scenario coordinates align with the BEV scene
+    frame used by the label renderer. Mirroring them here moves paths to the
+    opposite side of the occupancy map; the renderer already receives matching
+    raster_pixel values for the unmirrored coordinates.
+    """
+
+    _ = meta
+    return float(x), float(y)
+
+
+def _coordinate_pipeline_metadata(meta: Mapping[str, Any]) -> JsonDict:
+    return {
+        "source_frame": "pathplanner_left_handed_map_pose",
+        "target_frame": "telesim_scene_xy",
+        "occupancy": {
+            "left": float(meta["left"]),
+            "right": float(meta["right"]),
+            "top": float(meta["top"]),
+            "bottom": float(meta["bottom"]),
+            "scale": float(meta["scale"]),
+            "width_px": int(meta["width"]),
+            "height_px": int(meta["height"]),
+        },
+        "label_path": [
+            {
+                "stage": "massgen_render_manifest",
+                "operation": "copy robot trajectory map_pose to camera trajectory position",
+                "x": "position[0] = map_pose.x",
+                "y": "position[1] = map_pose.y",
+                "z": "position[2] = 0.0",
+                "yaw": "yaw_rad = map_pose.yaw",
+            },
+            {
+                "stage": "massgen_render_executor.label_path",
+                "operation": "identity XY into raster_world",
+                "x": "raster_world.x = position[0]",
+                "y": "raster_world.y = position[1]",
+                "z": "raster_world.z = position[2]",
+                "reason": "CHINGMU Pathplanner scenario XY already aligns with TeleSim scene BEV.",
+            },
+            {
+                "stage": "massgen_render_executor.label_path",
+                "operation": "compute raster_pixel from occupancy metadata",
+                "u": "round((raster_world.x - left) / scale)",
+                "v": "round((top - raster_world.y) / scale)",
+            },
+            {
+                "stage": "render_label_paths_telesim.prepare_path_data",
+                "operation": "derive affine from raster_world to raster_pixel and render with --no-mirror-translation",
+            },
+        ],
+        "actor_plan": [
+            {
+                "stage": "massgen_render_manifest",
+                "operation": "copy human trajectory map_pose to actor trajectory position",
+                "x": "position[0] = map_pose.x",
+                "y": "position[1] = map_pose.y",
+                "z": "position[2] = 0.0",
+                "yaw": "yaw_rad = map_pose.yaw",
+            },
+            {
+                "stage": "massgen_render_executor.actor_plan",
+                "operation": "identity XY into actor frame positions",
+                "x": "actor_frame.position[0] = position[0]",
+                "y": "actor_frame.position[1] = position[1]",
+                "z": "actor_frame.position[2] = position[2]",
+                "reason": "Actor positions share the same TeleSim scene XY as camera label paths.",
+            },
+            {
+                "stage": "massgen_render_executor.human_motion_samples",
+                "operation": "convert Pathplanner yaw to aligned human PLY sample yaw",
+                "yaw": "atan2(cos(pathplanner_yaw), sin(pathplanner_yaw))",
+                "reason": "Human actor assets use the same canonical facing convention as the legacy follow-path actor helper.",
+            },
+            {
+                "stage": "massgen_render_executor.actor_frames",
+                "operation": "apply stationary actor source yaw correction",
+                "yaw": "actor_frame.yaw_rad = actor_sample_yaw + pi",
+                "reason": "This matches moving actor frames, which use atan2(direction_x, direction_y) + pi.",
+            },
+            {
+                "stage": "render_label_paths_telesim.build_actor_motion_plan_transforms",
+                "operation": "apply actor position directly as world translation and actor_frame.yaw_rad plus plan yaw_offset_rad",
+                "reason": "MassGen actor plans set yaw_offset_rad to 0.0; z uses floor when z_mode=floor.",
+            },
+        ],
+    }
 
 
 def _pathplanner_yaw_to_gs_actor_sample_yaw(yaw_rad: float) -> float:
     """Convert conventional Pathplanner yaw to the sample yaw used by human actor placement."""
 
     planner_yaw = float(yaw_rad)
-    gs_dx = -math.cos(planner_yaw)
-    gs_dy = -math.sin(planner_yaw)
+    gs_dx = math.cos(planner_yaw)
+    gs_dy = math.sin(planner_yaw)
     return math.atan2(gs_dx, gs_dy)
 
 
-def _gs_xy_to_pixel(meta: Mapping[str, Any], x: float, y: float) -> tuple[int, int]:
+def _scene_xy_to_pixel(meta: Mapping[str, Any], x: float, y: float) -> tuple[int, int]:
     u = int(round((float(x) - float(meta["left"])) / float(meta["scale"])))
     v = int(round((float(meta["top"]) - float(y)) / float(meta["scale"])))
     return u, v
@@ -679,6 +1200,7 @@ def _human_actor_plan_bundle(
         "job_id": str(job.get("job_id") or ""),
         "scene_id": str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
         "source": "massgen_render_executor",
+        "coordinate_pipeline": _coordinate_pipeline_metadata(coord_meta)["actor_plan"],
         "actors": actor_plans,
     }
     return payload, actor_plan_path, blockers, warnings
@@ -737,6 +1259,8 @@ def _human_actor_plans(
         segment_fps = manifest_fps
         if asset.get("fps") is not None:
             segment_fps = float(asset.get("fps") or segment_fps)
+        root_motion_mode = str(asset.get("root_motion_mode") or "").strip().lower()
+        freeze_animation_frame = root_motion_mode != "follow_map_path"
         start_time_s = _optional_float(segment.get("start_time_s"))
         end_time_s = _optional_float(segment.get("end_time_s"))
         segment_frames = _frames_with_segment_activity(
@@ -744,6 +1268,7 @@ def _human_actor_plans(
             start_time_s=start_time_s,
             end_time_s=end_time_s,
             is_only_segment=len(segments) == 1,
+            animation_frame_index=0 if freeze_animation_frame else None,
         )
         payload: JsonDict = {
             "schema_version": "massgen_actor_plan.v1",
@@ -763,6 +1288,10 @@ def _human_actor_plans(
                 "action_sequence_id": segment.get("action_sequence_id"),
                 "start_time_s": segment.get("start_time_s"),
                 "end_time_s": segment.get("end_time_s"),
+                "root_motion_mode": asset.get("root_motion_mode"),
+                "animation_frame_policy": (
+                    "first_frame_static" if freeze_animation_frame else "advance_sequence"
+                ),
             },
             "frames": segment_frames,
         }
@@ -818,6 +1347,7 @@ def _frames_with_segment_activity(
     start_time_s: float | None,
     end_time_s: float | None,
     is_only_segment: bool,
+    animation_frame_index: int | None = None,
 ) -> list[JsonDict]:
     tagged: list[JsonDict] = []
     for frame in frames:
@@ -832,6 +1362,8 @@ def _frames_with_segment_activity(
                 item["active"] = False
             else:
                 item["active"] = True
+        if animation_frame_index is not None:
+            item["animation_frame_index"] = int(animation_frame_index)
         tagged.append(item)
     return tagged
 
@@ -856,7 +1388,7 @@ def _human_motion_samples(
             raw_position = raw.get("position")
             if not isinstance(raw_position, Sequence) or len(raw_position) < 2:
                 continue
-            x, y = _pathplanner_xy_to_gs_xy(
+            x, y = _pathplanner_xy_for_telesim_label(
                 coord_meta,
                 float(raw_position[0]),
                 float(raw_position[1]),
@@ -871,7 +1403,7 @@ def _human_motion_samples(
             samples.append(
                 (
                     0.0,
-                    (*_pathplanner_xy_to_gs_xy(
+                    (*_pathplanner_xy_for_telesim_label(
                         coord_meta,
                         float(start_pose.get("x", 0.0) or 0.0),
                         float(start_pose.get("y", 0.0) or 0.0),

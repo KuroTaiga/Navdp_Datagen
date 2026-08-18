@@ -200,7 +200,7 @@ def _apply_transform_to_frame_gpu(
         ],
         dim=1,
     ).to(device=device, dtype=torch.float32)
-    xyz = xyz @ rot_t.T
+    xyz = (xyz * float(scale)) @ rot_t.T
     xyz = xyz + t_t
     data["x"] = xyz[:, 0].cpu().numpy().astype(data.dtype["x"])
     data["y"] = xyz[:, 1].cpu().numpy().astype(data.dtype["y"])

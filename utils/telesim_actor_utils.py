@@ -196,9 +196,19 @@ def _first_actor_subdir(root: Path) -> Path | None:
 
 def load_gaussian_ply(path: Path) -> ply_utils.GaussianPly:
     try:
-        return ply_utils.GaussianPly.read(path)
+        ply = ply_utils.GaussianPly.read(path)
     except PlyElementParseError as exc:
         raise ValueError(f"Unable to parse actor PLY: {path}") from exc
+    if "actor" in ply.columns:
+        mask = np.asarray(ply.data["actor"]) != 0
+        if np.any(mask):
+            ply = ply_utils.GaussianPly(
+                ply=ply.ply,
+                vertex=ply.vertex,
+                data=np.array(ply.data[mask], copy=True),
+                columns=ply.columns,
+            )
+    return ply
 
 
 ACTOR_AXIS_ALIGNMENT_MATRIX = np.array(
@@ -223,6 +233,55 @@ def _compute_frame_radius_xy(data: np.ndarray) -> float:
     return float(np.percentile(dists, 95))
 
 
+def _actor_sequence_axis_alignment(actor_plys: Sequence[ply_utils.GaussianPly]) -> np.ndarray:
+    """Pick a source-axis alignment by detecting the stable vertical extent.
+
+    Older actor assets used the renderer's historical -Y-up convention. The
+    CHINGMU debug NPC PLYs are already Z-up and carry scene-space root motion,
+    so blindly applying the legacy alignment makes the walk drift look like
+    body height. Prefer the axis with large per-frame extent and low center
+    drift as the vertical axis.
+    """
+
+    extents: list[np.ndarray] = []
+    centers: list[np.ndarray] = []
+    for ply in actor_plys:
+        data = ply.data
+        if data.size == 0:
+            continue
+        xyz = np.stack((data["x"], data["y"], data["z"]), axis=1).astype(np.float64)
+        extents.append(np.nanmax(xyz, axis=0) - np.nanmin(xyz, axis=0))
+        centers.append(np.nanmedian(xyz, axis=0))
+    if not extents:
+        return ACTOR_AXIS_ALIGNMENT_MATRIX.copy()
+
+    median_extent = np.nanmedian(np.asarray(extents, dtype=np.float64), axis=0)
+    center_values = np.asarray(centers, dtype=np.float64)
+    center_drift = np.nanmax(center_values, axis=0) - np.nanmin(center_values, axis=0)
+    score = median_extent / np.maximum(center_drift, 0.05)
+    vertical_axis = int(np.nanargmax(score))
+    if vertical_axis == 2:
+        return np.eye(3, dtype=np.float64)
+    if vertical_axis == 1:
+        return ACTOR_AXIS_ALIGNMENT_MATRIX.copy()
+    return np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _frame_ground_origin_xy(data: np.ndarray) -> tuple[float, float]:
+    x = np.asarray(data["x"], dtype=np.float64)
+    y = np.asarray(data["y"], dtype=np.float64)
+    if x.size == 0 or y.size == 0:
+        return 0.0, 0.0
+    return float(np.nanmedian(x)), float(np.nanmedian(y))
+
+
 def load_actor_sequence(
     options: ActorOptions,
     *,
@@ -237,34 +296,39 @@ def load_actor_sequence(
             f"No actor frame PLY files found in {options.sequence_dir}"
         )
 
-    alignment_transform = np.eye(4, dtype=np.float64)
-    alignment_transform[:3, :3] = ACTOR_AXIS_ALIGNMENT_MATRIX
-
     actor_plys: list[ply_utils.GaussianPly] = []
-    z_values: list[np.ndarray] = []
-
     for ply_path in ply_files:
-        ply = load_gaussian_ply(Path(ply_path))
-        ply_utils.apply_transform_inplace(
-            ply,
-            alignment_transform,
-            rotate_normals=True,
-            rotate_sh=True,
-        )
-        actor_plys.append(ply)
-        z_values.append(ply.data["z"].astype(np.float64))
+        actor_plys.append(load_gaussian_ply(Path(ply_path)))
 
-    combined_z = np.concatenate(z_values)
-    raw_min_z = float(np.min(combined_z))
-    raw_max_z = float(np.max(combined_z))
-    measured_height = max(raw_max_z - raw_min_z, EPS)
+    alignment_matrix = _actor_sequence_axis_alignment(actor_plys)
+    alignment_transform = np.eye(4, dtype=np.float64)
+    alignment_transform[:3, :3] = alignment_matrix
+    if not np.allclose(alignment_matrix, np.eye(3), rtol=1e-8, atol=1e-8):
+        for ply in actor_plys:
+            ply_utils.apply_transform_inplace(
+                ply,
+                alignment_transform,
+                rotate_normals=True,
+                rotate_sh=True,
+            )
+
+    z_values: list[np.ndarray] = []
+    frame_heights: list[float] = []
+    for ply in actor_plys:
+        z = ply.data["z"].astype(np.float64)
+        z_values.append(z)
+        frame_heights.append(float(np.max(z) - np.min(z)))
+
+    measured_height = max(float(np.median(frame_heights)), EPS)
     target_height = options.height if options.height > 0.0 else measured_height
     scale_factor = target_height / measured_height
 
     if debug:
+        axis_name = ("x", "y", "z")[int(np.argmax(np.abs(alignment_matrix[2])))]
         print(
             f"[DEBUG] Actor sequence: {len(actor_plys)} frames, "
-            f"raw height {measured_height:.3f} m, applying scale {scale_factor:.3f}",
+            f"source vertical axis {axis_name}, raw height {measured_height:.3f} m, "
+            f"applying scale {scale_factor:.3f}",
             flush=True,
         )
 
@@ -279,10 +343,11 @@ def load_actor_sequence(
                 rotate_sh=True,
             )
 
-    global_min_z = min(float(np.min(ply.data["z"])) for ply in actor_plys)
-    translate_transform = np.eye(4, dtype=np.float64)
-    translate_transform[2, 3] = -global_min_z
     for ply in actor_plys:
+        origin_x, origin_y = _frame_ground_origin_xy(ply.data)
+        min_z = float(np.min(ply.data["z"]))
+        translate_transform = np.eye(4, dtype=np.float64)
+        translate_transform[:3, 3] = (-origin_x, -origin_y, -min_z)
         ply_utils.apply_transform_inplace(
             ply,
             translate_transform,
@@ -599,7 +664,7 @@ def transform_gpu_actor_frame(
 
     rot_t = torch.as_tensor(rotation, device=device, dtype=dtype)
     trans_t = torch.as_tensor(t, device=device, dtype=dtype)
-    xyz = canonical.xyz @ rot_t.T
+    xyz = (canonical.xyz * scale) @ rot_t.T
     xyz = xyz + trans_t
 
     if canonical.scaling.shape[1] == 0:

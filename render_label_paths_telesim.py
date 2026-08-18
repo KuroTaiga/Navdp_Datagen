@@ -72,6 +72,7 @@ from utils.telesim_actor_utils import (  # type: ignore
     transform_gpu_actor_frame,
 )
 from utils.actor_visibility import sphere_visible_in_camera, transformed_actor_sphere
+from utils.glb_robot_compositor import quantize_depth_meters
 from utils.video_writer_utils import VideoWriterBackend, make_video_writer
 
 LOGGER = logging.getLogger("render_label_paths_telesim")
@@ -1045,19 +1046,6 @@ def _write_camera_metadata(
     return out_path
 
 
-def _quantize_depth(depth_m: np.ndarray, *, bit_depth: int) -> np.ndarray:
-    if bit_depth <= 0:
-        raise ValueError("bit_depth must be positive.")
-    depth = depth_m.astype(np.float32, copy=False)
-    depth = np.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-    max_val = float(depth.max()) if depth.size else 0.0
-    if max_val <= 1e-6:
-        max_val = 1.0
-    depth_norm = np.clip(depth / max_val, 0.0, 1.0)
-    scale = (1 << bit_depth) - 1
-    return (depth_norm * scale + 0.5).astype(np.uint16 if bit_depth > 8 else np.uint8)
-
-
 def _save_depth_map(
     *,
     depth_inv: np.ndarray,
@@ -1073,7 +1061,7 @@ def _save_depth_map(
         depth_m = np.where(depth_inv > 0.0, 1.0 / depth_inv, 0.0)
     if rotate_180:
         depth_m = np.flipud(np.fliplr(depth_m))
-    depth_quant = _quantize_depth(depth_m, bit_depth=bit_depth)
+    depth_quant = quantize_depth_meters(depth_m, bit_depth=bit_depth)
     depth_png_path = frames_dir / f"{frame_prefix}_{frame_idx:04d}_depth.png"
     imageio.imwrite(depth_png_path, depth_quant)
 
@@ -2849,7 +2837,7 @@ def main() -> int:
                 error="cuda_oom" if is_oom else "fatal",
             )
             mp4_path = args.output_dir / scene_id / f"{label_id}.mp4"
-            LOGGER.warning(
+            LOGGER.exception(
                 "Rendering failed scene=%s label=%s json=%s mp4=%s error=%s",
                 scene_id,
                 label_id,

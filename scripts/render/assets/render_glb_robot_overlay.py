@@ -11,8 +11,10 @@ from pathlib import Path
 import numpy as np
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+_repo_root_str = str(REPO_ROOT)
+if not sys.path or sys.path[0] != _repo_root_str:
+    sys.path = [item for item in sys.path if item != _repo_root_str]
+    sys.path.insert(0, _repo_root_str)
 
 from utils.glb_robot_compositor import (
     GlbRobotRenderer,
