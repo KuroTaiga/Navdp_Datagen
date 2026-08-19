@@ -172,13 +172,7 @@ def _build_render_plan_from_package(args: argparse.Namespace) -> dict[str, Any]:
         manifest_path = Path(str(entry["render_manifest_json"]))
         if not manifest_path.is_absolute():
             manifest_path = package_root / manifest_path
-        entry_root = (
-            materialized_root
-            / _safe_component(str(entry.get("family") or "family"))
-            / _safe_component(str(entry.get("source") or "source"))
-            / _safe_component(str(entry.get("scene") or "scene"))
-            / Path(str(entry.get("render_manifest_json"))).stem.removesuffix(".render_manifest")
-        )
+        entry_root = materialized_root
         manifest = load_render_manifest(manifest_path)
         plan_payload = build_render_plans(
             manifest,
@@ -291,17 +285,6 @@ def _passes_filters(
     if scenes and str(entry.get("scene")) not in set(scenes):
         return False
     return True
-
-
-def _safe_component(value: str) -> str:
-    safe = []
-    for char in value:
-        if char.isalnum() or char in ("-", "_", "."):
-            safe.append(char)
-        else:
-            safe.append("__")
-    return "".join(safe).strip("_") or "unnamed"
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

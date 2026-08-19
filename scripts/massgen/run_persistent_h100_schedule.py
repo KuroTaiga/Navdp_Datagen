@@ -192,6 +192,25 @@ def _chunk_env(gpu_id: str, plans: list[Mapping[str, Any]]) -> dict[str, str]:
     return env
 
 
+def _metrics_indicate_success(metrics: list[dict[str, Any]], *, expected_paths: int) -> bool:
+    valid = [
+        metric
+        for metric in metrics
+        if isinstance(metric, Mapping) and not metric.get("error")
+    ]
+    if not valid:
+        return False
+    paths_ok = sum(int(metric.get("paths_ok") or 0) for metric in valid)
+    paths_fatal = sum(int(metric.get("paths_fatal") or 0) for metric in valid)
+    paths_oom = sum(int(metric.get("paths_oom") or 0) for metric in valid)
+    paths_attempted = sum(int(metric.get("paths_attempted") or 0) for metric in valid)
+    if paths_fatal or paths_oom:
+        return False
+    if expected_paths > 0:
+        return paths_ok >= int(expected_paths)
+    return paths_ok > 0 or paths_attempted == 0
+
+
 def _render_chunk(
     args: argparse.Namespace,
     *,
@@ -262,7 +281,15 @@ def _render_chunk(
         outer_render_elapsed_sec=render_elapsed,
     )
     output_bytes = smoke._dir_size_bytes(output_root)
-    status = "success" if render_returncode == 0 and (videos or bool(args.dry_run)) else "failed"
+    metric_success = bool(args.dry_run) or _metrics_indicate_success(
+        metrics,
+        expected_paths=len(plans),
+    )
+    status = (
+        "success"
+        if render_returncode == 0 and metric_success and (videos or bool(args.dry_run))
+        else "failed"
+    )
     if blockers:
         status = "blocked"
     record: dict[str, Any] = {

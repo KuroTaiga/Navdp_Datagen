@@ -111,6 +111,30 @@ def test_render_chunk_blocks_robot_overlay_for_phase_a(tmp_path: Path) -> None:
     assert "robot overlay plans are not supported" in record["blockers"][0]
 
 
+def test_metrics_success_requires_no_fatal_paths() -> None:
+    assert (
+        runner._metrics_indicate_success(
+            [{"paths_ok": 1, "paths_fatal": 0, "paths_oom": 0}],
+            expected_paths=1,
+        )
+        is True
+    )
+    assert (
+        runner._metrics_indicate_success(
+            [{"paths_ok": 1, "paths_fatal": 1, "paths_oom": 0}],
+            expected_paths=2,
+        )
+        is False
+    )
+    assert (
+        runner._metrics_indicate_success(
+            [{"paths_ok": 1, "paths_fatal": 0, "paths_oom": 0}],
+            expected_paths=2,
+        )
+        is False
+    )
+
+
 def _write_png_header(path: Path, *, width: int = 32, height: int = 32) -> None:
     path.write_bytes(
         b"\x89PNG\r\n\x1a\n"
@@ -248,6 +272,7 @@ def test_planner_builds_executable_schedule_from_package(tmp_path: Path) -> None
     chunk = schedule["assignments"][0]["chunks"][0]
     assert plan_payload["status"] == "ready"
     assert plan_payload["selected_entry_count"] == 1
+    assert plan_payload["plans"][0]["metadata"]["output_root"] == str(tmp_path / "materialized")
     assert chunk["plans"][0]["job_id"] == "job_a"
     assert "--actor-runtime-cache" in chunk["plans"][0]["command"]
     assert Path(chunk["plans"][0]["label_path"]).is_file()
