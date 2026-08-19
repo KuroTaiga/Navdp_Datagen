@@ -135,6 +135,61 @@ def test_metrics_success_requires_no_fatal_paths() -> None:
     )
 
 
+def test_worker_stage_markers_include_commands_and_lifecycle(tmp_path: Path) -> None:
+    records = [
+        {
+            "assignment_index": 0,
+            "chunk_index": 0,
+            "chunk_id": "chunk_a",
+            "gpu_id": "0",
+            "scene": "scene_a",
+            "status": "success",
+            "command_markers": [
+                {
+                    "command_index": 0,
+                    "started_at": "2026-08-19T00:00:00+00:00",
+                    "ended_at": "2026-08-19T00:00:02+00:00",
+                    "wall_time_sec": 2.0,
+                    "returncode": 0,
+                    "label_ids": ["job_a"],
+                    "metrics_json": "metrics/group_0000.json",
+                    "log_path": "logs/cmd.log",
+                }
+            ],
+            "metrics": [
+                {
+                    "_path": "metrics/group_0000.json",
+                    "paths_attempted": 1,
+                    "paths_ok": 1,
+                    "paths_fatal": 0,
+                    "lifecycle_seconds": {
+                        "process_start_sec": 1787097600.0,
+                        "python_import_sec": 0.5,
+                        "render_loop_sec": 1.0,
+                    },
+                }
+            ],
+        }
+    ]
+
+    count = runner._write_worker_stage_markers(tmp_path, records)
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "worker_stage_markers.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+
+    assert count == len(rows)
+    assert [row["marker_type"] for row in rows] == [
+        "chunk",
+        "command",
+        "renderer_lifecycle_stage",
+        "renderer_lifecycle_stage",
+    ]
+    assert rows[1]["label_count"] == 1
+    assert rows[2]["stage"] == "python_import_sec"
+    assert rows[3]["stage"] == "render_loop_sec"
+
+
 def _write_png_header(path: Path, *, width: int = 32, height: int = 32) -> None:
     path.write_bytes(
         b"\x89PNG\r\n\x1a\n"

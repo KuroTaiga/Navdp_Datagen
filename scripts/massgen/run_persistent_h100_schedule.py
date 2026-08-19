@@ -86,8 +86,8 @@ def _run_capture_env(
     cwd: Path,
     log_path: Path,
     env: Mapping[str, str],
-) -> tuple[subprocess.CompletedProcess[str], float]:
-    started = datetime.now(timezone.utc).isoformat()
+) -> tuple[subprocess.CompletedProcess[str], float, dict[str, Any]]:
+    started_at = datetime.now(timezone.utc)
     t0 = time.perf_counter()
     completed = subprocess.run(
         cmd,
@@ -98,12 +98,21 @@ def _run_capture_env(
         check=False,
     )
     elapsed = time.perf_counter() - t0
+    ended_at = datetime.now(timezone.utc)
+    marker = {
+        "started_at": started_at.isoformat(),
+        "ended_at": ended_at.isoformat(),
+        "wall_time_sec": elapsed,
+        "returncode": int(completed.returncode),
+        "log_path": str(log_path),
+    }
     log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(
         "".join(
             [
                 f"command: {' '.join(cmd)}\n",
-                f"started_at: {started}\n",
+                f"started_at: {marker['started_at']}\n",
+                f"ended_at: {marker['ended_at']}\n",
                 f"wall_time_sec: {elapsed:.6f}\n",
                 f"returncode: {completed.returncode}\n",
                 f"env_overrides: {json.dumps(dict(env), sort_keys=True)}\n",
@@ -115,7 +124,7 @@ def _run_capture_env(
         ),
         encoding="utf-8",
     )
-    return completed, elapsed
+    return completed, elapsed, marker
 
 
 def _chunk_output_root(results_root: Path, gpu_id: str, chunk: Mapping[str, Any]) -> Path:
@@ -259,9 +268,10 @@ def _render_chunk(
     render_elapsed = 0.0
     render_returncode = 2 if blockers else 0
     env = _chunk_env(gpu_id, plans)
+    command_markers: list[dict[str, Any]] = []
     if not blockers and grouped_commands and not bool(args.dry_run):
         for command_index, command in enumerate(grouped_commands):
-            completed, elapsed = _run_capture_env(
+            completed, elapsed, command_marker = _run_capture_env(
                 command,
                 cwd=args.repo_root,
                 env=env,
@@ -269,6 +279,18 @@ def _render_chunk(
                 / "logs"
                 / f"{_chunk_log_stem(gpu_id, chunk)}_cmd_{command_index:04d}.log",
             )
+            command_marker.update(
+                {
+                    "assignment_index": int(assignment_index),
+                    "chunk_index": int(chunk_index),
+                    "chunk_id": chunk.get("chunk_id"),
+                    "gpu_id": str(gpu_id),
+                    "command_index": int(command_index),
+                    "label_ids": smoke._option_values(command, "--label-id"),
+                    "metrics_json": smoke._single_option_value(command, "--metrics-json"),
+                }
+            )
+            command_markers.append(command_marker)
             render_elapsed += elapsed
             render_returncode = int(completed.returncode)
             if render_returncode != 0:
@@ -315,6 +337,7 @@ def _render_chunk(
         "paths_ok": render_overhead.get("nested_paths_ok"),
         "renderer_process_count": render_overhead.get("renderer_process_count"),
         "render_overhead": render_overhead,
+        "command_markers": command_markers,
         "metrics": metrics,
         "videos": [str(path) for path in videos],
         "output_root": str(output_root),
@@ -370,6 +393,160 @@ def _run_assignment(
             flush=True,
         )
     return records
+
+
+_LIFECYCLE_STAGE_ORDER = (
+    "python_import_sec",
+    "argument_parse_sec",
+    "output_preflight_sec",
+    "scene_metadata_load_sec",
+    "label_collect_sec",
+    "manifest_plan_sec",
+    "precheck_sec",
+    "scene_ply_load_sec",
+    "scene_asset_build_sec",
+    "renderer_init_sec",
+    "actor_plan_load_sec",
+    "actor_sequence_load_sec",
+    "actor_gpu_cache_upload_sec",
+    "path_prepare_sec",
+    "first_frame_latency_sec",
+    "render_loop_sec",
+    "writer_close_sec",
+    "output_bookkeeping_sec",
+    "renderer_shutdown_sec",
+)
+
+
+def _iso_from_epoch(value: float | None) -> str | None:
+    if value is None:
+        return None
+    return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+
+
+def _parse_iso_epoch(value: Any) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _write_worker_stage_markers(results_root: Path, records: list[dict[str, Any]]) -> int:
+    path = results_root / "worker_stage_markers.jsonl"
+    count = 0
+    with path.open("w", encoding="utf-8") as handle:
+        for record in records:
+            base = {
+                "assignment_index": record.get("assignment_index"),
+                "chunk_index": record.get("chunk_index"),
+                "chunk_id": record.get("chunk_id"),
+                "gpu_id": record.get("gpu_id"),
+                "scene": record.get("scene"),
+                "status": record.get("status"),
+            }
+            command_markers = [
+                marker
+                for marker in record.get("command_markers", [])
+                if isinstance(marker, Mapping)
+            ]
+            chunk_starts = [_parse_iso_epoch(marker.get("started_at")) for marker in command_markers]
+            chunk_ends = [_parse_iso_epoch(marker.get("ended_at")) for marker in command_markers]
+            chunk_starts = [value for value in chunk_starts if value is not None]
+            chunk_ends = [value for value in chunk_ends if value is not None]
+            if chunk_starts and chunk_ends:
+                start = min(chunk_starts)
+                end = max(chunk_ends)
+                handle.write(
+                    json.dumps(
+                        {
+                            **base,
+                            "marker_type": "chunk",
+                            "stage": "chunk_total",
+                            "start_epoch_sec": start,
+                            "end_epoch_sec": end,
+                            "start_at": _iso_from_epoch(start),
+                            "end_at": _iso_from_epoch(end),
+                            "duration_sec": max(0.0, end - start),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                count += 1
+            for marker in command_markers:
+                start = _parse_iso_epoch(marker.get("started_at"))
+                end = _parse_iso_epoch(marker.get("ended_at"))
+                handle.write(
+                    json.dumps(
+                        {
+                            **base,
+                            "marker_type": "command",
+                            "stage": "renderer_command",
+                            "command_index": marker.get("command_index"),
+                            "returncode": marker.get("returncode"),
+                            "label_count": len(marker.get("label_ids") or []),
+                            "metrics_json": marker.get("metrics_json"),
+                            "log_path": marker.get("log_path"),
+                            "start_epoch_sec": start,
+                            "end_epoch_sec": end,
+                            "start_at": marker.get("started_at"),
+                            "end_at": marker.get("ended_at"),
+                            "duration_sec": marker.get("wall_time_sec"),
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                )
+                count += 1
+            metrics = [
+                metric
+                for metric in record.get("metrics", [])
+                if isinstance(metric, Mapping) and isinstance(metric.get("lifecycle_seconds"), Mapping)
+            ]
+            for metric_index, metric in enumerate(metrics):
+                lifecycle = metric["lifecycle_seconds"]
+                process_start = lifecycle.get("process_start_sec")
+                try:
+                    cursor = float(process_start)
+                except (TypeError, ValueError):
+                    cursor = None
+                for stage in _LIFECYCLE_STAGE_ORDER:
+                    duration = lifecycle.get(stage)
+                    if duration is None:
+                        continue
+                    try:
+                        duration_value = max(0.0, float(duration))
+                    except (TypeError, ValueError):
+                        continue
+                    stage_start = cursor
+                    stage_end = (cursor + duration_value) if cursor is not None else None
+                    handle.write(
+                        json.dumps(
+                            {
+                                **base,
+                                "marker_type": "renderer_lifecycle_stage",
+                                "stage": stage,
+                                "metric_index": metric_index,
+                                "metric_path": metric.get("_path"),
+                                "label_count": metric.get("paths_attempted"),
+                                "paths_ok": metric.get("paths_ok"),
+                                "paths_fatal": metric.get("paths_fatal"),
+                                "start_epoch_sec": stage_start,
+                                "end_epoch_sec": stage_end,
+                                "start_at": _iso_from_epoch(stage_start),
+                                "end_at": _iso_from_epoch(stage_end),
+                                "duration_sec": duration_value,
+                            },
+                            sort_keys=True,
+                        )
+                        + "\n"
+                    )
+                    count += 1
+                    if cursor is not None:
+                        cursor += duration_value
+    return count
 
 
 def main() -> int:
@@ -472,6 +649,10 @@ def main() -> int:
     )
     summary["gpu_run_summary"] = smoke._gpu_summary(summary["gpu_samples"])
     summary["render_overhead_summary"] = smoke._summarize_render_overhead(summary["records"])
+    summary["worker_stage_marker_count"] = _write_worker_stage_markers(
+        args.results_root,
+        summary["records"],
+    )
     _write_json(args.results_root / "benchmark_summary.json", summary)
     print(
         f"summary_status {summary['status']} success={summary['success_count']}/{summary['record_count']} "
