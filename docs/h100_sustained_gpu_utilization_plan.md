@@ -4,6 +4,9 @@ This is a handoff plan for a future Codex implementation session. The goal is
 to make the H100 CPU-encode rendering pipeline sustain high GPU utilization by
 reducing setup/load/process overhead and keeping CUDA workers hot.
 
+For the newer persistent-worker/CUDA IPC process-boundary design, also read
+`docs/h100_persistent_gpu_worker_handoff.md`.
+
 ## Problem Statement
 
 The current H100 strategy is correct at a high level:
