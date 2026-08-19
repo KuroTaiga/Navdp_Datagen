@@ -54,6 +54,12 @@ def _parse_args() -> argparse.Namespace:
         help="Split compatible labels inside a chunk into renderer commands of this size.",
     )
     parser.add_argument("--gpu-sample-interval-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--command-attempts",
+        type=int,
+        default=1,
+        help="Retry each grouped renderer command up to this many attempts.",
+    )
     parser.add_argument("--preemptible-output", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--clean", action="store_true")
@@ -271,28 +277,33 @@ def _render_chunk(
     command_markers: list[dict[str, Any]] = []
     if not blockers and grouped_commands and not bool(args.dry_run):
         for command_index, command in enumerate(grouped_commands):
-            completed, elapsed, command_marker = _run_capture_env(
-                command,
-                cwd=args.repo_root,
-                env=env,
-                log_path=args.results_root
-                / "logs"
-                / f"{_chunk_log_stem(gpu_id, chunk)}_cmd_{command_index:04d}.log",
-            )
-            command_marker.update(
-                {
-                    "assignment_index": int(assignment_index),
-                    "chunk_index": int(chunk_index),
-                    "chunk_id": chunk.get("chunk_id"),
-                    "gpu_id": str(gpu_id),
-                    "command_index": int(command_index),
-                    "label_ids": smoke._option_values(command, "--label-id"),
-                    "metrics_json": smoke._single_option_value(command, "--metrics-json"),
-                }
-            )
-            command_markers.append(command_marker)
-            render_elapsed += elapsed
-            render_returncode = int(completed.returncode)
+            render_returncode = 1
+            for attempt_index in range(max(1, int(args.command_attempts or 1))):
+                completed, elapsed, command_marker = _run_capture_env(
+                    command,
+                    cwd=args.repo_root,
+                    env=env,
+                    log_path=args.results_root
+                    / "logs"
+                    / f"{_chunk_log_stem(gpu_id, chunk)}_cmd_{command_index:04d}_attempt_{attempt_index:02d}.log",
+                )
+                command_marker.update(
+                    {
+                        "assignment_index": int(assignment_index),
+                        "chunk_index": int(chunk_index),
+                        "chunk_id": chunk.get("chunk_id"),
+                        "gpu_id": str(gpu_id),
+                        "command_index": int(command_index),
+                        "attempt_index": int(attempt_index),
+                        "label_ids": smoke._option_values(command, "--label-id"),
+                        "metrics_json": smoke._single_option_value(command, "--metrics-json"),
+                    }
+                )
+                command_markers.append(command_marker)
+                render_elapsed += elapsed
+                render_returncode = int(completed.returncode)
+                if render_returncode == 0:
+                    break
             if render_returncode != 0:
                 break
 
@@ -588,6 +599,7 @@ def main() -> int:
         "repo_root": str(args.repo_root),
         "workers": int(args.workers),
         "group_max_labels_per_command": int(args.group_max_labels_per_command),
+        "command_attempts": int(args.command_attempts),
         "preemptible_output": bool(args.preemptible_output),
         "resume": bool(args.resume),
         "dry_run": bool(args.dry_run),
