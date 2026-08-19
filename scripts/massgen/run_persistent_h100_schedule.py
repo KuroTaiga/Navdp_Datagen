@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
@@ -18,7 +19,15 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.massgen import run_render_smoketest_benchmark as smoke  # noqa: E402
+_SMOKE_MODULE_PATH = REPO_ROOT / "scripts" / "massgen" / "run_render_smoketest_benchmark.py"
+_SMOKE_SPEC = importlib.util.spec_from_file_location(
+    "navdp_run_render_smoketest_benchmark",
+    _SMOKE_MODULE_PATH,
+)
+if _SMOKE_SPEC is None or _SMOKE_SPEC.loader is None:
+    raise ImportError(f"Unable to import smoke benchmark helpers from {_SMOKE_MODULE_PATH}")
+smoke = importlib.util.module_from_spec(_SMOKE_SPEC)
+_SMOKE_SPEC.loader.exec_module(smoke)
 
 
 def _parse_args() -> argparse.Namespace:
