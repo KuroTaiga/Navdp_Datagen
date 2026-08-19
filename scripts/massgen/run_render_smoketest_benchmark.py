@@ -99,6 +99,12 @@ def _parse_args() -> argparse.Namespace:
         help="Forward --actor-gpu-resident to MassGen render jobs.",
     )
     parser.add_argument(
+        "--actor-runtime-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Forward --actor-runtime-cache to MassGen render jobs.",
+    )
+    parser.add_argument(
         "--preemptible-output",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -874,6 +880,8 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
         base_cmd.extend(["--minimal-frames", str(int(args.minimal_frames))])
     if bool(args.actor_gpu_resident):
         base_cmd.append("--actor-gpu-resident")
+    if not bool(args.actor_runtime_cache):
+        base_cmd.append("--no-actor-runtime-cache")
 
     plan_completed, plan_elapsed = _run_capture(
         base_cmd,
@@ -996,6 +1004,7 @@ def _render_entries_group(
                 device=str(args.device),
                 minimal_frames=args.minimal_frames,
                 actor_gpu_resident=bool(args.actor_gpu_resident),
+                actor_runtime_cache=bool(args.actor_runtime_cache),
             )
         except Exception as exc:  # pylint: disable=broad-except
             plan_payload = {"status": "invalid", "job_count": 0, "plans": [], "error": str(exc)}
@@ -1286,6 +1295,7 @@ def main() -> int:
         "workers": int(args.workers),
         "skip_expected_blocked": bool(args.skip_expected_blocked),
         "actor_gpu_resident": bool(args.actor_gpu_resident),
+        "actor_runtime_cache": bool(args.actor_runtime_cache),
         "execution_mode": execution_mode,
         "group_max_labels_per_command": int(args.group_max_labels_per_command),
         "group_max_manifests_per_task": int(args.group_max_manifests_per_task),

@@ -71,6 +71,12 @@ def _parse_args() -> argparse.Namespace:
         help="Cache human actor sequences on GPU for per-frame transforms.",
     )
     parser.add_argument(
+        "--actor-runtime-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Reuse actor runtimes across labels inside one renderer process.",
+    )
+    parser.add_argument(
         "--save-actor-metadata",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -146,6 +152,7 @@ def main() -> int:
         save_rgb_frames=bool(args.save_rgb_frames),
         minimal_frames=args.minimal_frames,
         actor_gpu_resident=bool(args.actor_gpu_resident),
+        actor_runtime_cache=bool(args.actor_runtime_cache),
         save_actor_metadata=bool(args.save_actor_metadata),
         robot_overlay_script=args.robot_overlay_script,
         robot_glb=args.robot_glb,

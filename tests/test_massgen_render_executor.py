@@ -228,6 +228,7 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert "deliver_easy_001__view_robot_alpha" in job_plan["command"]
     assert "--actor-plan-json" in job_plan["command"]
     assert "--actor-seq-dir" not in job_plan["command"]
+    assert "--actor-runtime-cache" in job_plan["command"]
     assert "--save-actor-metadata" in job_plan["command"]
     assert Path(job_plan["label_path"]).is_file()
     assert Path(job_plan["actor_plan_path"]).is_file()
@@ -257,6 +258,24 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert actor["action"]["render_action_id"] == "receive_item"
     assert actor["frames"][0]["position"][:2] == [6.0, 4.5]
     assert len(actor["frames"]) == 3
+
+
+def test_executor_can_disable_actor_runtime_cache(tmp_path) -> None:
+    manifest, scenario_json, output_root = _prepared_manifest(tmp_path)
+
+    plan = build_render_plans(
+        manifest,
+        manifest_path=scenario_json,
+        output_root=output_root,
+        families=["deliver_to_human"],
+        write_inputs=True,
+        python_bin=sys.executable,
+        actor_runtime_cache=False,
+    )
+
+    command = plan["plans"][0]["command"]
+    assert "--no-actor-runtime-cache" in command
+    assert "--actor-runtime-cache" not in command
 
 
 def test_stationary_human_actor_yaw_preserves_planner_facing(tmp_path) -> None:

@@ -63,6 +63,7 @@ def build_render_plans(
     save_rgb_frames: bool = False,
     minimal_frames: int | None = None,
     actor_gpu_resident: bool = False,
+    actor_runtime_cache: bool = True,
     save_actor_metadata: bool = True,
     robot_overlay_script: str | Path = DEFAULT_ROBOT_OVERLAY_SCRIPT,
     robot_glb: str | Path = DEFAULT_ROBOT_GLB,
@@ -111,6 +112,7 @@ def build_render_plans(
             save_rgb_frames=save_rgb_frames,
             minimal_frames=minimal_frames,
             actor_gpu_resident=actor_gpu_resident,
+            actor_runtime_cache=actor_runtime_cache,
             save_actor_metadata=save_actor_metadata,
             robot_overlay_script=Path(robot_overlay_script).expanduser().resolve(),
             robot_glb=Path(robot_glb).expanduser().resolve(),
@@ -328,6 +330,7 @@ def _build_job_plan(
     save_rgb_frames: bool,
     minimal_frames: int | None,
     actor_gpu_resident: bool,
+    actor_runtime_cache: bool,
     save_actor_metadata: bool,
     robot_overlay_script: Path,
     robot_glb: Path,
@@ -462,6 +465,7 @@ def _build_job_plan(
         command.extend(["--actor-plan-json", str(actor_plan_path)])
         if actor_gpu_resident:
             command.append("--actor-gpu-resident")
+        command.append("--actor-runtime-cache" if actor_runtime_cache else "--no-actor-runtime-cache")
         if save_actor_metadata:
             command.append("--save-actor-metadata")
     render_options = job.get("render_options", {})
