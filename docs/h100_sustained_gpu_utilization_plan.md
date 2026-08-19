@@ -212,6 +212,23 @@ Acceptance criteria:
 - Output paths, metrics JSON paths, actor metadata, depth maps, and robot overlay
   inputs remain compatible with existing audit scripts.
 
+Implementation status, 2026-08-19:
+
+- `scripts/massgen/run_render_smoketest_benchmark.py` supports
+  `--scene-order`, which schedules selected records by `(source, scene)` so a
+  scene can finish all selected mission families before the runner moves to the
+  next scene.
+- The runner supports `--preemptible-output` and `--resume`; each task renders
+  into a temporary output directory, writes `TASK_DONE.json` only on success,
+  then atomically renames the completed task into place. This makes VM/card
+  preemption recoverable at task boundaries without trusting partial videos.
+- This is still task-level grouping. It reduces renderer invocations for
+  compatible scene batches, but it is not the persistent per-GPU worker pool
+  described in Phase 3.
+- For production, prefer scene-ordered chunks large enough to amortize scene
+  setup but small enough to preempt safely. A whole-scene batch is useful as a
+  benchmark, not necessarily the final operational chunk size.
+
 ### Phase 3: Persistent Per-GPU Worker Pool
 
 This is the main structural fix.
