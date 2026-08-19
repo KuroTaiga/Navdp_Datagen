@@ -976,6 +976,16 @@ class ActorRenderRuntime:
     gpu_cache_upload_sec: float = 0.0
 
 
+@dataclass(frozen=True)
+class CachedActorRuntime:
+    runtime: ActorRuntime
+    gpu_sequence: GpuActorSequence | None
+    gpu_error: str | None
+
+
+ActorRuntimeCache = dict[tuple[object, ...], CachedActorRuntime]
+
+
 def build_actor_motion_plan_transforms(
     plan: ActorMotionPlan,
     *,
@@ -1465,23 +1475,30 @@ def _load_actor_render_runtime(
     plan: ActorMotionPlan,
     args: argparse.Namespace,
     renderer: GaussianRendererBackend,
+    runtime_cache: ActorRuntimeCache | None = None,
+    cache_stats: dict[str, int] | None = None,
 ) -> ActorRenderRuntime:
-    sequence_dir = plan.sequence_dir or args.actor_seq_dir
-    if sequence_dir is None:
-        raise ValueError("--actor-plan-json requires --actor-seq-dir or sequence_dir in every actor plan.")
-    actor_options = ActorOptions(
-        sequence_dir=sequence_dir,
-        pattern=args.actor_pattern,
-        height=float(plan.actor_height_m if plan.actor_height_m is not None else args.actor_height),
-        speed=float(args.actor_speed),
-        fps=float(plan.actor_fps if plan.actor_fps is not None else args.actor_fps),
-        loop=bool(plan.loop if plan.loop is not None else args.actor_loop),
-        foot_offset=float(args.actor_foot_offset),
-        follow_distance=float(args.follow_distance),
-        buffer_distance=float(args.follow_buffer),
-        animation_cycle_mod=int(args.animation_cycle_mod),
-    )
+    actor_options = _actor_options_for_plan(plan=plan, args=args)
     _validate_actor_options(actor_options)
+    cache_key = _actor_runtime_cache_key(
+        actor_options=actor_options,
+        args=args,
+        renderer=renderer,
+    )
+    if runtime_cache is not None and cache_key in runtime_cache:
+        if cache_stats is not None:
+            cache_stats["hits"] = cache_stats.get("hits", 0) + 1
+        cached = runtime_cache[cache_key]
+        return ActorRenderRuntime(
+            plan=plan,
+            runtime=cached.runtime,
+            gpu_sequence=cached.gpu_sequence,
+            gpu_error=cached.gpu_error,
+            gpu_cache_upload_sec=0.0,
+        )
+
+    if cache_stats is not None:
+        cache_stats["misses"] = cache_stats.get("misses", 0) + 1
     actor_sequence = load_actor_sequence(actor_options, debug=bool(args.verbose))
     actor_runtime = ActorRuntime(options=actor_options, sequence=actor_sequence)
 
@@ -1531,12 +1548,71 @@ def _load_actor_render_runtime(
                     actor_gpu_error,
                 )
 
+    if runtime_cache is not None:
+        runtime_cache[cache_key] = CachedActorRuntime(
+            runtime=actor_runtime,
+            gpu_sequence=gpu_actor_sequence,
+            gpu_error=actor_gpu_error,
+        )
+        if cache_stats is not None:
+            cache_stats["stores"] = cache_stats.get("stores", 0) + 1
+
     return ActorRenderRuntime(
         plan=plan,
         runtime=actor_runtime,
         gpu_sequence=gpu_actor_sequence,
         gpu_error=actor_gpu_error,
         gpu_cache_upload_sec=actor_gpu_cache_upload_sec,
+    )
+
+
+def _actor_options_for_plan(
+    *,
+    plan: ActorMotionPlan,
+    args: argparse.Namespace,
+) -> ActorOptions:
+    sequence_dir = plan.sequence_dir or args.actor_seq_dir
+    if sequence_dir is None:
+        raise ValueError("--actor-plan-json requires --actor-seq-dir or sequence_dir in every actor plan.")
+    return ActorOptions(
+        sequence_dir=Path(sequence_dir).expanduser().resolve(),
+        pattern=str(args.actor_pattern),
+        height=float(plan.actor_height_m if plan.actor_height_m is not None else args.actor_height),
+        speed=float(args.actor_speed),
+        fps=float(plan.actor_fps if plan.actor_fps is not None else args.actor_fps),
+        loop=bool(plan.loop if plan.loop is not None else args.actor_loop),
+        foot_offset=float(args.actor_foot_offset),
+        follow_distance=float(args.follow_distance),
+        buffer_distance=float(args.follow_buffer),
+        animation_cycle_mod=int(args.animation_cycle_mod),
+    )
+
+
+def _actor_runtime_cache_key(
+    *,
+    actor_options: ActorOptions,
+    args: argparse.Namespace,
+    renderer: GaussianRendererBackend,
+) -> tuple[object, ...]:
+    base_gaussians = renderer._gaussians  # pylint: disable=protected-access
+    base_device = base_gaussians.get_xyz.device
+    scene_rest_dim = int(base_gaussians.get_features_rest.shape[1])
+    return (
+        str(actor_options.sequence_dir),
+        str(actor_options.pattern),
+        float(actor_options.height),
+        float(actor_options.speed),
+        float(actor_options.fps),
+        bool(actor_options.loop),
+        float(actor_options.foot_offset),
+        float(actor_options.follow_distance),
+        float(actor_options.buffer_distance),
+        int(actor_options.animation_cycle_mod),
+        bool(getattr(args, "actor_gpu_resident", False)),
+        float(getattr(args, "actor_gpu_cache_mb", 0.0) or 0.0),
+        str(getattr(args, "actor_gpu_sh_mode", "copy")),
+        str(base_device),
+        int(scene_rest_dim),
     )
 
 
@@ -2531,6 +2607,15 @@ def parse_args() -> argparse.Namespace:
         default="copy",
         help="SH-rest handling for --actor-gpu-resident. copy is fast but not exact SH rotation.",
     )
+    parser.add_argument(
+        "--actor-runtime-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reuse actor CPU/GPU sequence runtimes across labels in the same renderer process. "
+            "Default: enabled."
+        ),
+    )
     parser.add_argument("--actor-no-loop", dest="actor_loop", action="store_false")
     parser.set_defaults(actor_loop=True)
     parser.add_argument(
@@ -2875,6 +2960,13 @@ def main() -> int:
     with _measure_lifecycle(lifecycle_seconds, "renderer_init_sec"):
         renderer = build_renderer(asset, args)
 
+    actor_runtime_cache: ActorRuntimeCache | None = {} if bool(args.actor_runtime_cache) else None
+    actor_runtime_cache_stats = {
+        "enabled": int(bool(args.actor_runtime_cache)),
+        "hits": 0,
+        "misses": 0,
+        "stores": 0,
+    }
     actor_motion_plans: tuple[ActorMotionPlan, ...] = ()
     actor_render_runtimes: tuple[ActorRenderRuntime, ...] = ()
     if args.actor_plan_json is not None and not label_actor_plan_map:
@@ -2890,7 +2982,13 @@ def main() -> int:
     if actor_motion_plans:
         actor_load_t0 = time.perf_counter()
         actor_render_runtimes = tuple(
-            _load_actor_render_runtime(plan=plan, args=args, renderer=renderer)
+            _load_actor_render_runtime(
+                plan=plan,
+                args=args,
+                renderer=renderer,
+                runtime_cache=actor_runtime_cache,
+                cache_stats=actor_runtime_cache_stats,
+            )
             for plan in actor_motion_plans
         )
         actor_gpu_upload_sec = sum(
@@ -2919,6 +3017,8 @@ def main() -> int:
             ),
             args=args,
             renderer=renderer,
+            runtime_cache=actor_runtime_cache,
+            cache_stats=actor_runtime_cache_stats,
         )
         actor_gpu_upload_sec = max(
             0.0,
@@ -2959,7 +3059,13 @@ def main() -> int:
                     label_actor_motion_plans = load_actor_motion_plans(label_actor_plan_path)
                 actor_load_t0 = time.perf_counter()
                 label_actor_runtimes = tuple(
-                    _load_actor_render_runtime(plan=plan, args=args, renderer=renderer)
+                    _load_actor_render_runtime(
+                        plan=plan,
+                        args=args,
+                        renderer=renderer,
+                        runtime_cache=actor_runtime_cache,
+                        cache_stats=actor_runtime_cache_stats,
+                    )
                     for plan in label_actor_motion_plans
                 )
                 actor_gpu_upload_sec = sum(
@@ -3115,6 +3221,13 @@ def main() -> int:
         "vram_avg_max_worker_bytes": 0.0,
         "paths": paths_payload,
         "path_statuses": list(path_statuses.values()),
+        "actor_runtime_cache": {
+            "enabled": bool(actor_runtime_cache_stats.get("enabled", 0)),
+            "hits": int(actor_runtime_cache_stats.get("hits", 0)),
+            "misses": int(actor_runtime_cache_stats.get("misses", 0)),
+            "stores": int(actor_runtime_cache_stats.get("stores", 0)),
+            "resident_entries": len(actor_runtime_cache or {}),
+        },
     }
     lifecycle_seconds["output_bookkeeping_sec"] = lifecycle_seconds.get(
         "output_bookkeeping_sec", 0.0

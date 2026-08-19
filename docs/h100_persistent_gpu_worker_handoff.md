@@ -259,14 +259,23 @@ Started in this session:
 - tests cover resource extraction, scene chunking, GPU assignment, and cache
   eviction/refcount behavior.
 
+Added after the initial scheduler slice:
+
+- `render_label_paths_telesim.py` now enables an in-process
+  `--actor-runtime-cache` by default. In grouped/multi-label renders, actor
+  CPU sequences and optional actor GPU-resident sequences are reused by
+  sequence/options key instead of being reloaded for every label actor plan.
+- Renderer metrics include `actor_runtime_cache` with
+  `hits/misses/stores/resident_entries` so 5880/H100 tests can verify reuse.
+
 Next implementation steps:
 
-1. Teach the persistent scheduler to read the formal smoke package directly,
+1. Benchmark the actor runtime cache on 5880 against the previous
+   `CHINGMU_rescaled_3/0016_859086` 100-mission scene-order run.
+2. Teach the persistent scheduler to read the formal smoke package directly,
    not only render plan JSON.
-2. Add a single-process persistent renderer prototype that can consume one
+3. Add a single-process persistent renderer prototype that can consume one
    `PersistentGpuSchedule` for camera-only or actor-plan jobs.
-3. Move actor sequence loading into a process-local cache keyed by actor/action
-   resource keys.
 4. Add bounded async host output queue and CPU encode workers.
 5. Benchmark Phase A on 5880 with the same 100-mission scene used in
    `out/scene_order_5880/9d8867b/chingmu3_0016`.
