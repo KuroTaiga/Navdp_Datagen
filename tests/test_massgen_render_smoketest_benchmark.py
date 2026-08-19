@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import argparse
+
 import pytest
 
 from scripts.massgen import run_render_smoketest_benchmark as bench
@@ -238,6 +240,98 @@ def test_group_entry_tasks_chunks_manifest_groups() -> None:
         ("scene_a", [4], 2, 3),
         ("scene_b", [0, 1], 0, 1),
     ]
+
+
+def test_scene_entry_tasks_group_by_source_scene() -> None:
+    entries = [
+        {"family": "family_b", "source": "source", "scene": "scene_2", "id": "b"},
+        {"family": "family_a", "source": "source", "scene": "scene_1", "id": "a0"},
+        {"family": "family_c", "source": "source", "scene": "scene_1", "id": "a1"},
+    ]
+    grouped: dict[bench.GroupKey, list[dict[str, str]]] = {}
+    for entry in entries:
+        grouped.setdefault(bench._scene_entry_key(entry), []).append(entry)
+
+    tasks = bench._group_entry_tasks(grouped, max_manifests_per_task=0)
+
+    assert [(key, [entry["id"] for entry in task_entries]) for key, task_entries, *_ in tasks] == [
+        (("source", "scene_1"), ["a0", "a1"]),
+        (("source", "scene_2"), ["b"]),
+    ]
+
+
+def test_passes_filters_supports_scene_filter() -> None:
+    entry = {"family": "family_a", "source": "source_a", "scene": "scene_a"}
+
+    assert bench._passes_filters(entry, ["family_a"], ["source_a"], ["scene_a"]) is True
+    assert bench._passes_filters(entry, ["family_a"], ["source_a"], ["scene_b"]) is False
+
+
+def test_preemptible_task_commit_and_resume_marker(tmp_path) -> None:
+    work_root = tmp_path / "scene.tmp.123"
+    final_root = tmp_path / "scene"
+    video = work_root / "renders" / "scene" / "label.mp4"
+    metric = work_root / "metrics" / "group_0000.json"
+    video.parent.mkdir(parents=True)
+    metric.parent.mkdir(parents=True)
+    video.write_bytes(b"mp4")
+    metric.write_text("{}", encoding="utf-8")
+    record = {
+        "status": "success",
+        "output_root": str(work_root),
+        "final_output_root": str(final_root),
+        "videos": [str(video)],
+        "metrics": [{"_path": str(metric), "frames_total": 12}],
+    }
+
+    committed = bench._commit_task_output_root(
+        work_root=work_root,
+        final_root=final_root,
+        record=record,
+        preemptible=True,
+    )
+    resumed = bench._load_done_record(committed)
+
+    assert committed == final_root
+    assert not work_root.exists()
+    assert (final_root / "TASK_DONE.json").is_file()
+    assert resumed is not None
+    assert resumed["skipped_existing"] is True
+    assert resumed["output_root"] == str(final_root)
+    assert resumed["videos"] == [str(final_root / "renders" / "scene" / "label.mp4")]
+    assert resumed["metrics"][0]["_path"] == str(final_root / "metrics" / "group_0000.json")
+
+
+def test_render_entries_group_returns_existing_done_record(tmp_path) -> None:
+    final_root = tmp_path / "scene"
+    final_root.mkdir()
+    record = {
+        "status": "success",
+        "output_root": str(final_root),
+        "final_output_root": str(final_root),
+        "source": "source",
+        "scene": "scene",
+        "videos": ["video.mp4"],
+        "metrics": [],
+    }
+    bench._write_json(final_root / "TASK_DONE.json", {"record": record})
+    args = argparse.Namespace(preemptible_output=True, resume=True)
+
+    resumed = bench._render_entries_group(
+        args,
+        [],
+        0,
+        output_root=final_root,
+        log_stem=tmp_path / "log",
+        record_type="scene_ordered",
+        family=None,
+        source="source",
+        scene="scene",
+    )
+
+    assert resumed["status"] == "success"
+    assert resumed["skipped_existing"] is True
+    assert resumed["output_root"] == str(final_root)
 
 
 def test_grouped_render_command_keeps_incompatible_render_options_separate(tmp_path) -> None:

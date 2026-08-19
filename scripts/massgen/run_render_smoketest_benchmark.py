@@ -43,6 +43,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--family", action="append", default=None)
     parser.add_argument("--source", action="append", default=None)
+    parser.add_argument("--scene", action="append", default=None)
     parser.add_argument("--skip-expected-blocked", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--keep-outputs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--gpu-sample-interval-sec", type=float, default=1.0)
@@ -72,6 +73,16 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--scene-order",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Group selected manifests by source/scene, render all selected families for "
+            "a scene in one scene task, then move to the next scene task. This is the "
+            "preemptible smoke-test approximation of the scene-persistent H100 pipeline."
+        ),
+    )
+    parser.add_argument(
         "--group-max-manifests-per-task",
         type=int,
         default=0,
@@ -86,6 +97,21 @@ def _parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Forward --actor-gpu-resident to MassGen render jobs.",
+    )
+    parser.add_argument(
+        "--preemptible-output",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Render grouped tasks into .tmp directories and atomically promote only "
+            "successful tasks. This makes hard preemption/restart safe."
+        ),
+    )
+    parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip preemptible tasks that already have a TASK_DONE.json marker.",
     )
     parser.add_argument("--clean", action="store_true")
     return parser.parse_args()
@@ -454,6 +480,155 @@ def _group_log_stem(
     return stem
 
 
+def _scene_entry_key(entry: Mapping[str, Any]) -> tuple[str, str]:
+    return (
+        str(entry.get("source")),
+        str(entry.get("scene")),
+    )
+
+
+def _scene_output_root(
+    results_root: Path,
+    key: tuple[str, str],
+    *,
+    chunk_index: int | None = None,
+) -> Path:
+    source, scene = key
+    root = (
+        results_root
+        / "scene_ordered_renders"
+        / _safe_component(source)
+        / _safe_component(scene)
+    )
+    if chunk_index is not None:
+        root = root / f"chunk_{chunk_index:04d}"
+    return root
+
+
+def _scene_log_stem(
+    key: tuple[str, str],
+    *,
+    chunk_index: int | None = None,
+) -> Path:
+    source, scene = key
+    stem = Path("scene_ordered") / _safe_component(source) / _safe_component(scene)
+    if chunk_index is not None:
+        stem = stem / f"chunk_{chunk_index:04d}"
+    return stem
+
+
+def _task_done_path(output_root: Path) -> Path:
+    return output_root / "TASK_DONE.json"
+
+
+def _load_done_record(output_root: Path) -> dict[str, Any] | None:
+    marker = _task_done_path(output_root)
+    if not marker.is_file():
+        return None
+    try:
+        payload = _load_json(marker)
+    except Exception:
+        return None
+    record = payload.get("record")
+    if not isinstance(record, dict):
+        return None
+    record = dict(record)
+    record["skipped_existing"] = True
+    record["status"] = "success"
+    record["output_root"] = str(output_root)
+    return record
+
+
+def _tmp_output_root(output_root: Path) -> Path:
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    return output_root.with_name(f"{output_root.name}.tmp.{os.getpid()}.{stamp}")
+
+
+def _prepare_task_output_root(
+    output_root: Path,
+    *,
+    preemptible: bool,
+    resume: bool,
+) -> tuple[Path, dict[str, Any] | None]:
+    if resume:
+        done = _load_done_record(output_root)
+        if done is not None:
+            return output_root, done
+    if not preemptible:
+        output_root.mkdir(parents=True, exist_ok=True)
+        return output_root, None
+    work_root = _tmp_output_root(output_root)
+    if work_root.exists():
+        shutil.rmtree(work_root)
+    work_root.mkdir(parents=True, exist_ok=True)
+    return work_root, None
+
+
+def _commit_task_output_root(
+    *,
+    work_root: Path,
+    final_root: Path,
+    record: Mapping[str, Any],
+    preemptible: bool,
+) -> Path:
+    marker_record = dict(record)
+    marker_record["output_root"] = str(final_root)
+    marker_record["final_output_root"] = str(final_root)
+    videos = []
+    for path in marker_record.get("videos", []):
+        try:
+            videos.append(str(final_root / Path(str(path)).relative_to(work_root)))
+        except ValueError:
+            videos.append(str(path))
+    if videos:
+        marker_record["videos"] = videos
+    metrics = []
+    for metric in marker_record.get("metrics", []):
+        if not isinstance(metric, Mapping):
+            metrics.append(metric)
+            continue
+        remapped = dict(metric)
+        metric_path = remapped.get("_path")
+        if isinstance(metric_path, str):
+            try:
+                remapped["_path"] = str(final_root / Path(metric_path).relative_to(work_root))
+            except ValueError:
+                pass
+        metrics.append(remapped)
+    if metrics:
+        marker_record["metrics"] = metrics
+    if not preemptible:
+        _write_json(_task_done_path(final_root), {"record": marker_record})
+        return final_root
+    marker_payload = {
+        "committed_at": datetime.now(timezone.utc).isoformat(),
+        "record": marker_record,
+    }
+    _write_json(_task_done_path(work_root), marker_payload)
+    final_root.parent.mkdir(parents=True, exist_ok=True)
+    if final_root.exists():
+        existing_done = _load_done_record(final_root)
+        if existing_done is not None:
+            shutil.rmtree(work_root)
+            return final_root
+        stale = final_root.with_name(
+            f"{final_root.name}.stale.{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+        )
+        final_root.rename(stale)
+    work_root.rename(final_root)
+    return final_root
+
+
+def _cleanup_stale_tmp_outputs(results_root: Path) -> int:
+    removed = 0
+    for path in results_root.rglob("*.tmp.*"):
+        if not path.is_dir():
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 _COMMAND_OPTIONS_WITH_VALUE = {
     "--scenes-dir",
     "--tasks-dir",
@@ -657,10 +832,17 @@ def _build_grouped_render_commands(
     return grouped_commands
 
 
-def _passes_filters(entry: Mapping[str, Any], families: list[str] | None, sources: list[str] | None) -> bool:
+def _passes_filters(
+    entry: Mapping[str, Any],
+    families: list[str] | None,
+    sources: list[str] | None,
+    scenes: list[str] | None,
+) -> bool:
     if families and str(entry.get("family")) not in set(families):
         return False
     if sources and str(entry.get("source")) not in set(sources):
+        return False
+    if scenes and str(entry.get("scene")) not in set(scenes):
         return False
     return True
 
@@ -766,17 +948,29 @@ def _render_entry(args: argparse.Namespace, entry: Mapping[str, Any], index: int
     }
 
 
-def _render_group(
+def _render_entries_group(
     args: argparse.Namespace,
-    key: tuple[str, str, str],
     entries: list[Mapping[str, Any]],
     index: int,
     *,
+    output_root: Path,
+    log_stem: Path,
+    record_type: str,
+    family: str | None,
+    source: str,
+    scene: str,
     chunk_index: int | None = None,
     chunk_count: int | None = None,
 ) -> dict[str, Any]:
-    output_root = _group_output_root(args.results_root, key, chunk_index=chunk_index)
-    log_stem = _group_log_stem(key, chunk_index=chunk_index)
+    final_output_root = output_root
+    output_root, done_record = _prepare_task_output_root(
+        final_output_root,
+        preemptible=bool(args.preemptible_output),
+        resume=bool(args.resume),
+    )
+    if done_record is not None:
+        return done_record
+
     plans_root = output_root / "render_plans"
     metrics_root = output_root / "metrics"
     all_plans: list[Mapping[str, Any]] = []
@@ -845,17 +1039,21 @@ def _render_group(
         metrics,
         outer_render_elapsed_sec=render_elapsed,
     )
-    family, source, scene = key
     status = "success" if render_returncode == 0 and videos else "failed"
     if blocked:
         status = "blocked"
     elif plan_errors:
         status = "invalid"
-    return {
+    family_counts: dict[str, int] = {}
+    for entry in entries:
+        entry_family = str(entry.get("family"))
+        family_counts[entry_family] = family_counts.get(entry_family, 0) + 1
+    record = {
         "entry_index": int(index),
-        "record_type": "grouped_same_scene",
+        "record_type": record_type,
         "entry_count": len(entries),
-        "family": family,
+        "family": family if family is not None else ",".join(sorted(family_counts)),
+        "families": family_counts,
         "source": source,
         "scene": scene,
         "scenario_id": None,
@@ -890,19 +1088,103 @@ def _render_group(
         "metrics": metrics,
         "videos": [str(path) for path in videos],
         "output_root": str(output_root),
+        "final_output_root": str(final_output_root),
+        "preemptible_output": bool(args.preemptible_output),
         "output_bytes": output_bytes,
         "gpu_summary": {},
     }
+    if status == "success":
+        committed_root = _commit_task_output_root(
+            work_root=output_root,
+            final_root=final_output_root,
+            record=record,
+            preemptible=bool(args.preemptible_output),
+        )
+        record["output_root"] = str(committed_root)
+        record["final_output_root"] = str(committed_root)
+        if bool(args.preemptible_output):
+            committed_metrics: list[dict[str, Any]] = []
+            for metric in metrics:
+                committed_metric = dict(metric)
+                metric_path = metric.get("_path")
+                if isinstance(metric_path, str):
+                    try:
+                        committed_metric["_path"] = str(
+                            committed_root / Path(metric_path).relative_to(output_root)
+                        )
+                    except ValueError:
+                        committed_metric["_path"] = metric_path
+                committed_metrics.append(committed_metric)
+            record["metrics"] = committed_metrics
+            record["videos"] = [
+                str(committed_root / Path(path).relative_to(output_root))
+                for path in record["videos"]
+            ]
+    return record
+
+
+def _render_group(
+    args: argparse.Namespace,
+    key: tuple[str, str, str],
+    entries: list[Mapping[str, Any]],
+    index: int,
+    *,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> dict[str, Any]:
+    family, source, scene = key
+    return _render_entries_group(
+        args,
+        entries,
+        index,
+        output_root=_group_output_root(args.results_root, key, chunk_index=chunk_index),
+        log_stem=_group_log_stem(key, chunk_index=chunk_index),
+        record_type="grouped_same_scene",
+        family=family,
+        source=source,
+        scene=scene,
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+    )
+
+
+def _render_scene_group(
+    args: argparse.Namespace,
+    key: tuple[str, str],
+    entries: list[Mapping[str, Any]],
+    index: int,
+    *,
+    chunk_index: int | None = None,
+    chunk_count: int | None = None,
+) -> dict[str, Any]:
+    source, scene = key
+    return _render_entries_group(
+        args,
+        entries,
+        index,
+        output_root=_scene_output_root(args.results_root, key, chunk_index=chunk_index),
+        log_stem=_scene_log_stem(key, chunk_index=chunk_index),
+        record_type="scene_ordered",
+        family=None,
+        source=source,
+        scene=scene,
+        chunk_index=chunk_index,
+        chunk_count=chunk_count,
+    )
+
+
+GroupKey = tuple[str, ...]
 
 
 def _group_entry_tasks(
-    grouped: Mapping[tuple[str, str, str], list[Mapping[str, Any]]],
+    grouped: Mapping[GroupKey, list[Mapping[str, Any]]],
     *,
     max_manifests_per_task: int,
-) -> list[tuple[tuple[str, str, str], list[Mapping[str, Any]], int, int | None, int | None]]:
-    tasks: list[tuple[tuple[str, str, str], list[Mapping[str, Any]], int, int | None, int | None]] = []
+) -> list[tuple[GroupKey, list[Mapping[str, Any]], int, int | None, int | None]]:
+    tasks: list[tuple[GroupKey, list[Mapping[str, Any]], int, int | None, int | None]] = []
     chunk_size = int(max_manifests_per_task or 0)
-    for key, group_entries in grouped.items():
+    for key in sorted(grouped):
+        group_entries = grouped[key]
         if chunk_size <= 0:
             tasks.append((key, group_entries, len(tasks), None, None))
             continue
@@ -927,13 +1209,18 @@ def main() -> int:
     if args.clean and args.results_root.exists():
         shutil.rmtree(args.results_root)
     args.results_root.mkdir(parents=True, exist_ok=True)
+    stale_tmp_removed = (
+        _cleanup_stale_tmp_outputs(args.results_root)
+        if bool(args.preemptible_output) and bool(args.resume)
+        else 0
+    )
 
     package_index = _load_json(args.package_root / "smoketest_package_index.json")
     entries = [entry for entry in package_index.get("entries", []) if isinstance(entry, Mapping)]
     selected: list[Mapping[str, Any]] = []
     per_group_counts: dict[tuple[str, str, str], int] = {}
     for entry in entries:
-        if not _passes_filters(entry, args.family, args.source):
+        if not _passes_filters(entry, args.family, args.source, args.scene):
             continue
         if bool(args.skip_expected_blocked) and bool(entry.get("expected_renderer_blocked")):
             continue
@@ -951,6 +1238,13 @@ def main() -> int:
         if int(args.max_renders) > 0 and len(selected) >= int(args.max_renders):
             break
 
+    if bool(args.scene_order):
+        execution_mode = "scene_ordered"
+    elif bool(args.group_same_scene):
+        execution_mode = "grouped_same_scene"
+    else:
+        execution_mode = "per_manifest"
+
     summary: dict[str, Any] = {
         "schema_version": "navdp_massgen_render_smoketest_benchmark.v0.1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -965,12 +1259,16 @@ def main() -> int:
         "minimal_frames": args.minimal_frames,
         "max_renders": int(args.max_renders),
         "renders_per_family_source_scene": int(args.renders_per_family_source_scene),
+        "scene_filters": list(args.scene or []),
         "workers": int(args.workers),
         "skip_expected_blocked": bool(args.skip_expected_blocked),
         "actor_gpu_resident": bool(args.actor_gpu_resident),
-        "execution_mode": "grouped_same_scene" if bool(args.group_same_scene) else "per_manifest",
+        "execution_mode": execution_mode,
         "group_max_labels_per_command": int(args.group_max_labels_per_command),
         "group_max_manifests_per_task": int(args.group_max_manifests_per_task),
+        "preemptible_output": bool(args.preemptible_output),
+        "resume": bool(args.resume),
+        "stale_tmp_removed": stale_tmp_removed,
         "selected_count": len(selected),
         "records": [],
     }
@@ -978,7 +1276,72 @@ def main() -> int:
     gpu_samples_path = args.results_root / "gpu_samples.jsonl"
     benchmark_t0 = time.perf_counter()
     with GpuMonitor(float(args.gpu_sample_interval_sec), log_path=gpu_samples_path) as run_monitor:
-        if bool(args.group_same_scene):
+        if bool(args.scene_order):
+            grouped: dict[GroupKey, list[Mapping[str, Any]]] = {}
+            for entry in selected:
+                grouped.setdefault(_scene_entry_key(entry), []).append(entry)
+            group_items = list(grouped.items())
+            group_tasks = _group_entry_tasks(
+                grouped,
+                max_manifests_per_task=int(args.group_max_manifests_per_task),
+            )
+            summary["scene_group_count"] = len(group_items)
+            summary["execution_record_count"] = len(group_tasks)
+            if int(args.workers) <= 1:
+                for completed_count, (key, group_entries, index, chunk_index, chunk_count) in enumerate(group_tasks, start=1):
+                    scene_key = (key[0], key[1])
+                    record = _render_scene_group(
+                        args,
+                        scene_key,
+                        group_entries,
+                        index,
+                        chunk_index=chunk_index,
+                        chunk_count=chunk_count,
+                    )
+                    summary["records"].append(record)
+                    with jsonl_path.open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps(record, sort_keys=True) + "\n")
+                    print(
+                        f"{completed_count}/{len(group_tasks)} scene={record['source']} {record['scene']} "
+                        f"families={','.join(sorted(record.get('families', {})))} "
+                        f"entries={record['entry_count']} chunk={record.get('group_chunk_index')} "
+                        f"status={record['status']} frames={record.get('frames_total')} "
+                        f"render={record['render_elapsed_sec']:.2f}s bytes={record['output_bytes']}",
+                        flush=True,
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
+                    futures = {
+                        pool.submit(
+                            _render_scene_group,
+                            args,
+                            (key[0], key[1]),
+                            group_entries,
+                            index,
+                            chunk_index=chunk_index,
+                            chunk_count=chunk_count,
+                        ): index
+                        for key, group_entries, index, chunk_index, chunk_count in group_tasks
+                    }
+                    completed_count = 0
+                    for future in as_completed(futures):
+                        index = futures[future]
+                        record = future.result()
+                        completed_count += 1
+                        summary["records"].append(record)
+                        with jsonl_path.open("a", encoding="utf-8") as handle:
+                            handle.write(json.dumps(record, sort_keys=True) + "\n")
+                        print(
+                            f"{completed_count}/{len(group_tasks)} scene_group={index} "
+                            f"{record['source']} {record['scene']} "
+                            f"families={','.join(sorted(record.get('families', {})))} "
+                            f"entries={record['entry_count']} chunk={record.get('group_chunk_index')} "
+                            f"status={record['status']} "
+                            f"frames={record.get('frames_total')} render={record['render_elapsed_sec']:.2f}s "
+                            f"bytes={record['output_bytes']}",
+                            flush=True,
+                        )
+        elif bool(args.group_same_scene):
             grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
             for entry in selected:
                 grouped.setdefault(_entry_group_key(entry), []).append(entry)
@@ -993,7 +1356,7 @@ def main() -> int:
                 for completed_count, (key, group_entries, index, chunk_index, chunk_count) in enumerate(group_tasks, start=1):
                     record = _render_group(
                         args,
-                        key,
+                        (key[0], key[1], key[2]),
                         group_entries,
                         index,
                         chunk_index=chunk_index,
@@ -1016,7 +1379,7 @@ def main() -> int:
                         pool.submit(
                             _render_group,
                             args,
-                            key,
+                            (key[0], key[1], key[2]),
                             group_entries,
                             index,
                             chunk_index=chunk_index,
