@@ -260,6 +260,28 @@ def test_scene_entry_tasks_group_by_source_scene() -> None:
     ]
 
 
+def test_scene_order_task_groups_keep_scene_barriers_with_chunks() -> None:
+    grouped = {
+        ("source", "scene_b"): [{"id": "b0"}, {"id": "b1"}],
+        ("source", "scene_a"): [{"id": "a0"}, {"id": "a1"}, {"id": "a2"}],
+    }
+
+    scene_groups = bench._scene_order_task_groups(grouped, max_manifests_per_task=2)
+
+    assert [
+        [(key, [entry["id"] for entry in entries], index, chunk, count) for key, entries, index, chunk, count in scene_tasks]
+        for scene_tasks in scene_groups
+    ] == [
+        [
+            (("source", "scene_a"), ["a0", "a1"], 0, 0, 2),
+            (("source", "scene_a"), ["a2"], 1, 1, 2),
+        ],
+        [
+            (("source", "scene_b"), ["b0", "b1"], 2, 0, 1),
+        ],
+    ]
+
+
 def test_passes_filters_supports_scene_filter() -> None:
     entry = {"family": "family_a", "source": "source_a", "scene": "scene_a"}
 

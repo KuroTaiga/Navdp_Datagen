@@ -1198,6 +1198,29 @@ def _group_entry_tasks(
     return tasks
 
 
+def _scene_order_task_groups(
+    grouped: Mapping[GroupKey, list[Mapping[str, Any]]],
+    *,
+    max_manifests_per_task: int,
+) -> list[list[tuple[GroupKey, list[Mapping[str, Any]], int, int | None, int | None]]]:
+    scene_task_groups: list[
+        list[tuple[GroupKey, list[Mapping[str, Any]], int, int | None, int | None]]
+    ] = []
+    next_index = 0
+    for key in sorted(grouped):
+        scene_tasks: list[
+            tuple[GroupKey, list[Mapping[str, Any]], int, int | None, int | None]
+        ] = []
+        for task_key, task_entries, _, chunk_index, chunk_count in _group_entry_tasks(
+            {key: grouped[key]},
+            max_manifests_per_task=max_manifests_per_task,
+        ):
+            scene_tasks.append((task_key, task_entries, next_index, chunk_index, chunk_count))
+            next_index += 1
+        scene_task_groups.append(scene_tasks)
+    return scene_task_groups
+
+
 def main() -> int:
     args = _parse_args()
     args.package_root = args.package_root.expanduser().resolve()
@@ -1280,12 +1303,12 @@ def main() -> int:
             grouped: dict[GroupKey, list[Mapping[str, Any]]] = {}
             for entry in selected:
                 grouped.setdefault(_scene_entry_key(entry), []).append(entry)
-            group_items = list(grouped.items())
-            group_tasks = _group_entry_tasks(
+            scene_task_groups = _scene_order_task_groups(
                 grouped,
                 max_manifests_per_task=int(args.group_max_manifests_per_task),
             )
-            summary["scene_group_count"] = len(group_items)
+            group_tasks = [task for scene_tasks in scene_task_groups for task in scene_tasks]
+            summary["scene_group_count"] = len(scene_task_groups)
             summary["execution_record_count"] = len(group_tasks)
             if int(args.workers) <= 1:
                 for completed_count, (key, group_entries, index, chunk_index, chunk_count) in enumerate(group_tasks, start=1):
@@ -1310,37 +1333,40 @@ def main() -> int:
                         flush=True,
                     )
             else:
-                with ThreadPoolExecutor(max_workers=int(args.workers)) as pool:
-                    futures = {
-                        pool.submit(
-                            _render_scene_group,
-                            args,
-                            (key[0], key[1]),
-                            group_entries,
-                            index,
-                            chunk_index=chunk_index,
-                            chunk_count=chunk_count,
-                        ): index
-                        for key, group_entries, index, chunk_index, chunk_count in group_tasks
-                    }
-                    completed_count = 0
-                    for future in as_completed(futures):
-                        index = futures[future]
-                        record = future.result()
-                        completed_count += 1
-                        summary["records"].append(record)
-                        with jsonl_path.open("a", encoding="utf-8") as handle:
-                            handle.write(json.dumps(record, sort_keys=True) + "\n")
-                        print(
-                            f"{completed_count}/{len(group_tasks)} scene_group={index} "
-                            f"{record['source']} {record['scene']} "
-                            f"families={','.join(sorted(record.get('families', {})))} "
-                            f"entries={record['entry_count']} chunk={record.get('group_chunk_index')} "
-                            f"status={record['status']} "
-                            f"frames={record.get('frames_total')} render={record['render_elapsed_sec']:.2f}s "
-                            f"bytes={record['output_bytes']}",
-                            flush=True,
-                        )
+                completed_count = 0
+                for scene_tasks in scene_task_groups:
+                    if not scene_tasks:
+                        continue
+                    with ThreadPoolExecutor(max_workers=min(int(args.workers), len(scene_tasks))) as pool:
+                        futures = {
+                            pool.submit(
+                                _render_scene_group,
+                                args,
+                                (key[0], key[1]),
+                                group_entries,
+                                index,
+                                chunk_index=chunk_index,
+                                chunk_count=chunk_count,
+                            ): index
+                            for key, group_entries, index, chunk_index, chunk_count in scene_tasks
+                        }
+                        for future in as_completed(futures):
+                            index = futures[future]
+                            record = future.result()
+                            completed_count += 1
+                            summary["records"].append(record)
+                            with jsonl_path.open("a", encoding="utf-8") as handle:
+                                handle.write(json.dumps(record, sort_keys=True) + "\n")
+                            print(
+                                f"{completed_count}/{len(group_tasks)} scene_group={index} "
+                                f"{record['source']} {record['scene']} "
+                                f"families={','.join(sorted(record.get('families', {})))} "
+                                f"entries={record['entry_count']} chunk={record.get('group_chunk_index')} "
+                                f"status={record['status']} "
+                                f"frames={record.get('frames_total')} render={record['render_elapsed_sec']:.2f}s "
+                                f"bytes={record['output_bytes']}",
+                                flush=True,
+                            )
         elif bool(args.group_same_scene):
             grouped: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
             for entry in selected:
