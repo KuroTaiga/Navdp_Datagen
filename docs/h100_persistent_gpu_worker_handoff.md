@@ -267,16 +267,30 @@ Added after the initial scheduler slice:
   sequence/options key instead of being reloaded for every label actor plan.
 - Renderer metrics include `actor_runtime_cache` with
   `hits/misses/stores/resident_entries` so 5880/H100 tests can verify reuse.
+- `scripts/massgen/run_persistent_h100_schedule.py` can execute an
+  `h100_persistent_schedule.v1` file when the schedule was generated with
+  `--include-execution`. This is a Phase-A bridge: it preserves
+  planner-managed scene/resource chunk order, GPU assignment order,
+  grouped multi-label renderer invocations, preemptible temp-output commits,
+  resume markers, logs, metrics JSONL, and GPU sampling. It still launches the
+  existing renderer process per chunk, so it is not the final in-memory
+  persistent CUDA renderer server.
+- `scripts/massgen/plan_persistent_h100_schedule.py` can now read either an
+  existing aggregate render plan or a formal smoke package root. With
+  `--package-root`, it materializes label/actor inputs under
+  `--materialized-root`, writes an optional aggregate render plan, and emits an
+  executable persistent schedule with `--include-execution`.
 
 Next implementation steps:
 
-1. Benchmark the actor runtime cache on 5880 against the previous
-   `CHINGMU_rescaled_3/0016_859086` 100-mission scene-order run.
-2. Teach the persistent scheduler to read the formal smoke package directly,
-   not only render plan JSON.
-3. Add a single-process persistent renderer prototype that can consume one
-   `PersistentGpuSchedule` for camera-only or actor-plan jobs.
-4. Add bounded async host output queue and CPU encode workers.
-5. Benchmark Phase A on 5880 with the same 100-mission scene used in
+1. Replace the Phase-A bridge with a true single-process persistent renderer
+   server that keeps scene/avatar resources live across chunks without
+   relaunching `render_label_paths_telesim.py`.
+2. Add bounded async host output queue and CPU encode workers behind a flag.
+3. Add dynamic worker/card-count controls for weekday/weekend VM allocation
+   changes, with resume-safe hard-preemption behavior.
+4. Benchmark the executable schedule bridge and then the true persistent server
+   on 5880 with the same 100-mission scene used in
    `out/scene_order_5880/9d8867b/chingmu3_0016`.
-6. Only after Phase A, test CUDA IPC + MPS as a separate comparison.
+5. Only after the true persistent server is stable, test CUDA IPC + MPS as a
+   separate comparison.

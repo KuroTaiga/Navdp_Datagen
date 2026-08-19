@@ -39,7 +39,9 @@ class RenderWorkItem:
     index: int
     job_id: str
     scene_id: str
+    plan_payload: Mapping[str, Any] = field(repr=False, compare=False)
     command: tuple[str, ...]
+    env: tuple[tuple[str, str], ...]
     output_root: str | None
     label_path: str | None
     actor_plan_path: str | None
@@ -86,16 +88,20 @@ class PersistentGpuSchedule:
     chunks: tuple[SceneChunk, ...]
     work_items: tuple[RenderWorkItem, ...]
 
-    def to_json_dict(self) -> dict[str, Any]:
+    def to_json_dict(self, *, include_execution: bool = False) -> dict[str, Any]:
         return {
             "schema_version": "h100_persistent_schedule.v1",
             "work_item_count": len(self.work_items),
             "chunk_count": len(self.chunks),
+            "includes_execution": bool(include_execution),
             "assignments": [
                 {
                     "gpu_id": assignment.gpu_id,
                     "frame_count_hint": assignment.frame_count_hint,
-                    "chunks": [_chunk_to_json(chunk) for chunk in assignment.chunks],
+                    "chunks": [
+                        _chunk_to_json(chunk, include_execution=include_execution)
+                        for chunk in assignment.chunks
+                    ],
                 }
                 for assignment in self.assignments
             ],
@@ -208,7 +214,14 @@ def build_work_items_from_render_plan(
                 index=index,
                 job_id=str(plan.get("job_id") or f"job_{index:06d}"),
                 scene_id=str(plan.get("scene_id") or ""),
+                plan_payload=dict(plan),
                 command=command,
+                env=tuple(
+                    sorted(
+                        (str(key), str(value))
+                        for key, value in (plan.get("env") or {}).items()
+                    )
+                ),
                 output_root=str((plan.get("metadata") or {}).get("output_root") or "") or None,
                 label_path=_optional_str(plan.get("label_path")),
                 actor_plan_path=_optional_str(plan.get("actor_plan_path")),
@@ -450,8 +463,8 @@ def _compatibility_key(plan: Mapping[str, Any], command: Sequence[str]) -> tuple
     )
 
 
-def _chunk_to_json(chunk: SceneChunk) -> dict[str, Any]:
-    return {
+def _chunk_to_json(chunk: SceneChunk, *, include_execution: bool = False) -> dict[str, Any]:
+    payload: dict[str, Any] = {
         "chunk_id": chunk.chunk_id,
         "scene_id": chunk.scene_id,
         "job_ids": [item.job_id for item in chunk.items],
@@ -470,6 +483,26 @@ def _chunk_to_json(chunk: SceneChunk) -> dict[str, Any]:
             for resource in chunk.resources
         ],
     }
+    if include_execution:
+        payload["work_items"] = [
+            {
+                "index": item.index,
+                "job_id": item.job_id,
+                "scene_id": item.scene_id,
+                "command": list(item.command),
+                "env": dict(item.env),
+                "output_root": item.output_root,
+                "label_path": item.label_path,
+                "actor_plan_path": item.actor_plan_path,
+                "human_actor_ids": list(item.human_actor_ids),
+                "peer_robot_ids": list(item.peer_robot_ids),
+                "mission_families": list(item.mission_families),
+                "frame_count_hint": item.frame_count_hint,
+            }
+            for item in chunk.items
+        ]
+        payload["plans"] = [dict(item.plan_payload) for item in chunk.items]
+    return payload
 
 
 def _option_values(command: Sequence[str], option: str) -> list[str]:

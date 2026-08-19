@@ -112,6 +112,7 @@ def _plan(
         "peer_robot_ids": peer_robot_ids,
         "mission_families": ["dense_dynamic_humans"],
         "command": command,
+        "env": {"GAUSSIAN_RENDER_BACKEND": "gsplat"},
         "robot_overlay_commands": robot_overlay_commands,
         "metadata": {"output_root": str(tmp_path / "out")},
     }
@@ -210,6 +211,25 @@ def test_persistent_schedule_json_has_assignments(tmp_path: Path) -> None:
     assert payload["work_item_count"] == 1
     assert payload["chunk_count"] == 1
     assert payload["assignments"][0]["chunks"][0]["job_ids"] == ["a0"]
+    assert payload["includes_execution"] is False
+    assert "plans" not in payload["assignments"][0]["chunks"][0]
+
+
+def test_persistent_schedule_can_include_execution_payload(tmp_path: Path) -> None:
+    schedule = build_persistent_gpu_schedule(
+        {"plans": [_plan(tmp_path, job_id="a0", scene_id="scene_a")]},
+        gpu_ids=["0"],
+        max_items_per_chunk=2,
+    )
+
+    payload = schedule.to_json_dict(include_execution=True)
+    chunk = payload["assignments"][0]["chunks"][0]
+
+    assert payload["includes_execution"] is True
+    assert chunk["plans"][0]["job_id"] == "a0"
+    assert chunk["work_items"][0]["job_id"] == "a0"
+    assert "--scene" in chunk["work_items"][0]["command"]
+    assert chunk["work_items"][0]["env"] == {"GAUSSIAN_RENDER_BACKEND": "gsplat"}
 
 
 def test_resource_cache_refuses_to_evict_leased_resources() -> None:
