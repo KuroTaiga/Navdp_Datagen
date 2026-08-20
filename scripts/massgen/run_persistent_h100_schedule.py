@@ -133,20 +133,20 @@ def _run_capture_env(
     return completed, elapsed, marker
 
 
-def _chunk_output_root(results_root: Path, gpu_id: str, chunk: Mapping[str, Any]) -> Path:
+def _chunk_output_root(results_root: Path, assignment_id: str, chunk: Mapping[str, Any]) -> Path:
     return (
         results_root
         / "persistent_schedule_renders"
-        / f"gpu_{smoke._safe_component(gpu_id)}"
+        / f"gpu_{smoke._safe_component(assignment_id)}"
         / smoke._safe_component(str(chunk.get("scene_id") or "scene"))
         / smoke._safe_component(str(chunk.get("chunk_id") or "chunk"))
     )
 
 
-def _chunk_log_stem(gpu_id: str, chunk: Mapping[str, Any]) -> Path:
+def _chunk_log_stem(assignment_id: str, chunk: Mapping[str, Any]) -> Path:
     return (
         Path("persistent_schedule")
-        / f"gpu_{smoke._safe_component(gpu_id)}"
+        / f"gpu_{smoke._safe_component(assignment_id)}"
         / smoke._safe_component(str(chunk.get("scene_id") or "scene"))
         / smoke._safe_component(str(chunk.get("chunk_id") or "chunk"))
     )
@@ -199,11 +199,12 @@ def _rewrite_plan_for_chunk(plan: Mapping[str, Any], *, output_root: Path) -> di
 
 
 def _chunk_env(gpu_id: str, plans: list[Mapping[str, Any]]) -> dict[str, str]:
-    env: dict[str, str] = {"CUDA_VISIBLE_DEVICES": str(gpu_id)}
+    env: dict[str, str] = {}
     for plan in plans:
         plan_env = plan.get("env")
         if isinstance(plan_env, Mapping):
             env.update({str(key): str(value) for key, value in plan_env.items()})
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     return env
 
 
@@ -230,11 +231,13 @@ def _render_chunk(
     args: argparse.Namespace,
     *,
     gpu_id: str,
+    assignment_id: str | None = None,
     chunk: Mapping[str, Any],
     assignment_index: int,
     chunk_index: int,
 ) -> dict[str, Any]:
-    final_output_root = _chunk_output_root(args.results_root, gpu_id, chunk)
+    assignment_id = str(assignment_id or gpu_id)
+    final_output_root = _chunk_output_root(args.results_root, assignment_id, chunk)
     output_root, done_record = smoke._prepare_task_output_root(
         final_output_root,
         preemptible=bool(args.preemptible_output),
@@ -285,11 +288,12 @@ def _render_chunk(
                     env=env,
                     log_path=args.results_root
                     / "logs"
-                    / f"{_chunk_log_stem(gpu_id, chunk)}_cmd_{command_index:04d}_attempt_{attempt_index:02d}.log",
+                    / f"{_chunk_log_stem(assignment_id, chunk)}_cmd_{command_index:04d}_attempt_{attempt_index:02d}.log",
                 )
                 command_marker.update(
                     {
                         "assignment_index": int(assignment_index),
+                        "assignment_id": assignment_id,
                         "chunk_index": int(chunk_index),
                         "chunk_id": chunk.get("chunk_id"),
                         "gpu_id": str(gpu_id),
@@ -327,6 +331,7 @@ def _render_chunk(
         status = "blocked"
     record: dict[str, Any] = {
         "assignment_index": int(assignment_index),
+        "assignment_id": assignment_id,
         "chunk_index": int(chunk_index),
         "record_type": "persistent_schedule_chunk",
         "gpu_id": str(gpu_id),
@@ -382,12 +387,14 @@ def _run_assignment(
     jsonl_path: Path,
 ) -> list[dict[str, Any]]:
     gpu_id = str(assignment.get("gpu_id") or assignment_index)
+    assignment_id = str(assignment.get("assignment_id") or gpu_id)
     chunks = [chunk for chunk in assignment.get("chunks", []) if isinstance(chunk, Mapping)]
     records: list[dict[str, Any]] = []
     for chunk_index, chunk in enumerate(chunks):
         record = _render_chunk(
             args,
             gpu_id=gpu_id,
+            assignment_id=assignment_id,
             chunk=chunk,
             assignment_index=assignment_index,
             chunk_index=chunk_index,
@@ -397,7 +404,7 @@ def _run_assignment(
             with jsonl_path.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(record, sort_keys=True) + "\n")
         print(
-            f"gpu={gpu_id} chunk={record.get('chunk_id')} status={record['status']} "
+            f"assignment={assignment_id} gpu={gpu_id} chunk={record.get('chunk_id')} status={record['status']} "
             f"jobs={record.get('job_count')} frames={record.get('frames_total')} "
             f"render={float(record.get('render_elapsed_sec') or 0.0):.2f}s "
             f"bytes={record.get('output_bytes')}",
@@ -451,6 +458,7 @@ def _write_worker_stage_markers(results_root: Path, records: list[dict[str, Any]
         for record in records:
             base = {
                 "assignment_index": record.get("assignment_index"),
+                "assignment_id": record.get("assignment_id"),
                 "chunk_index": record.get("chunk_index"),
                 "chunk_id": record.get("chunk_id"),
                 "gpu_id": record.get("gpu_id"),
@@ -594,6 +602,18 @@ def main() -> int:
         "schedule_json": str(args.schedule_json),
         "schedule_work_item_count": schedule.get("work_item_count"),
         "schedule_chunk_count": schedule.get("chunk_count"),
+        "schedule_assignment_count": len(assignments),
+        "schedule_assignment_ids": [
+            str(assignment.get("assignment_id") or assignment.get("gpu_id") or index)
+            for index, assignment in enumerate(assignments)
+        ],
+        "physical_gpu_ids": sorted(
+            {
+                str(assignment.get("gpu_id"))
+                for assignment in assignments
+                if assignment.get("gpu_id") is not None
+            }
+        ),
         "includes_execution": bool(schedule.get("includes_execution")),
         "results_root": str(args.results_root),
         "repo_root": str(args.repo_root),

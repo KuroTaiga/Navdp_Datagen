@@ -74,6 +74,7 @@ class SceneChunk:
 
 @dataclass(frozen=True)
 class GpuAssignment:
+    assignment_id: str
     gpu_id: str
     chunks: tuple[SceneChunk, ...]
 
@@ -96,6 +97,7 @@ class PersistentGpuSchedule:
             "includes_execution": bool(include_execution),
             "assignments": [
                 {
+                    "assignment_id": assignment.assignment_id,
                     "gpu_id": assignment.gpu_id,
                     "frame_count_hint": assignment.frame_count_hint,
                     "chunks": [
@@ -281,19 +283,25 @@ def assign_chunks_to_gpus(
 ) -> tuple[GpuAssignment, ...]:
     if not gpu_ids:
         raise ValueError("at least one GPU id is required")
-    assignments: dict[str, list[SceneChunk]] = {str(gpu_id): [] for gpu_id in gpu_ids}
-    load: dict[str, int] = {str(gpu_id): 0 for gpu_id in gpu_ids}
+    lanes = _gpu_assignment_lanes(gpu_ids)
+    assignments: dict[str, list[SceneChunk]] = {assignment_id: [] for assignment_id, _ in lanes}
+    load: dict[str, int] = {assignment_id: 0 for assignment_id, _ in lanes}
+    lane_gpu_id: dict[str, str] = {assignment_id: gpu_id for assignment_id, gpu_id in lanes}
     scene_owner: dict[str, str] = {}
     for chunk in chunks:
-        gpu_id = scene_owner.get(chunk.scene_id)
-        if gpu_id is None:
-            gpu_id = min(load, key=lambda item: (load[item], item))
-            scene_owner[chunk.scene_id] = gpu_id
-        assignments[gpu_id].append(chunk)
-        load[gpu_id] += max(1, int(chunk.frame_count_hint))
+        assignment_id = scene_owner.get(chunk.scene_id)
+        if assignment_id is None:
+            assignment_id = min(load, key=lambda item: (load[item], item))
+            scene_owner[chunk.scene_id] = assignment_id
+        assignments[assignment_id].append(chunk)
+        load[assignment_id] += max(1, int(chunk.frame_count_hint))
     return tuple(
-        GpuAssignment(gpu_id=str(gpu_id), chunks=tuple(assignments[str(gpu_id)]))
-        for gpu_id in gpu_ids
+        GpuAssignment(
+            assignment_id=str(assignment_id),
+            gpu_id=str(lane_gpu_id[assignment_id]),
+            chunks=tuple(assignments[str(assignment_id)]),
+        )
+        for assignment_id, _ in lanes
     )
 
 
@@ -544,3 +552,18 @@ def _sum_unique_resource_bytes(resources: Sequence[ResourceRef], *, attr: str) -
     for resource in _unique_resources(resources):
         total += int(getattr(resource, attr))
     return total
+
+
+def _gpu_assignment_lanes(gpu_ids: Sequence[str]) -> tuple[tuple[str, str], ...]:
+    physical_ids = [str(gpu_id) for gpu_id in gpu_ids]
+    total_counts: dict[str, int] = {}
+    for gpu_id in physical_ids:
+        total_counts[gpu_id] = total_counts.get(gpu_id, 0) + 1
+    seen_counts: dict[str, int] = {}
+    lanes: list[tuple[str, str]] = []
+    for gpu_id in physical_ids:
+        lane_index = seen_counts.get(gpu_id, 0)
+        seen_counts[gpu_id] = lane_index + 1
+        assignment_id = gpu_id if total_counts[gpu_id] == 1 else f"{gpu_id}_w{lane_index:02d}"
+        lanes.append((assignment_id, gpu_id))
+    return tuple(lanes)

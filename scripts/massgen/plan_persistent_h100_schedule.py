@@ -73,6 +73,16 @@ def _parse_args() -> argparse.Namespace:
         help="GPU id to schedule onto. May be passed multiple times. Default: 0.",
     )
     parser.add_argument(
+        "--workers-per-gpu",
+        type=int,
+        default=1,
+        help=(
+            "Create this many logical scheduler lanes per physical GPU id. "
+            "Use this for same-GPU multi-worker saturation tests, e.g. "
+            "--gpu-id 0 --workers-per-gpu 4."
+        ),
+    )
+    parser.add_argument(
         "--max-items-per-chunk",
         type=int,
         default=0,
@@ -122,7 +132,7 @@ def main() -> int:
     )
     schedule = build_persistent_gpu_schedule(
         plan_payload,
-        gpu_ids=[str(item) for item in (args.gpu_id or ["0"])],
+        gpu_ids=_expanded_gpu_ids(args.gpu_id or ["0"], workers_per_gpu=args.workers_per_gpu),
         max_items_per_chunk=int(args.max_items_per_chunk or 0),
         estimates=estimates,
     )
@@ -139,6 +149,14 @@ def main() -> int:
     else:
         print(text, end="")
     return 0
+
+
+def _expanded_gpu_ids(gpu_ids: list[str], *, workers_per_gpu: int) -> list[str]:
+    workers = max(1, int(workers_per_gpu or 1))
+    out: list[str] = []
+    for gpu_id in gpu_ids:
+        out.extend([str(gpu_id)] * workers)
+    return out
 
 
 def _build_render_plan_from_package(args: argparse.Namespace) -> dict[str, Any]:

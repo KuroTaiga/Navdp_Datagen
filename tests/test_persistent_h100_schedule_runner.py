@@ -76,6 +76,7 @@ def test_render_chunk_dry_run_writes_preemptible_done_marker(tmp_path: Path) -> 
     record = runner._render_chunk(
         args,
         gpu_id="0",
+        assignment_id="0_w00",
         chunk=_chunk(tmp_path),
         assignment_index=0,
         chunk_index=0,
@@ -83,6 +84,9 @@ def test_render_chunk_dry_run_writes_preemptible_done_marker(tmp_path: Path) -> 
 
     final_root = Path(record["final_output_root"])
     assert record["status"] == "success"
+    assert record["assignment_id"] == "0_w00"
+    assert record["gpu_id"] == "0"
+    assert "gpu_0_w00" in final_root.parts
     assert final_root.name == "scene_a_g0000_c0000"
     assert (final_root / "TASK_DONE.json").is_file()
     marker = json.loads((final_root / "TASK_DONE.json").read_text(encoding="utf-8"))
@@ -135,10 +139,28 @@ def test_metrics_success_requires_no_fatal_paths() -> None:
     )
 
 
+def test_chunk_env_keeps_physical_cuda_device_authoritative() -> None:
+    env = runner._chunk_env(
+        "0",
+        [
+            {
+                "env": {
+                    "CUDA_VISIBLE_DEVICES": "wrong",
+                    "GAUSSIAN_RENDER_BACKEND": "gsplat",
+                }
+            }
+        ],
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+    assert env["GAUSSIAN_RENDER_BACKEND"] == "gsplat"
+
+
 def test_worker_stage_markers_include_commands_and_lifecycle(tmp_path: Path) -> None:
     records = [
         {
             "assignment_index": 0,
+            "assignment_id": "0_w00",
             "chunk_index": 0,
             "chunk_id": "chunk_a",
             "gpu_id": "0",
@@ -186,6 +208,7 @@ def test_worker_stage_markers_include_commands_and_lifecycle(tmp_path: Path) -> 
         "renderer_lifecycle_stage",
     ]
     assert rows[1]["label_count"] == 1
+    assert rows[1]["assignment_id"] == "0_w00"
     assert rows[2]["stage"] == "python_import_sec"
     assert rows[3]["stage"] == "render_loop_sec"
 
@@ -320,11 +343,13 @@ def test_planner_builds_executable_schedule_from_package(tmp_path: Path) -> None
     plan_payload = planner._build_render_plan_from_package(args)
     schedule = planner.build_persistent_gpu_schedule(
         plan_payload,
-        gpu_ids=["0"],
+        gpu_ids=planner._expanded_gpu_ids(["0"], workers_per_gpu=2),
         max_items_per_chunk=2,
     ).to_json_dict(include_execution=True)
 
     chunk = schedule["assignments"][0]["chunks"][0]
+    assert [assignment["gpu_id"] for assignment in schedule["assignments"]] == ["0", "0"]
+    assert [assignment["assignment_id"] for assignment in schedule["assignments"]] == ["0_w00", "0_w01"]
     assert plan_payload["status"] == "ready"
     assert plan_payload["selected_entry_count"] == 1
     assert plan_payload["plans"][0]["metadata"]["output_root"] == str(tmp_path / "materialized")

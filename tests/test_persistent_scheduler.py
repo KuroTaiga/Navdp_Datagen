@@ -198,6 +198,25 @@ def test_gpu_assignment_keeps_scene_chunks_together(tmp_path: Path) -> None:
     assert sum(len(assignment.chunks) for assignment in assignments) == len(chunks)
 
 
+def test_gpu_assignment_supports_same_physical_gpu_worker_lanes(tmp_path: Path) -> None:
+    plan_payload = {
+        "plans": [
+            _plan(tmp_path, job_id="a0", scene_id="scene_a"),
+            _plan(tmp_path, job_id="b0", scene_id="scene_b", actor_id="human_b"),
+            _plan(tmp_path, job_id="c0", scene_id="scene_c", actor_id="human_c"),
+            _plan(tmp_path, job_id="d0", scene_id="scene_d", actor_id="human_d"),
+        ]
+    }
+    chunks = build_scene_chunks(build_work_items_from_render_plan(plan_payload), max_items_per_chunk=1)
+
+    assignments = assign_chunks_to_gpus(chunks, gpu_ids=["0", "0"])
+
+    assert [assignment.gpu_id for assignment in assignments] == ["0", "0"]
+    assert [assignment.assignment_id for assignment in assignments] == ["0_w00", "0_w01"]
+    assert all(assignment.chunks for assignment in assignments)
+    assert sum(len(assignment.chunks) for assignment in assignments) == len(chunks)
+
+
 def test_persistent_schedule_json_has_assignments(tmp_path: Path) -> None:
     schedule = build_persistent_gpu_schedule(
         {"plans": [_plan(tmp_path, job_id="a0", scene_id="scene_a")]},
@@ -210,6 +229,8 @@ def test_persistent_schedule_json_has_assignments(tmp_path: Path) -> None:
     assert payload["schema_version"] == "h100_persistent_schedule.v1"
     assert payload["work_item_count"] == 1
     assert payload["chunk_count"] == 1
+    assert payload["assignments"][0]["assignment_id"] == "0"
+    assert payload["assignments"][0]["gpu_id"] == "0"
     assert payload["assignments"][0]["chunks"][0]["job_ids"] == ["a0"]
     assert payload["includes_execution"] is False
     assert "plans" not in payload["assignments"][0]["chunks"][0]
