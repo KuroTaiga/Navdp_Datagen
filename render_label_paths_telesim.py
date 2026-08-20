@@ -38,6 +38,10 @@ REPO_ROOT = _script_path.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 TELESIM_ROOT = REPO_ROOT / "TeleSim3D"
+if not (TELESIM_ROOT / "tele_sim").exists():
+    release_telesim_root = REPO_ROOT / "release" / "navdp_path_renderer" / "TeleSim3D"
+    if (release_telesim_root / "tele_sim").exists():
+        TELESIM_ROOT = release_telesim_root
 if str(TELESIM_ROOT) not in sys.path:
     sys.path.insert(0, str(TELESIM_ROOT))
 TELESIM_GAUSSIAN_ROOT = TELESIM_ROOT / "gaussian-splatting"
