@@ -60,6 +60,26 @@ Also verify the package references existing scene and avatar roots. The
 renderer does not copy scene Gaussian PLYs or human avatar PLY sequences into
 the package; it expects referenced paths to exist on the H100 host.
 
+## Helper Script
+
+This repo includes a Linux mirror helper:
+
+```sh
+MIRROR_ROOT=/mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen \
+REPO_URL=https://github.com/KuroTaiga/Navdp_Datagen.git \
+BRANCH=massgen \
+scripts/massgen/setup_h100_linux_mirror.sh
+```
+
+Optional package copy:
+
+```sh
+MIRROR_ROOT=/mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen \
+PACKAGE_SRC=/path/to/source/package \
+PACKAGE_DST=/mnt/<h100-data>/dongjk/navdp_data/massgen_packages/<package> \
+scripts/massgen/setup_h100_linux_mirror.sh
+```
+
 ## Smoke Command
 
 Start with a capped run before a full natural-length run:
@@ -90,6 +110,35 @@ Outputs to inspect first:
 <results-root>/report_persistent/assets/tables/full_run_worker_lanes.csv
 <results-root>/mp4_count.txt
 ```
+
+## Container Option
+
+The renderer-side H100 container is separate from the Pathplanner CPU MassGen
+container. Build it from this repo mirror:
+
+```sh
+cd /mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen
+IMAGE_TAG=navdp-datagen-h100:massgen scripts/massgen/build_h100_container.sh
+```
+
+Run the capped smoke in the container:
+
+```sh
+PACKAGE_ROOT=/mnt/<h100-data>/dongjk/navdp_data/massgen_packages/<package> \
+RESULTS_ROOT=/mnt/<h100-data>/dongjk/navdp_data/h100_results/<run-id> \
+GPU_DEVICES=0,1,2,3 \
+CPU_CORES=120 \
+JOBS_PER_GPU=4 \
+MINIMAL_FRAMES=16 \
+RENDERS_PER_FAMILY_SOURCE_SCENE=50 \
+EXTRA_H100_ARGS="--clean" \
+scripts/massgen/run_h100_container.sh run
+```
+
+`run_h100_container.sh` mounts common data roots at the same absolute path
+inside the container (`/mnt/DATA`, `/mnt/DATA1`, `/private_lxh`,
+`/team/telenav`) when those paths exist. If the package references another
+absolute root, add an explicit mount or adjust the script before running.
 
 ## Resume And Preemption
 
