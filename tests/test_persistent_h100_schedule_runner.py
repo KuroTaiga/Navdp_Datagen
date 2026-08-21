@@ -63,6 +63,44 @@ def test_rewrite_plan_for_chunk_moves_outputs_under_chunk_root(tmp_path: Path) -
     )
 
 
+def test_load_assignment_cpu_cores_ignores_invalid_entries(tmp_path: Path) -> None:
+    path = tmp_path / "cpu_map.json"
+    path.write_text(
+        json.dumps(
+            {
+                "0_w00": [0, "1", "bad"],
+                "0_w01": [],
+                "0_w02": "not-list",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert runner._load_assignment_cpu_cores(path) == {"0_w00": (0, 1)}
+
+
+def test_chunk_env_applies_cpu_thread_caps() -> None:
+    env = runner._chunk_env(
+        "1",
+        [{"env": {"GAUSSIAN_RENDER_BACKEND": "gsplat"}}],
+        cpu_threads=6,
+    )
+
+    assert env["CUDA_VISIBLE_DEVICES"] == "1"
+    assert env["OMP_NUM_THREADS"] == "6"
+    assert env["MKL_NUM_THREADS"] == "6"
+    assert env["OPENBLAS_NUM_THREADS"] == "6"
+    assert env["TORCH_NUM_THREADS"] == "6"
+    assert env["MALLOC_ARENA_MAX"] == "2"
+
+
+def test_taskset_command_is_noop_when_disabled() -> None:
+    command = ["python", "render.py"]
+
+    assert runner._taskset_command(command, cpu_cores=(0, 1), enabled=False) == command
+    assert runner._taskset_command(command, cpu_cores=(), enabled=True) == command
+
+
 def test_render_chunk_dry_run_writes_preemptible_done_marker(tmp_path: Path) -> None:
     args = argparse.Namespace(
         results_root=tmp_path / "results",

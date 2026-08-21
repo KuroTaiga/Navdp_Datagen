@@ -76,22 +76,52 @@ class NvidiaSmiMonitor:
             self._stop.wait(self.interval_sec)
 
 
-def _parse_args() -> argparse.Namespace:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Run MassGen family package renders on H100-class hosts with CPU H.264 "
-            "encoding, multi-GPU fanout, CPU affinity, and GPU utilization logging."
+            "encoding, persistent scene/resource scheduling, CPU affinity, and "
+            "GPU utilization logging."
         )
     )
     parser.add_argument("--package-root", type=Path, required=True)
     parser.add_argument("--results-root", type=Path, required=True)
+    parser.add_argument(
+        "--pipeline-mode",
+        choices=["persistent", "legacy"],
+        default="persistent",
+        help=(
+            "persistent uses the scene/resource-aware H100 schedule runner. "
+            "legacy keeps the older family-level multi-process fanout."
+        ),
+    )
     parser.add_argument("--python-bin", type=Path, default=Path(sys.executable))
     parser.add_argument("--repo-root", type=Path, default=REPO_ROOT)
+    parser.add_argument("--render-script", type=Path, default=REPO_ROOT / "render_label_paths_telesim.py")
     parser.add_argument("--video-backend", default="cpu", choices=["cpu", "nvenc", "gpu"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--minimal-frames", type=int, default=None)
     parser.add_argument("--family", action="append", default=None)
-    parser.add_argument("--limit", type=int, default=1, help="Maximum manifest jobs to render per family.")
+    parser.add_argument("--source", action="append", default=None)
+    parser.add_argument("--scene", action="append", default=None)
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=1,
+        help="Legacy mode only: maximum manifest jobs to render per family.",
+    )
+    parser.add_argument(
+        "--max-renders",
+        type=int,
+        default=0,
+        help="Persistent mode: global selected render-manifest cap. 0 means no cap.",
+    )
+    parser.add_argument(
+        "--renders-per-family-source-scene",
+        type=int,
+        default=0,
+        help="Persistent mode: cap selected manifests per (family, source, scene). 0 means no cap.",
+    )
     parser.add_argument("--retry", type=int, default=1)
     parser.add_argument(
         "--gpu-devices",
@@ -120,15 +150,42 @@ def _parse_args() -> argparse.Namespace:
         help="Keep human actor sequences resident on GPU. Default is on for H100 hosts.",
     )
     parser.add_argument(
+        "--actor-runtime-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable renderer-side actor runtime cache for persistent schedule jobs.",
+    )
+    parser.add_argument(
         "--target-gpu-util",
         type=float,
         default=H100_DEFAULT_TARGET_GPU_UTIL,
         help="Soft target for average GPU utilization percent, used for reporting.",
     )
-    parser.add_argument("--util-sample-interval-sec", type=float, default=2.0)
+    parser.add_argument("--util-sample-interval-sec", type=float, default=0.1)
     parser.add_argument("--util-monitor", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ffmpeg-bin", type=Path, default=None)
-    return parser.parse_args()
+    parser.add_argument("--materialized-root", type=Path, default=None)
+    parser.add_argument("--max-items-per-chunk", type=int, default=0)
+    parser.add_argument("--group-max-labels-per-command", type=int, default=0)
+    parser.add_argument("--command-attempts", type=int, default=3)
+    parser.add_argument("--run-render", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-analysis", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--stage-window-min", type=float, default=4.0)
+    parser.add_argument("--scene-vram-gib", type=float, default=8.0)
+    parser.add_argument("--human-avatar-vram-mib", type=float, default=512.0)
+    parser.add_argument("--robot-asset-vram-mib", type=float, default=512.0)
+    parser.add_argument("--actor-plan-ram-mib", type=float, default=64.0)
+    parser.add_argument("--simulate-cache-gib", type=float, default=None)
+    parser.add_argument(
+        "--baseline-summary",
+        action="append",
+        default=None,
+        help="Optional benchmark_summary.json to include in persistent report comparisons.",
+    )
+    return parser.parse_args(argv)
 
 
 def _write_text(path: Path, text: str) -> None:
@@ -136,8 +193,73 @@ def _write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
+    _write_text(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
+
+
 def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _run_logged(
+    command: list[str],
+    *,
+    cwd: Path,
+    log_path: Path,
+    env: Mapping[str, str] | None = None,
+) -> tuple[int, float]:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    started = datetime.now(timezone.utc).isoformat()
+    t0 = time.perf_counter()
+    with log_path.open("w", encoding="utf-8") as handle:
+        handle.write(f"command: {' '.join(command)}\n")
+        handle.write(f"started_at: {started}\n\n")
+        handle.flush()
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            env={**os.environ, **dict(env or {})},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert process.stdout is not None
+        for line in process.stdout:
+            handle.write(line)
+            handle.flush()
+            print(line, end="", flush=True)
+        returncode = process.wait()
+        elapsed = time.perf_counter() - t0
+        handle.write(f"\nended_at: {datetime.now(timezone.utc).isoformat()}\n")
+        handle.write(f"wall_time_sec: {elapsed:.6f}\n")
+        handle.write(f"returncode: {returncode}\n")
+    return int(returncode), float(elapsed)
+
+
+def _capture_to_file(command: list[str], path: Path, *, cwd: Path) -> None:
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    _write_text(
+        path,
+        "".join(
+            [
+                f"command: {' '.join(command)}\n",
+                f"returncode: {completed.returncode}\n",
+                "\n--- stdout ---\n",
+                completed.stdout or "",
+                "\n--- stderr ---\n",
+                completed.stderr or "",
+            ]
+        ),
+    )
 
 
 def _parse_gpu_devices(value: str | None) -> list[str]:
@@ -208,6 +330,30 @@ def _build_worker_slots(
             )
         )
     return slots
+
+
+def _slot_gpu_ids(slots: list[WorkerSlot]) -> list[str]:
+    return [str(slot.gpu_id) for slot in slots]
+
+
+def _assignment_cpu_core_map(schedule_json: Path, slots: list[WorkerSlot]) -> dict[str, list[int]]:
+    payload = _load_json(schedule_json)
+    assignments = [
+        item
+        for item in payload.get("assignments", [])
+        if isinstance(item, Mapping)
+    ]
+    out: dict[str, list[int]] = {}
+    for assignment, slot in zip(assignments, slots):
+        assignment_id = str(assignment.get("assignment_id") or assignment.get("gpu_id") or slot.slot_id)
+        out[assignment_id] = list(slot.cpu_cores)
+    return out
+
+
+def _cpu_threads_per_persistent_worker(slots: list[WorkerSlot]) -> int:
+    if not slots:
+        return 0
+    return max(1, min(int(slot.cpu_threads) for slot in slots))
 
 
 def _worker_env(
@@ -566,13 +712,324 @@ def _summarize_gpu_utilization(
     }
 
 
+def _persistent_plan_command(args: argparse.Namespace, *, slots: list[WorkerSlot]) -> list[str]:
+    materialized_root = args.materialized_root or (args.results_root / "materialized")
+    command = [
+        str(args.python_bin),
+        "scripts/massgen/plan_persistent_h100_schedule.py",
+        "--package-root",
+        str(args.package_root),
+        "--materialized-root",
+        str(materialized_root),
+        "--render-plan-output-json",
+        str(args.results_root / "aggregate_render_plan.json"),
+        "--output-json",
+        str(args.results_root / "persistent_schedule.json"),
+        "--python-bin",
+        str(args.python_bin),
+        "--render-script",
+        str(args.render_script),
+        "--video-backend",
+        str(args.video_backend),
+        "--device",
+        str(args.device),
+        "--workers-per-gpu",
+        "1",
+        "--max-items-per-chunk",
+        str(int(args.max_items_per_chunk or 0)),
+        "--scene-vram-gib",
+        str(float(args.scene_vram_gib)),
+        "--human-avatar-vram-mib",
+        str(float(args.human_avatar_vram_mib)),
+        "--robot-asset-vram-mib",
+        str(float(args.robot_asset_vram_mib)),
+        "--actor-plan-ram-mib",
+        str(float(args.actor_plan_ram_mib)),
+        "--include-execution",
+    ]
+    if args.minimal_frames is not None and int(args.minimal_frames) > 0:
+        command.extend(["--minimal-frames", str(int(args.minimal_frames))])
+    for family in args.family or []:
+        command.extend(["--family", str(family)])
+    for source in args.source or []:
+        command.extend(["--source", str(source)])
+    for scene in args.scene or []:
+        command.extend(["--scene", str(scene)])
+    if int(args.max_renders or 0) > 0:
+        command.extend(["--max-renders", str(int(args.max_renders))])
+    if int(args.renders_per_family_source_scene or 0) > 0:
+        command.extend(
+            [
+                "--renders-per-family-source-scene",
+                str(int(args.renders_per_family_source_scene)),
+            ]
+        )
+    if bool(args.actor_gpu_resident):
+        command.append("--actor-gpu-resident")
+    else:
+        command.append("--no-actor-gpu-resident")
+    if bool(args.actor_runtime_cache):
+        command.append("--actor-runtime-cache")
+    else:
+        command.append("--no-actor-runtime-cache")
+    for gpu_id in _slot_gpu_ids(slots):
+        command.extend(["--gpu-id", gpu_id])
+    if args.simulate_cache_gib is not None:
+        command.extend(["--simulate-cache-gib", str(float(args.simulate_cache_gib))])
+    return command
+
+
+def _persistent_run_command(
+    args: argparse.Namespace,
+    *,
+    slots: list[WorkerSlot],
+    cpu_map_json: Path,
+) -> list[str]:
+    command = [
+        str(args.python_bin),
+        "scripts/massgen/run_persistent_h100_schedule.py",
+        "--schedule-json",
+        str(args.results_root / "persistent_schedule.json"),
+        "--results-root",
+        str(args.results_root / "run_persistent"),
+        "--repo-root",
+        str(args.repo_root),
+        "--workers",
+        str(len(slots)),
+        "--group-max-labels-per-command",
+        str(int(args.group_max_labels_per_command or 0)),
+        "--command-attempts",
+        str(max(1, int(args.command_attempts or 1))),
+        "--gpu-sample-interval-sec",
+        str(float(args.util_sample_interval_sec)),
+        "--cpu-threads-per-worker",
+        str(_cpu_threads_per_persistent_worker(slots)),
+        "--assignment-cpu-cores-json",
+        str(cpu_map_json),
+        "--preemptible-output",
+    ]
+    if bool(args.cpu_affinity):
+        command.append("--cpu-affinity")
+    else:
+        command.append("--no-cpu-affinity")
+    if bool(args.resume):
+        command.append("--resume")
+    else:
+        command.append("--no-resume")
+    if bool(args.clean):
+        command.append("--clean")
+    if bool(args.dry_run):
+        command.append("--dry-run")
+    return command
+
+
+def _persistent_report_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        str(args.python_bin),
+        "scripts/massgen/report_persistent_h100_schedule_run.py",
+        "--run-root",
+        str(args.results_root / "run_persistent"),
+        "--output-root",
+        str(args.results_root / "report_persistent"),
+        "--title",
+        "MassGen Persistent H100 Pipeline",
+        "--stage-window-min",
+        str(float(args.stage_window_min)),
+    ]
+    natural_json = args.results_root / "natural_length_projection.json"
+    if natural_json.is_file():
+        command.extend(["--natural-length-json", str(natural_json)])
+    for baseline in args.baseline_summary or []:
+        command.extend(["--baseline-summary", str(Path(baseline).expanduser())])
+    return command
+
+
+def _persistent_runner_env(args: argparse.Namespace) -> dict[str, str]:
+    env = {"GAUSSIAN_RENDER_BACKEND": "gsplat"}
+    if args.ffmpeg_bin is not None:
+        env["IMAGEIO_FFMPEG_EXE"] = str(args.ffmpeg_bin)
+        env["FFMPEG_BIN"] = str(args.ffmpeg_bin)
+    return env
+
+
+def _run_persistent_pipeline(args: argparse.Namespace) -> int:
+    if args.video_backend != "cpu":
+        print(
+            "[WARN] H100 persistent profile is intended for --video-backend cpu because H100 has no NVENC/RT blocks.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    gpu_devices = _parse_gpu_devices(args.gpu_devices) or _detect_gpu_devices()
+    slots = _build_worker_slots(
+        gpu_devices,
+        jobs_per_gpu=int(args.jobs_per_gpu),
+        cpu_cores=int(args.cpu_cores),
+        cpu_cores_per_worker=args.cpu_cores_per_worker,
+        max_workers=args.max_workers,
+    )
+
+    if bool(args.clean) and args.results_root.exists():
+        shutil.rmtree(args.results_root)
+    logs_root = args.results_root / "logs"
+    logs_root.mkdir(parents=True, exist_ok=True)
+    _copy_package_metadata(args.package_root, args.results_root)
+
+    run_config = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "repo_root": str(args.repo_root),
+        "package_root": str(args.package_root),
+        "results_root": str(args.results_root),
+        "python_bin": str(args.python_bin),
+        "render_script": str(args.render_script),
+        "ffmpeg_bin": str(args.ffmpeg_bin) if args.ffmpeg_bin is not None else None,
+        "pipeline_profile": "h100_cpu_encode_persistent_schedule",
+        "pipeline_mode": "persistent",
+        "video_backend": str(args.video_backend),
+        "device": str(args.device),
+        "minimal_frames": args.minimal_frames,
+        "families": list(args.family or []),
+        "sources": list(args.source or []),
+        "scenes": list(args.scene or []),
+        "max_renders": int(args.max_renders or 0),
+        "renders_per_family_source_scene": int(args.renders_per_family_source_scene or 0),
+        "max_items_per_chunk": int(args.max_items_per_chunk or 0),
+        "group_max_labels_per_command": int(args.group_max_labels_per_command or 0),
+        "command_attempts": int(args.command_attempts or 1),
+        "run_render": bool(args.run_render),
+        "run_analysis": bool(args.run_analysis),
+        "resume": bool(args.resume),
+        "clean": bool(args.clean),
+        "dry_run": bool(args.dry_run),
+        "h100_profile": {
+            "gpu_devices": gpu_devices,
+            "jobs_per_gpu": int(args.jobs_per_gpu),
+            "worker_count": len(slots),
+            "cpu_cores": int(args.cpu_cores),
+            "cpu_affinity": bool(args.cpu_affinity),
+            "cpu_threads_per_worker": _cpu_threads_per_persistent_worker(slots),
+            "actor_gpu_resident": bool(args.actor_gpu_resident),
+            "actor_runtime_cache": bool(args.actor_runtime_cache),
+            "target_gpu_util_pct": float(args.target_gpu_util),
+            "util_sample_interval_sec": float(args.util_sample_interval_sec),
+            "slots": [
+                {
+                    "slot_id": slot.slot_id,
+                    "gpu_id": slot.gpu_id,
+                    "cpu_cores": list(slot.cpu_cores),
+                    "cpu_threads": slot.cpu_threads,
+                }
+                for slot in slots
+            ],
+        },
+    }
+    _write_json(args.results_root / "h100_persistent_run_config.json", run_config)
+    _write_text(
+        args.results_root / "run_config.env",
+        "\n".join(
+            [
+                f"started_at={datetime.now().isoformat(timespec='seconds')}",
+                f"repo={args.repo_root}",
+                f"package_root={args.package_root}",
+                f"results_root={args.results_root}",
+                f"pipeline_mode=persistent",
+                f"gpu_devices={','.join(gpu_devices)}",
+                f"jobs_per_gpu={int(args.jobs_per_gpu)}",
+                f"worker_count={len(slots)}",
+                f"minimal_frames={args.minimal_frames}",
+                "",
+            ]
+        ),
+    )
+    _capture_to_file(["df", "-h"], args.results_root / "df_before.txt", cwd=args.repo_root)
+    _capture_to_file(["git", "status", "--short", "--branch"], args.results_root / "git_status_before.txt", cwd=args.repo_root)
+    if shutil.which("nvidia-smi") is not None:
+        _capture_to_file(["nvidia-smi"], args.results_root / "nvidia_smi_before.txt", cwd=args.repo_root)
+
+    plan_rc, _ = _run_logged(
+        _persistent_plan_command(args, slots=slots),
+        cwd=args.repo_root,
+        log_path=logs_root / "plan_persistent.log",
+    )
+    if plan_rc != 0:
+        return plan_rc
+
+    schedule_json = args.results_root / "persistent_schedule.json"
+    cpu_map_json = args.results_root / "assignment_cpu_cores.json"
+    _write_json(cpu_map_json, _assignment_cpu_core_map(schedule_json, slots))
+
+    length_rc, _ = _run_logged(
+        [
+            str(args.python_bin),
+            "scripts/massgen/summarize_persistent_schedule_lengths.py",
+            "--aggregate-render-plan-json",
+            str(args.results_root / "aggregate_render_plan.json"),
+            "--schedule-json",
+            str(schedule_json),
+            "--output-json",
+            str(args.results_root / "natural_length_projection.json"),
+        ],
+        cwd=args.repo_root,
+        log_path=logs_root / "natural_lengths.log",
+    )
+    if length_rc != 0:
+        return length_rc
+
+    run_rc = 0
+    if bool(args.run_render):
+        run_rc, _ = _run_logged(
+            _persistent_run_command(args, slots=slots, cpu_map_json=cpu_map_json),
+            cwd=args.repo_root,
+            log_path=logs_root / "run_persistent.log",
+            env=_persistent_runner_env(args),
+        )
+
+    report_rc = 0
+    if bool(args.run_analysis) and (args.results_root / "run_persistent" / "benchmark_summary.json").is_file():
+        report_env = {
+            "MPLCONFIGDIR": str(args.results_root / "mplconfig"),
+            "XDG_CACHE_HOME": str(args.results_root / "xdg_cache"),
+            "FC_CACHEDIR": str(args.results_root / "fontconfig"),
+        }
+        for value in report_env.values():
+            Path(value).mkdir(parents=True, exist_ok=True)
+        report_rc, _ = _run_logged(
+            _persistent_report_command(args),
+            cwd=args.repo_root,
+            log_path=logs_root / "report_persistent.log",
+            env=report_env,
+        )
+
+    _capture_to_file(["df", "-h"], args.results_root / "df_after.txt", cwd=args.repo_root)
+    if shutil.which("nvidia-smi") is not None:
+        _capture_to_file(["nvidia-smi"], args.results_root / "nvidia_smi_after.txt", cwd=args.repo_root)
+    mp4_files = sorted((args.results_root / "run_persistent").glob("**/*.mp4"))
+    _write_text(args.results_root / "mp4_files.txt", "\n".join(str(path) for path in mp4_files) + ("\n" if mp4_files else ""))
+    _write_text(args.results_root / "mp4_count.txt", f"{len(mp4_files)}\n")
+    with (args.results_root / "run_config.env").open("a", encoding="utf-8") as handle:
+        handle.write(f"finished_at={datetime.now().isoformat(timespec='seconds')}\n")
+
+    if run_rc != 0:
+        return run_rc
+    return report_rc
+
+
 def main() -> int:
     args = _parse_args()
     args.package_root = args.package_root.expanduser().resolve()
     args.results_root = args.results_root.expanduser().resolve()
     args.repo_root = args.repo_root.expanduser().resolve()
     args.python_bin = args.python_bin.expanduser().resolve()
+    args.render_script = args.render_script.expanduser().resolve()
     args.ffmpeg_bin = args.ffmpeg_bin.expanduser().resolve() if args.ffmpeg_bin is not None else None
+    args.materialized_root = args.materialized_root.expanduser().resolve() if args.materialized_root is not None else None
+    args.baseline_summary = [
+        str(Path(item).expanduser().resolve())
+        for item in (args.baseline_summary or [])
+    ]
+
+    if args.pipeline_mode == "persistent":
+        return _run_persistent_pipeline(args)
 
     if args.video_backend != "cpu":
         print(

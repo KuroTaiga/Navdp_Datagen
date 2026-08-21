@@ -56,6 +56,91 @@ def test_worker_env_pins_gpu_and_thread_budget(tmp_path: Path) -> None:
     assert env["IMAGEIO_FFMPEG_EXE"] == str(tmp_path / "ffmpeg")
 
 
+def test_persistent_runner_env_forwards_ffmpeg_override(tmp_path: Path) -> None:
+    args = h100._parse_args(
+        [
+            "--package-root",
+            str(tmp_path / "package"),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--ffmpeg-bin",
+            str(tmp_path / "bin" / "ffmpeg"),
+        ]
+    )
+
+    env = h100._persistent_runner_env(args)
+
+    assert env["GAUSSIAN_RENDER_BACKEND"] == "gsplat"
+    assert env["IMAGEIO_FFMPEG_EXE"] == str(tmp_path / "bin" / "ffmpeg")
+    assert env["FFMPEG_BIN"] == str(tmp_path / "bin" / "ffmpeg")
+
+
+def test_slot_gpu_ids_preserve_repeated_worker_lanes() -> None:
+    slots = h100._build_worker_slots(
+        ["0", "1"],
+        jobs_per_gpu=3,
+        cpu_cores=24,
+    )
+
+    assert h100._slot_gpu_ids(slots) == ["0", "1", "0", "1", "0", "1"]
+
+
+def test_assignment_cpu_core_map_follows_schedule_order(tmp_path: Path) -> None:
+    schedule_json = tmp_path / "persistent_schedule.json"
+    schedule_json.write_text(
+        """
+        {
+          "schema_version": "h100_persistent_schedule.v1",
+          "assignments": [
+            {"assignment_id": "0_w00", "gpu_id": "0", "chunks": []},
+            {"assignment_id": "0_w01", "gpu_id": "0", "chunks": []}
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+    slots = [
+        h100.WorkerSlot(slot_id=0, gpu_id="0", cpu_cores=(0, 1, 2), cpu_threads=3),
+        h100.WorkerSlot(slot_id=1, gpu_id="0", cpu_cores=(3, 4, 5), cpu_threads=3),
+    ]
+
+    assert h100._assignment_cpu_core_map(schedule_json, slots) == {
+        "0_w00": [0, 1, 2],
+        "0_w01": [3, 4, 5],
+    }
+
+
+def test_persistent_plan_command_uses_one_lane_per_slot(tmp_path: Path) -> None:
+    args = h100._parse_args(
+        [
+            "--package-root",
+            str(tmp_path / "package"),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--gpu-devices",
+            "0",
+            "--jobs-per-gpu",
+            "2",
+            "--renders-per-family-source-scene",
+            "50",
+        ]
+    )
+    args.package_root = args.package_root.resolve()
+    args.results_root = args.results_root.resolve()
+    args.python_bin = args.python_bin.resolve()
+    args.render_script = args.render_script.resolve()
+    slots = [
+        h100.WorkerSlot(slot_id=0, gpu_id="0", cpu_cores=(0,), cpu_threads=1),
+        h100.WorkerSlot(slot_id=1, gpu_id="0", cpu_cores=(1,), cpu_threads=1),
+    ]
+
+    command = h100._persistent_plan_command(args, slots=slots)
+
+    assert command.count("--gpu-id") == 2
+    assert command[command.index("--workers-per-gpu") + 1] == "1"
+    assert "--renders-per-family-source-scene" in command
+
+
 def test_copy_package_metadata_copies_generic_jsons(tmp_path: Path) -> None:
     package = tmp_path / "package"
     package.mkdir()

@@ -259,6 +259,25 @@ Started in this session:
 - tests cover resource extraction, scene chunking, GPU assignment, and cache
   eviction/refcount behavior.
 
+Current bridge implementation:
+
+- `scripts/massgen/run_family_rollout_h100.py` defaults to the persistent
+  schedule path (`--pipeline-mode persistent`);
+- the H100 wrapper generates `persistent_schedule.json`,
+  `aggregate_render_plan.json`, `natural_length_projection.json`, and
+  `assignment_cpu_cores.json`;
+- `scripts/massgen/run_persistent_h100_schedule.py` executes the schedule with
+  multiple logical lanes per physical GPU, preemptible temp outputs, resume
+  markers, command retries, 10 Hz-ish GPU sampling, per-worker CPU thread caps,
+  and optional Linux `taskset` affinity;
+- `scripts/massgen/report_persistent_h100_schedule_run.py` produces full-run
+  GPU/VRAM and worker lifecycle graphs plus stage tables.
+
+This is still a Phase-A bridge: each chunk launches the existing renderer
+process. It validates scene/resource-aware ordering, worker fanout, durable
+resume, and reporting before implementing the true single persistent renderer
+process per GPU described above.
+
 Added after the initial scheduler slice:
 
 - `render_label_paths_telesim.py` now enables an in-process

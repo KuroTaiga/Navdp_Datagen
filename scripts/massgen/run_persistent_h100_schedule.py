@@ -55,6 +55,27 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--gpu-sample-interval-sec", type=float, default=1.0)
     parser.add_argument(
+        "--cpu-threads-per-worker",
+        type=int,
+        default=0,
+        help="If >0, cap common CPU math/encode thread env vars for renderer subprocesses.",
+    )
+    parser.add_argument(
+        "--assignment-cpu-cores-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON object mapping assignment_id to CPU core ids. "
+            "Used with taskset on Linux when --cpu-affinity is enabled."
+        ),
+    )
+    parser.add_argument(
+        "--cpu-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use taskset with --assignment-cpu-cores-json on Linux when available.",
+    )
+    parser.add_argument(
         "--command-attempts",
         type=int,
         default=1,
@@ -78,6 +99,25 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _load_assignment_cpu_cores(path: Path | None) -> dict[str, tuple[int, ...]]:
+    if path is None:
+        return {}
+    payload = _load_json(path)
+    out: dict[str, tuple[int, ...]] = {}
+    for assignment_id, raw_cores in payload.items():
+        if not isinstance(raw_cores, list):
+            continue
+        cores: list[int] = []
+        for item in raw_cores:
+            try:
+                cores.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if cores:
+            out[str(assignment_id)] = tuple(cores)
+    return out
+
+
 def _write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -92,11 +132,14 @@ def _run_capture_env(
     cwd: Path,
     log_path: Path,
     env: Mapping[str, str],
+    cpu_cores: tuple[int, ...] = (),
+    cpu_affinity: bool = True,
 ) -> tuple[subprocess.CompletedProcess[str], float, dict[str, Any]]:
+    effective_cmd = _taskset_command(cmd, cpu_cores=cpu_cores, enabled=cpu_affinity)
     started_at = datetime.now(timezone.utc)
     t0 = time.perf_counter()
     completed = subprocess.run(
-        cmd,
+        effective_cmd,
         cwd=cwd,
         env={**os.environ, **dict(env)},
         text=True,
@@ -116,7 +159,7 @@ def _run_capture_env(
     log_path.write_text(
         "".join(
             [
-                f"command: {' '.join(cmd)}\n",
+                f"command: {' '.join(effective_cmd)}\n",
                 f"started_at: {marker['started_at']}\n",
                 f"ended_at: {marker['ended_at']}\n",
                 f"wall_time_sec: {elapsed:.6f}\n",
@@ -131,6 +174,16 @@ def _run_capture_env(
         encoding="utf-8",
     )
     return completed, elapsed, marker
+
+
+def _taskset_command(command: list[str], *, cpu_cores: tuple[int, ...], enabled: bool) -> list[str]:
+    if not enabled or not cpu_cores or sys.platform.lower() != "linux":
+        return command
+    taskset = shutil.which("taskset")
+    if taskset is None:
+        return command
+    core_list = ",".join(str(core) for core in cpu_cores)
+    return [taskset, "-c", core_list, *command]
 
 
 def _chunk_output_root(results_root: Path, assignment_id: str, chunk: Mapping[str, Any]) -> Path:
@@ -198,13 +251,26 @@ def _rewrite_plan_for_chunk(plan: Mapping[str, Any], *, output_root: Path) -> di
     return rewritten
 
 
-def _chunk_env(gpu_id: str, plans: list[Mapping[str, Any]]) -> dict[str, str]:
+def _chunk_env(gpu_id: str, plans: list[Mapping[str, Any]], *, cpu_threads: int = 0) -> dict[str, str]:
     env: dict[str, str] = {}
     for plan in plans:
         plan_env = plan.get("env")
         if isinstance(plan_env, Mapping):
             env.update({str(key): str(value) for key, value in plan_env.items()})
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    if int(cpu_threads or 0) > 0:
+        thread_count = str(int(cpu_threads))
+        env.update(
+            {
+                "OMP_NUM_THREADS": thread_count,
+                "MKL_NUM_THREADS": thread_count,
+                "OPENBLAS_NUM_THREADS": thread_count,
+                "NUMEXPR_NUM_THREADS": thread_count,
+                "VECLIB_MAXIMUM_THREADS": thread_count,
+                "TORCH_NUM_THREADS": thread_count,
+                "MALLOC_ARENA_MAX": "2",
+            }
+        )
     return env
 
 
@@ -276,7 +342,12 @@ def _render_chunk(
 
     render_elapsed = 0.0
     render_returncode = 2 if blockers else 0
-    env = _chunk_env(gpu_id, plans)
+    cpu_threads_per_worker = int(getattr(args, "cpu_threads_per_worker", 0) or 0)
+    env = _chunk_env(gpu_id, plans, cpu_threads=cpu_threads_per_worker)
+    assignment_cpu_cores = tuple(
+        int(core)
+        for core in getattr(args, "assignment_cpu_cores", {}).get(str(assignment_id), ())
+    )
     command_markers: list[dict[str, Any]] = []
     if not blockers and grouped_commands and not bool(args.dry_run):
         for command_index, command in enumerate(grouped_commands):
@@ -286,6 +357,8 @@ def _render_chunk(
                     command,
                     cwd=args.repo_root,
                     env=env,
+                    cpu_cores=assignment_cpu_cores,
+                    cpu_affinity=bool(getattr(args, "cpu_affinity", True)),
                     log_path=args.results_root
                     / "logs"
                     / f"{_chunk_log_stem(assignment_id, chunk)}_cmd_{command_index:04d}_attempt_{attempt_index:02d}.log",
@@ -301,6 +374,8 @@ def _render_chunk(
                         "attempt_index": int(attempt_index),
                         "label_ids": smoke._option_values(command, "--label-id"),
                         "metrics_json": smoke._single_option_value(command, "--metrics-json"),
+                        "cpu_cores": list(assignment_cpu_cores),
+                        "cpu_threads_per_worker": cpu_threads_per_worker,
                     }
                 )
                 command_markers.append(command_marker)
@@ -573,6 +648,12 @@ def main() -> int:
     args.schedule_json = args.schedule_json.expanduser().resolve()
     args.results_root = args.results_root.expanduser().resolve()
     args.repo_root = args.repo_root.expanduser().resolve()
+    args.assignment_cpu_cores_json = (
+        args.assignment_cpu_cores_json.expanduser().resolve()
+        if args.assignment_cpu_cores_json is not None
+        else None
+    )
+    args.assignment_cpu_cores = _load_assignment_cpu_cores(args.assignment_cpu_cores_json)
     if args.clean and args.results_root.exists():
         shutil.rmtree(args.results_root)
     args.results_root.mkdir(parents=True, exist_ok=True)
@@ -620,6 +701,15 @@ def main() -> int:
         "workers": int(args.workers),
         "group_max_labels_per_command": int(args.group_max_labels_per_command),
         "command_attempts": int(args.command_attempts),
+        "cpu_threads_per_worker": int(args.cpu_threads_per_worker or 0),
+        "cpu_affinity": bool(args.cpu_affinity),
+        "assignment_cpu_cores_json": (
+            str(args.assignment_cpu_cores_json) if args.assignment_cpu_cores_json is not None else None
+        ),
+        "assignment_cpu_cores": {
+            assignment_id: list(cores)
+            for assignment_id, cores in sorted(args.assignment_cpu_cores.items())
+        },
         "preemptible_output": bool(args.preemptible_output),
         "resume": bool(args.resume),
         "dry_run": bool(args.dry_run),
