@@ -424,6 +424,7 @@ def _plot_stage_overlay(
     window_start: float,
     window_min: float,
     path: Path,
+    title: str | None = None,
 ) -> None:
     import matplotlib
 
@@ -460,7 +461,7 @@ def _plot_stage_overlay(
             )
     ax.set_xlim(0, window_min)
     ax.set_ylim(0, 105)
-    ax.set_title(f"First {window_min:g} minutes: GPU/VRAM with worker lifecycle lanes")
+    ax.set_title(title or f"First {window_min:g} minutes: GPU/VRAM with worker lifecycle lanes")
     ax.set_ylabel("GPU util %")
     ax2.set_ylabel("VRAM used GiB")
     lines, labels = ax.get_legend_handles_labels()
@@ -592,9 +593,11 @@ def main() -> int:
     samples = _gpu_samples(run_root / "gpu_samples.jsonl")
     gpu_summary = _gpu_summary(samples)
     intervals = _stage_intervals(summary)
-    window_start = samples[0]["epoch_sec"] if samples else 0.0
+    interval_start = min((float(interval["start_epoch_sec"]) for interval in intervals), default=0.0)
+    interval_end = max((float(interval["end_epoch_sec"]) for interval in intervals), default=0.0)
+    window_start = samples[0]["epoch_sec"] if samples else interval_start
     requested_window_end = window_start + float(args.stage_window_min) * 60.0
-    observed_window_end = samples[-1]["epoch_sec"] if samples else requested_window_end
+    observed_window_end = samples[-1]["epoch_sec"] if samples else max(requested_window_end, interval_end)
     window_end = min(requested_window_end, observed_window_end)
     actual_window_min = max(0.0, window_end - window_start) / 60.0
     stage_rows, clipped = _stage_summary(
@@ -604,6 +607,16 @@ def main() -> int:
         window_end=window_end,
     )
     lane_rows = _worker_lane_rows(clipped)
+    full_window_start = window_start
+    full_window_end = max(observed_window_end, interval_end)
+    full_window_min = max(0.0, full_window_end - full_window_start) / 60.0
+    full_stage_rows, full_clipped = _stage_summary(
+        intervals=intervals,
+        samples=samples,
+        window_start=full_window_start,
+        window_end=full_window_end,
+    )
+    full_lane_rows = _worker_lane_rows(full_clipped)
     chunk_rows = _render_overhead_rows(summary)
     comparison_rows = _comparison_rows(args.baseline_summary, summary)
     assignment_ids = [
@@ -641,6 +654,8 @@ def main() -> int:
 
     _write_csv(tables_root / "first_window_stage_summary.csv", stage_rows)
     _write_csv(tables_root / "first_window_worker_lanes.csv", lane_rows)
+    _write_csv(tables_root / "full_run_stage_summary.csv", full_stage_rows)
+    _write_csv(tables_root / "full_run_worker_lanes.csv", full_lane_rows)
     _write_csv(tables_root / "chunk_timing_breakdown.csv", chunk_rows)
     _write_csv(tables_root / "comparison_summary.csv", comparison_rows)
     _plot_gpu_timeline(samples, graphs_root / "gpu_vram_timeline.png")
@@ -650,6 +665,14 @@ def main() -> int:
         window_start=window_start,
         window_min=actual_window_min or float(args.stage_window_min),
         path=graphs_root / "first_window_stage_overlay.png",
+    )
+    _plot_stage_overlay(
+        samples=samples,
+        clipped=full_clipped,
+        window_start=full_window_start,
+        window_min=full_window_min,
+        path=graphs_root / "full_run_stage_overlay.png",
+        title="Full run: GPU/VRAM with worker lifecycle lanes",
     )
 
     rollup = {
@@ -673,8 +696,11 @@ def main() -> int:
         "gpu_summary": gpu_summary,
         "requested_first_window_min": float(args.stage_window_min),
         "actual_first_window_min": actual_window_min,
+        "actual_full_window_min": full_window_min,
         "first_window_stage_rows": stage_rows,
         "first_window_worker_lanes": lane_rows,
+        "full_run_stage_rows": full_stage_rows,
+        "full_run_worker_lanes": full_lane_rows,
         "natural_length_projection": natural_payload,
     }
     _write_json(metrics_root / "summary_metrics.json", rollup)
@@ -683,6 +709,8 @@ def main() -> int:
     memory = gpu_summary.get("memory_used_gib", {}) if isinstance(gpu_summary, Mapping) else {}
     stage_table_rows = stage_rows[:8]
     lane_table_rows = lane_rows[:12]
+    full_stage_table_rows = full_stage_rows[:8]
+    full_lane_table_rows = full_lane_rows[:12]
     natural_section = ""
     if natural_payload:
         overall = natural_payload.get("overall", {})
@@ -726,9 +754,19 @@ Generated: {datetime.now().isoformat(timespec="seconds")}
 
 {_markdown_table(stage_table_rows, ["stage_group", "worker_seconds_in_window", "worker_seconds_per_window_sec", "sample_count_when_active", "avg_gpu_pct_when_active", "max_gpu_pct_when_active"])}
 
+## Full-Run Stage Diagnostic
+
+[Full-run stage overlay](assets/graphs/full_run_stage_overlay.png) shows the whole GPU/VRAM trace with one lifecycle lane per worker.
+
+{_markdown_table(full_stage_table_rows, ["stage_group", "worker_seconds_in_window", "worker_seconds_per_window_sec", "sample_count_when_active", "avg_gpu_pct_when_active", "max_gpu_pct_when_active"])}
+
 ## Worker Lanes
 
 {_markdown_table(lane_table_rows, ["assignment_id", "chunk_count_seen", "worker_seconds", "render_loop_sec", "actor_load_sec", "write_close_sec", "scene_renderer_init_sec"])}
+
+## Full-Run Worker Lanes
+
+{_markdown_table(full_lane_table_rows, ["assignment_id", "chunk_count_seen", "worker_seconds", "render_loop_sec", "actor_load_sec", "write_close_sec", "scene_renderer_init_sec"])}
 
 ## Comparison
 
@@ -738,9 +776,12 @@ Generated: {datetime.now().isoformat(timespec="seconds")}
 
 - [GPU/VRAM timeline](assets/graphs/gpu_vram_timeline.png)
 - [First-window stage overlay](assets/graphs/first_window_stage_overlay.png)
+- [Full-run stage overlay](assets/graphs/full_run_stage_overlay.png)
 - [summary_metrics.json](metrics/summary_metrics.json)
 - [first_window_stage_summary.csv](assets/tables/first_window_stage_summary.csv)
 - [first_window_worker_lanes.csv](assets/tables/first_window_worker_lanes.csv)
+- [full_run_stage_summary.csv](assets/tables/full_run_stage_summary.csv)
+- [full_run_worker_lanes.csv](assets/tables/full_run_worker_lanes.csv)
 - [chunk_timing_breakdown.csv](assets/tables/chunk_timing_breakdown.csv)
 - [comparison_summary.csv](assets/tables/comparison_summary.csv)
 """
