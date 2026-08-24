@@ -28,12 +28,17 @@ Only the render-time TeleSim subset is bundled; planning, Habitat, LLM, and view
 Recommended conda install:
 
 ```bash
-conda create -n navdp-render python=3.10
-conda activate navdp-render
 ./install.sh
 ```
 
-When run inside an active non-base conda env, `install.sh` installs into that conda env.
+When conda is available, `install.sh` creates and uses `navdp-render` by default. If
+you already activated a non-base conda env, it installs into that active env instead.
+For the H100 platform worker, this is the expected setup path after copying the
+release folder:
+
+```bash
+CONDA_ENV=navdp-h100 TORCH_CUDA=cu121 REQUIRE_CUDA=true ./install.sh
+```
 
 Venv install, for machines not using conda:
 
@@ -44,7 +49,9 @@ source .venv-navdp-render/bin/activate
 
 Defaults:
 
-- Current conda env when `CONDA_PREFIX` is active; otherwise Python venv at `.venv-navdp-render`
+- Current non-base conda env when `CONDA_PREFIX` is active
+- Otherwise a conda env named `navdp-render` when conda is installed
+- Otherwise Python venv at `.venv-navdp-render`
 - PyTorch `2.5.1` CUDA `cu121`
 - `gsplat` from pip
 - editable install of the bundled `TeleSim3D/tele_sim`
@@ -55,6 +62,8 @@ Overrides:
 ENV_DIR=/path/to/venv TORCH_CUDA=cu124 ./install.sh
 INSTALL_TORCH=false ./install.sh
 USE_VENV=true ./install.sh
+USE_CONDA=false USE_VENV=false ./install.sh
+TORCH_VERSION=2.5.1 TORCH_CUDA=cu121 REQUIRE_CUDA=true ./install.sh
 ```
 
 GPU rendering requires a CUDA-capable PyTorch install. Video output uses `--video-backend nvenc` by default and falls back through ImageIO/ffmpeg behavior; use `--video-backend cpu` when NVENC is unavailable.
