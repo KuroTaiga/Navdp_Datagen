@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -88,6 +89,12 @@ def _parse_args() -> argparse.Namespace:
         default=0,
         help="Split compatible same-scene work into chunks of at most this many jobs.",
     )
+    parser.add_argument(
+        "--scene-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep all chunks from the same scene on one logical lane for cache locality.",
+    )
     parser.add_argument("--scene-vram-gib", type=float, default=8.0)
     parser.add_argument("--human-avatar-vram-mib", type=float, default=512.0)
     parser.add_argument("--robot-asset-vram-mib", type=float, default=512.0)
@@ -135,6 +142,7 @@ def main() -> int:
         gpu_ids=_expanded_gpu_ids(args.gpu_id or ["0"], workers_per_gpu=args.workers_per_gpu),
         max_items_per_chunk=int(args.max_items_per_chunk or 0),
         estimates=estimates,
+        scene_affinity=bool(args.scene_affinity),
     )
     payload = schedule.to_json_dict(include_execution=bool(args.include_execution))
     if args.simulate_cache_gib is not None:
@@ -204,6 +212,7 @@ def _build_render_plan_from_package(args: argparse.Namespace) -> dict[str, Any]:
             minimal_frames=args.minimal_frames,
             actor_gpu_resident=bool(args.actor_gpu_resident),
             actor_runtime_cache=bool(args.actor_runtime_cache),
+            env_overrides=_render_env_overrides(Path(str(args.python_bin))),
         )
         entry_records.append(
             {
@@ -232,6 +241,40 @@ def _build_render_plan_from_package(args: argparse.Namespace) -> dict[str, Any]:
         "entries": entry_records,
         "plans": all_plans,
     }
+
+
+def _render_env_overrides(python_bin: Path) -> dict[str, str]:
+    env: dict[str, str] = {"PYOPENGL_PLATFORM": os.environ.get("PYOPENGL_PLATFORM", "egl")}
+    env_root = python_bin.expanduser().parent.parent
+    env_bin = env_root / "bin"
+    existing_path = os.environ.get("PATH", "")
+    if env_bin.is_dir():
+        env["PATH"] = ":".join(
+            [str(env_bin)] + [part for part in existing_path.split(":") if part and part != str(env_bin)]
+        )
+    extension_root = os.environ.get("TORCH_EXTENSIONS_DIR")
+    if not extension_root:
+        extension_root = str(env_root.parent.parent / "torch_extensions" / env_root.name)
+    env["TORCH_EXTENSIONS_DIR"] = extension_root
+    env["TORCH_CUDA_ARCH_LIST"] = os.environ.get("TORCH_CUDA_ARCH_LIST", "9.0")
+
+    cuda_home = Path(os.environ.get("CUDA_HOME", "/usr/local/cuda-12.9")).expanduser()
+    env["CUDA_HOME"] = str(cuda_home)
+    lib_dirs = [env_root / "lib"]
+    lib_dirs.extend(sorted((env_root / "lib").glob("python*/site-packages/torch/lib")))
+    lib_dirs.append(cuda_home / "lib64")
+    lib_dirs.append(Path("/usr/local/cuda-12.9/lib64"))
+    existing_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    parts: list[str] = []
+    for lib_dir in lib_dirs:
+        if lib_dir.is_dir():
+            value = str(lib_dir)
+            if value not in parts:
+                parts.append(value)
+    parts.extend(part for part in existing_ld.split(":") if part and part not in parts)
+    if parts:
+        env["LD_LIBRARY_PATH"] = ":".join(parts)
+    return env
 
 
 def _simulate_cache(

@@ -72,6 +72,7 @@ def build_render_plans(
     robot_compose_mode: str = "depth",
     robot_glb_up_axis: str = "z",
     robot_target_height: float | None = None,
+    env_overrides: Mapping[str, str] | None = None,
 ) -> JsonDict:
     """Build dry-run or executable plans for manifest jobs.
 
@@ -121,6 +122,7 @@ def build_render_plans(
             robot_compose_mode=robot_compose_mode,
             robot_glb_up_axis=robot_glb_up_axis,
             robot_target_height=robot_target_height,
+            env_overrides=env_overrides,
         )
         for job in selected_jobs
     ]
@@ -339,6 +341,7 @@ def _build_job_plan(
     robot_compose_mode: str,
     robot_glb_up_axis: str,
     robot_target_height: float | None,
+    env_overrides: Mapping[str, str] | None,
 ) -> JsonDict:
     job_id = str(job.get("job_id") or job.get("outputs", {}).get("stem") or "massgen_job")
     scene_id = str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or "")
@@ -473,6 +476,8 @@ def _build_job_plan(
         cull = render_options.get("human_visibility_culling", {})
         if isinstance(cull, Mapping) and cull.get("enabled"):
             command.extend(["--actor-visibility-culling", "--actor-cull-margin-m", _float_arg(cull.get("margin_m", 0.25))])
+    env = {"GAUSSIAN_RENDER_BACKEND": "gsplat"}
+    env.update({str(key): str(value) for key, value in (env_overrides or {}).items()})
     return {
         "status": "blocked" if blockers else "ready",
         "job_id": job_id,
@@ -492,7 +497,7 @@ def _build_job_plan(
             "render_dir": str(render_output_root / scene_id),
             "metrics_json": str(metrics_root / f"{job_id}.json"),
         },
-        "env": {"GAUSSIAN_RENDER_BACKEND": "gsplat"},
+        "env": env,
         "command": command,
         "robot_overlay_commands": robot_overlay_commands,
         "robot_overlay_paths": robot_overlay_paths,

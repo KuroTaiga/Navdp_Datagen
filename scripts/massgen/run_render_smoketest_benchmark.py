@@ -185,7 +185,7 @@ def _run_capture(cmd: list[str], *, cwd: Path, log_path: Path) -> tuple[subproce
     return completed, elapsed
 
 
-def _read_gpu_sample() -> dict[str, Any] | None:
+def _read_gpu_samples() -> list[dict[str, Any]]:
     cmd = [
         "nvidia-smi",
         "--query-gpu=timestamp,index,utilization.gpu,utilization.memory,memory.used,memory.free,memory.total,power.draw,temperature.gpu",
@@ -193,24 +193,32 @@ def _read_gpu_sample() -> dict[str, Any] | None:
     ]
     completed = subprocess.run(cmd, text=True, capture_output=True, check=False)
     if completed.returncode != 0:
-        return None
-    line = (completed.stdout or "").strip().splitlines()
-    if not line:
-        return None
-    parts = [part.strip() for part in line[0].split(",")]
-    if len(parts) < 9:
-        return None
-    return {
-        "timestamp": parts[0],
-        "index": int(parts[1]),
-        "gpu_util_pct": float(parts[2]),
-        "mem_util_pct": float(parts[3]),
-        "memory_used_mib": float(parts[4]),
-        "memory_free_mib": float(parts[5]),
-        "memory_total_mib": float(parts[6]),
-        "power_w": float(parts[7]),
-        "temperature_c": float(parts[8]),
-    }
+        return []
+    samples: list[dict[str, Any]] = []
+    for line in (completed.stdout or "").strip().splitlines():
+        parts = [part.strip() for part in line.split(",")]
+        if len(parts) < 9:
+            continue
+        samples.append(
+            {
+                "timestamp": parts[0],
+                "index": int(parts[1]),
+                "gpu_index": int(parts[1]),
+                "gpu_util_pct": float(parts[2]),
+                "mem_util_pct": float(parts[3]),
+                "memory_used_mib": float(parts[4]),
+                "memory_free_mib": float(parts[5]),
+                "memory_total_mib": float(parts[6]),
+                "power_w": float(parts[7]),
+                "temperature_c": float(parts[8]),
+            }
+        )
+    return samples
+
+
+def _read_gpu_sample() -> dict[str, Any] | None:
+    samples = _read_gpu_samples()
+    return samples[0] if samples else None
 
 
 class GpuMonitor:
@@ -236,12 +244,13 @@ class GpuMonitor:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            sample = _read_gpu_sample()
-            if sample is not None:
-                self.samples.append(sample)
+            samples = _read_gpu_samples()
+            if samples:
+                self.samples.extend(samples)
                 if self.log_path is not None:
                     with self.log_path.open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps(sample, sort_keys=True) + "\n")
+                        for sample in samples:
+                            handle.write(json.dumps(sample, sort_keys=True) + "\n")
             self._stop.wait(self.interval_sec)
 
 

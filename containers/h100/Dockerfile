@@ -5,7 +5,7 @@ FROM ${CUDA_BASE}
 
 ARG CONDA_ENV=cuda121
 ARG MINIFORGE_VERSION=24.11.3-0
-ARG INSTALL_LOCAL_EXTENSIONS=1
+ARG INSTALL_RENDER_REQUIREMENTS=1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CONDA_DIR=/opt/conda \
@@ -62,25 +62,18 @@ ENV PATH=${CONDA_DIR}/envs/${CONDA_ENV}/bin:${CONDA_DIR}/bin:${PATH}
 WORKDIR /workspace/Navdp_Datagen
 
 COPY environment.yml /tmp/environment.yml
+COPY release/navdp_path_renderer/requirements.txt /tmp/navdp_path_renderer_requirements.txt
 RUN conda env create -f /tmp/environment.yml \
+  && if [[ "${INSTALL_RENDER_REQUIREMENTS}" == "1" ]]; then \
+      python -m pip install -r /tmp/navdp_path_renderer_requirements.txt; \
+    fi \
   && conda clean -afy \
   && mkdir -p "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}" "${FC_CACHEDIR}"
 
 COPY . /workspace/Navdp_Datagen
 
-RUN if [[ "${INSTALL_LOCAL_EXTENSIONS}" == "1" ]]; then \
-      if [[ -f submodules/gsplat/pyproject.toml ]]; then \
-        python -m pip install --no-build-isolation -e submodules/gsplat; \
-      fi; \
-      if [[ -f submodules/diff-gaussian-rasterization/setup.py ]]; then \
-        python -m pip install --no-build-isolation -e submodules/diff-gaussian-rasterization; \
-      fi; \
-      if [[ -f submodules/simple-knn/setup.py ]]; then \
-        python -m pip install --no-build-isolation -e submodules/simple-knn; \
-      fi; \
-      if [[ -f submodules/fused-ssim/setup.py ]]; then \
-        python -m pip install --no-build-isolation -e submodules/fused-ssim; \
-      fi; \
+RUN if [[ "${INSTALL_RENDER_REQUIREMENTS}" == "1" ]]; then \
+      python -c "import gsplat; print('gsplat', getattr(gsplat, '__version__', 'unknown'))"; \
     fi \
   && python -m py_compile \
       render_label_paths_telesim.py \

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-MIRROR_ROOT="${MIRROR_ROOT:-/mnt/DATA1/dongjk/navdp_data/Navdp_Datagen}"
+MIRROR_ROOT="${MIRROR_ROOT:-/team/telenav/code/Navdp_Datagen}"
 REPO_URL="${REPO_URL:-https://github.com/KuroTaiga/Navdp_Datagen.git}"
 BRANCH="${BRANCH:-massgen}"
 PACKAGE_SRC="${PACKAGE_SRC:-}"
 PACKAGE_DST="${PACKAGE_DST:-}"
 BUILD_CONTAINER="${BUILD_CONTAINER:-0}"
+CLEAN_IMAGE="${CLEAN_IMAGE:-1}"
+UPDATE_SUBMODULES="${UPDATE_SUBMODULES:-0}"
 IMAGE_TAG="${IMAGE_TAG:-navdp-datagen-h100:massgen}"
 
 if [[ -d "${MIRROR_ROOT}/.git" ]]; then
@@ -20,7 +22,13 @@ else
   git clone --branch "${BRANCH}" "${REPO_URL}" "${MIRROR_ROOT}"
 fi
 
-git -C "${MIRROR_ROOT}" submodule update --init --recursive || true
+if [[ "${UPDATE_SUBMODULES}" == "1" ]]; then
+  if ! git -C "${MIRROR_ROOT}" submodule update --init --recursive; then
+    echo "[warn] submodule update failed" >&2
+  fi
+else
+  echo "[mirror] skipping submodule init; H100 gsplat image installs render deps from pip"
+fi
 
 if [[ -n "${PACKAGE_SRC}" ]]; then
   if [[ -z "${PACKAGE_DST}" ]]; then
@@ -43,7 +51,11 @@ fi
 
 if [[ "${BUILD_CONTAINER}" == "1" ]]; then
   echo "[container] building ${IMAGE_TAG}"
-  IMAGE_TAG="${IMAGE_TAG}" "${MIRROR_ROOT}/scripts/massgen/build_h100_container.sh"
+  if [[ "${CLEAN_IMAGE}" == "1" ]]; then
+    IMAGE_TAG="${IMAGE_TAG}" "${MIRROR_ROOT}/scripts/massgen/build_h100_clean_mirror_image.sh"
+  else
+    IMAGE_TAG="${IMAGE_TAG}" "${MIRROR_ROOT}/scripts/massgen/build_h100_container.sh"
+  fi
 fi
 
 cat <<EOF
@@ -52,7 +64,21 @@ Mirror ready:
   MIRROR_ROOT=${MIRROR_ROOT}
   BRANCH=${BRANCH}
 
+EOF
+
+run_header="Next:"
+if [[ "${BUILD_CONTAINER}" != "1" ]]; then
+  run_header="Then:"
+  cat <<EOF
 Next:
+  cd ${MIRROR_ROOT}
+  IMAGE_TAG=${IMAGE_TAG} scripts/massgen/build_h100_clean_mirror_image.sh
+
+EOF
+fi
+
+cat <<EOF
+${run_header}
   cd ${MIRROR_ROOT}
   PACKAGE_ROOT=<package path> RESULTS_ROOT=<output path> \\
     scripts/massgen/run_h100_container.sh run

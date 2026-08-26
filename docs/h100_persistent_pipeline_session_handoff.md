@@ -112,7 +112,14 @@ Important outputs:
   - Clone/update helper for the Linux mirror and optional package copy.
 
 - `scripts/massgen/build_h100_container.sh`
-  - Builds `navdp-datagen-h100:massgen` by default.
+  - Quick iterative build of `navdp-datagen-h100:massgen` from the live
+    checkout.
+
+- `scripts/massgen/build_h100_clean_mirror_image.sh`
+  - Release-style image build for Linux/H100. Exports a tracked-only
+    superproject Docker context, avoids renderer submodule contents, installs
+    `gsplat` through pip, checks clean git state, targets `linux/amd64`, and
+    can optionally save the image tarball.
 
 - `scripts/massgen/run_h100_container.sh`
   - Runs the H100 persistent pipeline inside the container with GPU, IPC, and
@@ -152,7 +159,7 @@ Build on the Linux H100 mirror:
 
 ```sh
 cd /mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen
-IMAGE_TAG=navdp-datagen-h100:massgen scripts/massgen/build_h100_container.sh
+IMAGE_TAG=navdp-datagen-h100:massgen scripts/massgen/build_h100_clean_mirror_image.sh
 ```
 
 Run:

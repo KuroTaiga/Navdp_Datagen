@@ -18,20 +18,22 @@ using the same `massgen` branch implementation:
 ## Suggested Layout
 
 ```text
-/mnt/<h100-data>/dongjk/navdp_data/
-  Navdp_Datagen/                  # git mirror, branch massgen
+/team/telenav/
+  code/Navdp_Datagen/             # git mirror, branch massgen
   massgen_packages/<package>/     # copied planner/render package
   h100_results/<run-id>/          # run output root
-  human_gs_source/                # human avatar source, if not already elsewhere
+  human_avatars/...               # human avatar source, if not already elsewhere
 ```
 
-Use a platform-local data mount for outputs. Do not write large results into
+On the current H100 platform, only `/team` and `/private` are persistent. Keep
+code under `/team/telenav/code`; do not rely on `/root`, `/dev/shm`, or the
+container root filesystem surviving a restart. Do not write large results into
 the git checkout.
 
 ## Mirror Setup
 
 ```sh
-cd /mnt/<h100-data>/dongjk/navdp_data
+cd /team/telenav/code
 git clone <repo-url> Navdp_Datagen
 cd Navdp_Datagen
 git switch massgen
@@ -65,7 +67,7 @@ the package; it expects referenced paths to exist on the H100 host.
 This repo includes a Linux mirror helper:
 
 ```sh
-MIRROR_ROOT=/mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen \
+MIRROR_ROOT=/team/telenav/code/Navdp_Datagen \
 REPO_URL=https://github.com/KuroTaiga/Navdp_Datagen.git \
 BRANCH=massgen \
 scripts/massgen/setup_h100_linux_mirror.sh
@@ -74,9 +76,9 @@ scripts/massgen/setup_h100_linux_mirror.sh
 Optional package copy:
 
 ```sh
-MIRROR_ROOT=/mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen \
+MIRROR_ROOT=/team/telenav/code/Navdp_Datagen \
 PACKAGE_SRC=/path/to/source/package \
-PACKAGE_DST=/mnt/<h100-data>/dongjk/navdp_data/massgen_packages/<package> \
+PACKAGE_DST=/team/telenav/massgen_packages/<package> \
 scripts/massgen/setup_h100_linux_mirror.sh
 ```
 
@@ -85,12 +87,13 @@ scripts/massgen/setup_h100_linux_mirror.sh
 Start with a capped run before a full natural-length run:
 
 ```sh
-cd /mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen
+cd /team/telenav/code/Navdp_Datagen
+H100_PYTHON=/team/telenav/code/conda_envs/navdp_cuda121/bin/python
 
-/path/to/cuda-env/bin/python scripts/massgen/run_family_rollout_h100.py \
-  --package-root /mnt/<h100-data>/dongjk/navdp_data/massgen_packages/<package> \
-  --results-root /mnt/<h100-data>/dongjk/navdp_data/h100_results/<run-id> \
-  --python-bin /path/to/cuda-env/bin/python \
+"${H100_PYTHON}" scripts/massgen/run_family_rollout_h100.py \
+  --package-root /team/telenav/massgen_packages/<package> \
+  --results-root /team/telenav/h100_results/<run-id> \
+  --python-bin "${H100_PYTHON}" \
   --gpu-devices 0,1,2,3 \
   --cpu-cores 120 \
   --jobs-per-gpu 4 \
@@ -99,6 +102,17 @@ cd /mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen
   --minimal-frames 16 \
   --command-attempts 3 \
   --clean
+```
+
+`run_family_rollout_h100.py` derives `PYOPENGL_PLATFORM=egl` and prefixes
+`<python-env>/lib` on `LD_LIBRARY_PATH` from `--python-bin`, so the persistent
+conda env can provide `libGL`, `libEGL`, and `libGLU` without relying on root
+filesystem apt packages. If invoking render scripts directly, export those
+values first:
+
+```sh
+export PYOPENGL_PLATFORM=egl
+export LD_LIBRARY_PATH=/team/telenav/code/conda_envs/navdp_cuda121/lib:${LD_LIBRARY_PATH:-}
 ```
 
 Outputs to inspect first:
@@ -117,15 +131,31 @@ The renderer-side H100 container is separate from the Pathplanner CPU MassGen
 container. Build it from this repo mirror:
 
 ```sh
-cd /mnt/<h100-data>/dongjk/navdp_data/Navdp_Datagen
-IMAGE_TAG=navdp-datagen-h100:massgen scripts/massgen/build_h100_container.sh
+cd /team/telenav/code/Navdp_Datagen
+IMAGE_TAG=navdp-datagen-h100:massgen scripts/massgen/build_h100_clean_mirror_image.sh
+```
+
+The clean builder exports only git-tracked superproject files into a temporary
+Docker context, checks that the checkout is clean, targets `linux/amd64`, and
+defaults to `--pull --no-cache`. It does not require renderer submodules; the
+image installs the render dependency set from
+`release/navdp_path_renderer/requirements.txt`, including `gsplat`, with pip.
+For an iterative non-release build from the live checkout, use
+`scripts/massgen/build_h100_container.sh` instead.
+
+If the image must be moved to another Linux/H100 host without rebuilding:
+
+```sh
+SAVE_IMAGE_TAR=/team/telenav/navdp-datagen-h100_massgen.tar \
+  IMAGE_TAG=navdp-datagen-h100:massgen \
+  scripts/massgen/build_h100_clean_mirror_image.sh
 ```
 
 Run the capped smoke in the container:
 
 ```sh
-PACKAGE_ROOT=/mnt/<h100-data>/dongjk/navdp_data/massgen_packages/<package> \
-RESULTS_ROOT=/mnt/<h100-data>/dongjk/navdp_data/h100_results/<run-id> \
+PACKAGE_ROOT=/team/telenav/massgen_packages/<package> \
+RESULTS_ROOT=/team/telenav/h100_results/<run-id> \
 GPU_DEVICES=0,1,2,3 \
 CPU_CORES=120 \
 JOBS_PER_GPU=4 \

@@ -51,10 +51,12 @@ sys.path.insert(0, str(telesim_root))
 
 import imageio  # noqa: F401
 import numpy  # noqa: F401
+import gsplat  # noqa: F401
 import tele_sim  # noqa: F401
 
 print("python", sys.executable)
 print("torch", torch.__version__, "cuda", torch.cuda.is_available(), "devices", torch.cuda.device_count())
+print("gsplat", getattr(gsplat, "__version__", "unknown"))
 print("tele_sim", tele_sim.__file__)
 PY
 

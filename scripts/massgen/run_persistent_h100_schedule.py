@@ -251,12 +251,25 @@ def _rewrite_plan_for_chunk(plan: Mapping[str, Any], *, output_root: Path) -> di
     return rewritten
 
 
-def _chunk_env(gpu_id: str, plans: list[Mapping[str, Any]], *, cpu_threads: int = 0) -> dict[str, str]:
+def _chunk_env(
+    gpu_id: str,
+    plans: list[Mapping[str, Any]],
+    *,
+    assignment_id: str | None = None,
+    cpu_threads: int = 0,
+) -> dict[str, str]:
     env: dict[str, str] = {}
     for plan in plans:
         plan_env = plan.get("env")
         if isinstance(plan_env, Mapping):
             env.update({str(key): str(value) for key, value in plan_env.items()})
+    extension_root = env.get("TORCH_EXTENSIONS_DIR")
+    if extension_root:
+        safe_assignment_id = "".join(
+            char if char.isalnum() or char in "._-" else "_"
+            for char in str(assignment_id or gpu_id)
+        )
+        env["TORCH_EXTENSIONS_DIR"] = str(Path(extension_root) / safe_assignment_id)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     if int(cpu_threads or 0) > 0:
         thread_count = str(int(cpu_threads))
@@ -343,7 +356,12 @@ def _render_chunk(
     render_elapsed = 0.0
     render_returncode = 2 if blockers else 0
     cpu_threads_per_worker = int(getattr(args, "cpu_threads_per_worker", 0) or 0)
-    env = _chunk_env(gpu_id, plans, cpu_threads=cpu_threads_per_worker)
+    env = _chunk_env(
+        gpu_id,
+        plans,
+        assignment_id=assignment_id,
+        cpu_threads=cpu_threads_per_worker,
+    )
     assignment_cpu_cores = tuple(
         int(core)
         for core in getattr(args, "assignment_cpu_cores", {}).get(str(assignment_id), ())

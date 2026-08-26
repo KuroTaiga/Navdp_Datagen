@@ -19,6 +19,7 @@ from utils.telesim_actor_utils import (
     build_gpu_actor_sequence,
     load_gaussian_ply,
     load_actor_sequence,
+    list_actor_frame_paths,
     transform_gpu_actor_frame,
 )
 from utils.sh_utils import RGB2SH
@@ -216,6 +217,28 @@ def test_load_gaussian_ply_filters_actor_mask(tmp_path) -> None:
 
     assert len(ply.data) == 2
     np.testing.assert_array_equal(ply.data["x"], np.array([1.0, 3.0], dtype=np.float32))
+
+
+def test_list_actor_frame_paths_prefers_animation_frames_over_canonical_sidecar(tmp_path) -> None:
+    for name in ("cano_gs.ply", "frame_00001.ply", "frame_00000.ply"):
+        (tmp_path / name).write_bytes(b"ply\n")
+
+    frame_paths = list_actor_frame_paths(
+        ActorOptions(
+            sequence_dir=tmp_path,
+            pattern="*.ply",
+            height=1.8,
+            follow_distance=0.0,
+            buffer_distance=0.0,
+            speed=1.3,
+            fps=10.0,
+            loop=True,
+            foot_offset=0.0,
+            animation_cycle_mod=1,
+        )
+    )
+
+    assert [path.name for path in frame_paths] == ["frame_00000.ply", "frame_00001.ply"]
 
 
 def test_load_actor_sequence_recenters_scene_space_z_up_frames(tmp_path) -> None:

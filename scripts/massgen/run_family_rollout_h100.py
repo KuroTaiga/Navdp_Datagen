@@ -166,6 +166,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--ffmpeg-bin", type=Path, default=None)
     parser.add_argument("--materialized-root", type=Path, default=None)
     parser.add_argument("--max-items-per-chunk", type=int, default=0)
+    parser.add_argument(
+        "--scene-affinity",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Keep all same-scene persistent chunks on one logical lane.",
+    )
     parser.add_argument("--group-max-labels-per-command", type=int, default=0)
     parser.add_argument("--command-attempts", type=int, default=3)
     parser.add_argument("--run-render", action=argparse.BooleanOptionalAction, default=True)
@@ -356,14 +362,53 @@ def _cpu_threads_per_persistent_worker(slots: list[WorkerSlot]) -> int:
     return max(1, min(int(slot.cpu_threads) for slot in slots))
 
 
+def _render_runtime_env(base_env: Mapping[str, str], python_bin: Path | None) -> dict[str, str]:
+    env: dict[str, str] = {"PYOPENGL_PLATFORM": str(base_env.get("PYOPENGL_PLATFORM", "egl"))}
+    if python_bin is None:
+        return env
+
+    env_root = Path(python_bin).expanduser().parent.parent
+    env_bin = env_root / "bin"
+    existing_path = str(base_env.get("PATH", ""))
+    if env_bin.is_dir():
+        env["PATH"] = ":".join(
+            [str(env_bin)] + [part for part in existing_path.split(":") if part and part != str(env_bin)]
+        )
+    env["TORCH_EXTENSIONS_DIR"] = str(
+        base_env.get("TORCH_EXTENSIONS_DIR")
+        or "/team/telenav/code/torch_extensions/navdp_cuda121"
+    )
+    env["TORCH_CUDA_ARCH_LIST"] = str(base_env.get("TORCH_CUDA_ARCH_LIST") or "9.0")
+    lib_dirs = [env_root / "lib"]
+    lib_dirs.extend(sorted((env_root / "lib").glob("python*/site-packages/torch/lib")))
+    cuda_home = Path(str(base_env.get("CUDA_HOME") or "/usr/local/cuda-12.9")).expanduser()
+    env["CUDA_HOME"] = str(cuda_home)
+    lib_dirs.append(cuda_home / "lib64")
+    lib_dirs.append(Path("/usr/local/cuda-12.9/lib64"))
+
+    existing = str(base_env.get("LD_LIBRARY_PATH", ""))
+    parts: list[str] = []
+    for lib_dir in lib_dirs:
+        if lib_dir.is_dir():
+            lib_dir_str = str(lib_dir)
+            if lib_dir_str not in parts:
+                parts.append(lib_dir_str)
+    parts.extend(part for part in existing.split(":") if part and part not in parts)
+    if parts:
+        env["LD_LIBRARY_PATH"] = ":".join(parts)
+    return env
+
+
 def _worker_env(
     *,
     base_env: Mapping[str, str],
     slot: WorkerSlot,
     ffmpeg_bin: Path | None = None,
+    python_bin: Path | None = None,
 ) -> dict[str, str]:
     env = {str(k): str(v) for k, v in base_env.items()}
     thread_count = str(max(1, int(slot.cpu_threads)))
+    env.update(_render_runtime_env(env, python_bin))
     env.update(
         {
             "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
@@ -565,7 +610,7 @@ def _render_family(
         shutil.rmtree(family_dir)
     shutil.copytree(src_family, family_dir)
 
-    env = _worker_env(base_env=os.environ, slot=slot, ffmpeg_bin=args.ffmpeg_bin)
+    env = _worker_env(base_env=os.environ, slot=slot, ffmpeg_bin=args.ffmpeg_bin, python_bin=args.python_bin)
     manifest_json = family_dir / "render_manifest.json"
     plan_json = family_dir / "render_plan.json"
     base_cmd = [
@@ -747,6 +792,10 @@ def _persistent_plan_command(args: argparse.Namespace, *, slots: list[WorkerSlot
         str(float(args.actor_plan_ram_mib)),
         "--include-execution",
     ]
+    if bool(args.scene_affinity):
+        command.append("--scene-affinity")
+    else:
+        command.append("--no-scene-affinity")
     if args.minimal_frames is not None and int(args.minimal_frames) > 0:
         command.extend(["--minimal-frames", str(int(args.minimal_frames))])
     for family in args.family or []:
@@ -845,7 +894,8 @@ def _persistent_report_command(args: argparse.Namespace) -> list[str]:
 
 
 def _persistent_runner_env(args: argparse.Namespace) -> dict[str, str]:
-    env = {"GAUSSIAN_RENDER_BACKEND": "gsplat"}
+    env = _render_runtime_env(os.environ, args.python_bin)
+    env["GAUSSIAN_RENDER_BACKEND"] = "gsplat"
     if args.ffmpeg_bin is not None:
         env["IMAGEIO_FFMPEG_EXE"] = str(args.ffmpeg_bin)
         env["FFMPEG_BIN"] = str(args.ffmpeg_bin)
@@ -894,6 +944,7 @@ def _run_persistent_pipeline(args: argparse.Namespace) -> int:
         "max_renders": int(args.max_renders or 0),
         "renders_per_family_source_scene": int(args.renders_per_family_source_scene or 0),
         "max_items_per_chunk": int(args.max_items_per_chunk or 0),
+        "scene_affinity": bool(args.scene_affinity),
         "group_max_labels_per_command": int(args.group_max_labels_per_command or 0),
         "command_attempts": int(args.command_attempts or 1),
         "run_render": bool(args.run_render),

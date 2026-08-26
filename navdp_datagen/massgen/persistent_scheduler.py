@@ -280,6 +280,7 @@ def assign_chunks_to_gpus(
     chunks: Sequence[SceneChunk],
     *,
     gpu_ids: Sequence[str],
+    scene_affinity: bool = True,
 ) -> tuple[GpuAssignment, ...]:
     if not gpu_ids:
         raise ValueError("at least one GPU id is required")
@@ -289,10 +290,11 @@ def assign_chunks_to_gpus(
     lane_gpu_id: dict[str, str] = {assignment_id: gpu_id for assignment_id, gpu_id in lanes}
     scene_owner: dict[str, str] = {}
     for chunk in chunks:
-        assignment_id = scene_owner.get(chunk.scene_id)
+        assignment_id = scene_owner.get(chunk.scene_id) if scene_affinity else None
         if assignment_id is None:
             assignment_id = min(load, key=lambda item: (load[item], item))
-            scene_owner[chunk.scene_id] = assignment_id
+            if scene_affinity:
+                scene_owner[chunk.scene_id] = assignment_id
         assignments[assignment_id].append(chunk)
         load[assignment_id] += max(1, int(chunk.frame_count_hint))
     return tuple(
@@ -311,10 +313,15 @@ def build_persistent_gpu_schedule(
     gpu_ids: Sequence[str],
     max_items_per_chunk: int = 0,
     estimates: ResourceEstimates | None = None,
+    scene_affinity: bool = True,
 ) -> PersistentGpuSchedule:
     work_items = build_work_items_from_render_plan(plan_payload, estimates=estimates)
     chunks = build_scene_chunks(work_items, max_items_per_chunk=max_items_per_chunk)
-    assignments = assign_chunks_to_gpus(chunks, gpu_ids=gpu_ids)
+    assignments = assign_chunks_to_gpus(
+        chunks,
+        gpu_ids=gpu_ids,
+        scene_affinity=bool(scene_affinity),
+    )
     return PersistentGpuSchedule(
         assignments=assignments,
         chunks=chunks,

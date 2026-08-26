@@ -25,10 +25,12 @@ The H100 profile is separate because H100 does not provide NVENC/RT video encode
 ## Example
 
 ```sh
-python scripts/massgen/run_family_rollout_h100.py \
+H100_PYTHON=/team/telenav/code/conda_envs/navdp_cuda121/bin/python
+
+"${H100_PYTHON}" scripts/massgen/run_family_rollout_h100.py \
   --package-root /path/to/massgen_package \
   --results-root /path/to/h100_results \
-  --python-bin /path/to/env/bin/python \
+  --python-bin "${H100_PYTHON}" \
   --gpu-devices 0,1,2,3 \
   --cpu-cores 120 \
   --jobs-per-gpu 4 \
@@ -114,16 +116,23 @@ from the mirrored checkout. Keep the mirror separate from 5880-specific
 checkouts and keep output under the platform data mount, for example:
 
 ```text
-/mnt/<h100-data>/dongjk/navdp_data/
-  Navdp_Datagen/                  # git mirror, branch massgen
+/team/telenav/
+  code/Navdp_Datagen/             # git mirror, branch massgen
   massgen_packages/<package>/     # copied package from pathplanner output
   h100_results/<run-id>/          # persistent output root
 ```
 
+On the current H100 platform, only `/team` and `/private` are persistent. Keep
+code under `/team/telenav/code`; do not rely on `/root`, `/dev/shm`, or the
+container root filesystem surviving a restart.
+
 Before the first full run, verify:
 
 - `python-bin` points at the CUDA/PyTorch/gsplat environment;
+- `run_family_rollout_h100.py` can derive `PYOPENGL_PLATFORM=egl` and
+  `<python-env>/lib` on `LD_LIBRARY_PATH` from `--python-bin`; direct renderer
+  invocations should export those values explicitly;
 - `render_label_paths_telesim.py` can import TeleSim3D from the mirrored repo;
-- `/mnt/.../human_gs_source` and scene roots referenced by the package exist;
+- `/team/...` or `/private/...` human/avatar and scene roots referenced by the package exist;
 - `nvidia-smi` sees the requested H100 ids;
 - `taskset` is installed if CPU affinity is desired.

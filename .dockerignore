@@ -16,6 +16,10 @@ logs
 reports
 task_outputs
 
+SIBR_viewers
+TeleSim3D
+submodules
+
 *.mp4
 *.mov
 *.avi
@@ -24,7 +28,3 @@ task_outputs
 *.jpg
 *.jpeg
 *.gif
-
-submodules/**/build
-submodules/**/dist
-submodules/**/*.egg-info

@@ -169,6 +169,23 @@ def _summary(values: list[float]) -> dict[str, Any]:
     }
 
 
+def _sample_gpu_id(sample: Mapping[str, Any]) -> str:
+    value = sample.get("gpu_index", sample.get("index", "unknown"))
+    return str(value)
+
+
+def _samples_for_gpu(samples: list[dict[str, Any]], gpu_id: str) -> list[dict[str, Any]]:
+    return [sample for sample in samples if _sample_gpu_id(sample) == str(gpu_id)]
+
+
+def _intervals_for_gpu(intervals: list[dict[str, Any]], gpu_id: str) -> list[dict[str, Any]]:
+    return [interval for interval in intervals if str(interval.get("gpu_id")) == str(gpu_id)]
+
+
+def _safe_artifact_token(value: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in str(value)) or "unknown"
+
+
 def _gpu_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
     if not samples:
         return {"sample_count": 0}
@@ -181,6 +198,13 @@ def _gpu_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "samples_ge50_pct": 100.0 * sum(1 for value in util if value >= 50.0) / len(util),
         "samples_ge80_pct": 100.0 * sum(1 for value in util if value >= 80.0) / len(util),
         "memory_used_gib": _summary([value / 1024.0 for value in memory]),
+    }
+
+
+def _gpu_summary_by_gpu(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        gpu_id: _gpu_summary(_samples_for_gpu(samples, gpu_id))
+        for gpu_id in sorted({_sample_gpu_id(sample) for sample in samples})
     }
 
 
@@ -385,7 +409,7 @@ def _worker_lane_rows(clipped: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-def _plot_gpu_timeline(samples: list[dict[str, Any]], path: Path) -> None:
+def _plot_gpu_timeline(samples: list[dict[str, Any]], path: Path, *, title: str = "GPU/VRAM Timeline") -> None:
     import matplotlib
 
     matplotlib.use("Agg")
@@ -410,7 +434,7 @@ def _plot_gpu_timeline(samples: list[dict[str, Any]], path: Path) -> None:
         lines, labels = ax.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
         ax.legend(lines + lines2, labels + labels2, loc="upper right")
-    ax.set_title("GPU/VRAM Timeline")
+    ax.set_title(title)
     ax.set_xlabel("minutes from trace start")
     ax.set_ylabel("GPU util %")
     fig.savefig(path, dpi=180)
@@ -645,6 +669,8 @@ def main() -> int:
                 if interval.get("gpu_id")
             }
         )
+    if not physical_gpu_ids:
+        physical_gpu_ids = sorted({_sample_gpu_id(sample) for sample in samples})
     assignment_count = summary.get("schedule_assignment_count") or len(assignment_ids)
     natural_payload = (
         _load_json(args.natural_length_json.expanduser().resolve())
@@ -674,6 +700,66 @@ def main() -> int:
         path=graphs_root / "full_run_stage_overlay.png",
         title="Full run: GPU/VRAM with worker lifecycle lanes",
     )
+    per_gpu_artifacts: list[dict[str, Any]] = []
+    per_gpu_stage_rows: dict[str, Any] = {}
+    for gpu_id in physical_gpu_ids:
+        gpu_samples = _samples_for_gpu(samples, gpu_id)
+        gpu_intervals = _intervals_for_gpu(intervals, gpu_id)
+        if not gpu_samples and not gpu_intervals:
+            continue
+        safe_gpu = _safe_artifact_token(gpu_id)
+        gpu_stage_rows, gpu_clipped = _stage_summary(
+            intervals=gpu_intervals,
+            samples=gpu_samples,
+            window_start=window_start,
+            window_end=window_end,
+        )
+        gpu_lane_rows = _worker_lane_rows(gpu_clipped)
+        gpu_full_stage_rows, gpu_full_clipped = _stage_summary(
+            intervals=gpu_intervals,
+            samples=gpu_samples,
+            window_start=full_window_start,
+            window_end=full_window_end,
+        )
+        gpu_full_lane_rows = _worker_lane_rows(gpu_full_clipped)
+        _write_csv(tables_root / f"gpu_{safe_gpu}_first_window_stage_summary.csv", gpu_stage_rows)
+        _write_csv(tables_root / f"gpu_{safe_gpu}_first_window_worker_lanes.csv", gpu_lane_rows)
+        _write_csv(tables_root / f"gpu_{safe_gpu}_full_run_stage_summary.csv", gpu_full_stage_rows)
+        _write_csv(tables_root / f"gpu_{safe_gpu}_full_run_worker_lanes.csv", gpu_full_lane_rows)
+        timeline = graphs_root / f"gpu_{safe_gpu}_vram_timeline.png"
+        first_overlay = graphs_root / f"gpu_{safe_gpu}_first_window_stage_overlay.png"
+        full_overlay = graphs_root / f"gpu_{safe_gpu}_full_run_stage_overlay.png"
+        _plot_gpu_timeline(gpu_samples, timeline, title=f"GPU {gpu_id}/VRAM Timeline")
+        _plot_stage_overlay(
+            samples=gpu_samples,
+            clipped=gpu_clipped,
+            window_start=window_start,
+            window_min=actual_window_min or float(args.stage_window_min),
+            path=first_overlay,
+            title=f"GPU {gpu_id}: first {(actual_window_min or float(args.stage_window_min)):.2f} minutes",
+        )
+        _plot_stage_overlay(
+            samples=gpu_samples,
+            clipped=gpu_full_clipped,
+            window_start=full_window_start,
+            window_min=full_window_min,
+            path=full_overlay,
+            title=f"GPU {gpu_id}: full run with worker lifecycle lanes",
+        )
+        per_gpu_stage_rows[gpu_id] = {
+            "first_window_stage_rows": gpu_stage_rows,
+            "first_window_worker_lanes": gpu_lane_rows,
+            "full_run_stage_rows": gpu_full_stage_rows,
+            "full_run_worker_lanes": gpu_full_lane_rows,
+        }
+        per_gpu_artifacts.append(
+            {
+                "gpu_id": gpu_id,
+                "timeline": timeline.relative_to(output_root).as_posix(),
+                "first_window_stage_overlay": first_overlay.relative_to(output_root).as_posix(),
+                "full_run_stage_overlay": full_overlay.relative_to(output_root).as_posix(),
+            }
+        )
 
     rollup = {
         "schema_version": "persistent_h100_schedule_run_report.v1",
@@ -694,6 +780,7 @@ def main() -> int:
             "render_overhead_summary": summary.get("render_overhead_summary"),
         },
         "gpu_summary": gpu_summary,
+        "gpu_summary_by_gpu": _gpu_summary_by_gpu(samples),
         "requested_first_window_min": float(args.stage_window_min),
         "actual_first_window_min": actual_window_min,
         "actual_full_window_min": full_window_min,
@@ -701,6 +788,8 @@ def main() -> int:
         "first_window_worker_lanes": lane_rows,
         "full_run_stage_rows": full_stage_rows,
         "full_run_worker_lanes": full_lane_rows,
+        "per_gpu_stage_rows": per_gpu_stage_rows,
+        "per_gpu_artifacts": per_gpu_artifacts,
         "natural_length_projection": natural_payload,
     }
     _write_json(metrics_root / "summary_metrics.json", rollup)
@@ -711,6 +800,17 @@ def main() -> int:
     lane_table_rows = lane_rows[:12]
     full_stage_table_rows = full_stage_rows[:8]
     full_lane_table_rows = full_lane_rows[:12]
+    per_gpu_artifact_lines = "\n".join(
+        (
+            f"- GPU {item['gpu_id']}: "
+            f"[timeline]({item['timeline']}), "
+            f"[first-window overlay]({item['first_window_stage_overlay']}), "
+            f"[full-run overlay]({item['full_run_stage_overlay']})"
+        )
+        for item in per_gpu_artifacts
+    )
+    if not per_gpu_artifact_lines:
+        per_gpu_artifact_lines = "- No per-GPU artifacts were generated."
     natural_section = ""
     if natural_payload:
         overall = natural_payload.get("overall", {})
@@ -777,6 +877,7 @@ Generated: {datetime.now().isoformat(timespec="seconds")}
 - [GPU/VRAM timeline](assets/graphs/gpu_vram_timeline.png)
 - [First-window stage overlay](assets/graphs/first_window_stage_overlay.png)
 - [Full-run stage overlay](assets/graphs/full_run_stage_overlay.png)
+{per_gpu_artifact_lines}
 - [summary_metrics.json](metrics/summary_metrics.json)
 - [first_window_stage_summary.csv](assets/tables/first_window_stage_summary.csv)
 - [first_window_worker_lanes.csv](assets/tables/first_window_worker_lanes.csv)

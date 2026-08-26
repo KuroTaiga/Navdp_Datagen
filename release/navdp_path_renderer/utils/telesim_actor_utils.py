@@ -22,6 +22,8 @@ DEFAULT_ACTOR_PATTERN = "*.ply"
 DEFAULT_ACTOR_SPEED = 1.3
 
 _DIGIT_PATTERN = re.compile(r"(\d+)")
+_BROAD_ACTOR_PATTERNS = {"", "*", "*.ply"}
+_ANIMATION_FRAME_PATTERNS = ("frame_*.ply", "[0-9][0-9][0-9][0-9][0-9][0-9].ply")
 
 
 class PathSampler:
@@ -136,6 +138,14 @@ def list_actor_frame_paths_in_dir(sequence_dir: Path, *, pattern: str = "*.ply")
     if not sequence_dir.is_dir():
         return []
     pattern = pattern or "*.ply"
+
+    if pattern in _BROAD_ACTOR_PATTERNS:
+        for animation_pattern in _ANIMATION_FRAME_PATTERNS:
+            frames = [path for path in sequence_dir.glob(animation_pattern) if path.is_file()]
+            frames = [path for path in frames if path.suffix.lower() == ".ply"]
+            if frames:
+                return sorted(frames, key=natural_sort_key)
+
     initial = [path for path in sequence_dir.glob(pattern) if path.is_file()]
     initial = [path for path in initial if path.suffix.lower() == ".ply"]
     if not initial:
@@ -151,6 +161,14 @@ def list_actor_frame_paths_recursive(root: Path, *, pattern: str = "*.ply") -> l
     if root is None or not root.is_dir():
         return []
     pattern = pattern or "*.ply"
+
+    if pattern in _BROAD_ACTOR_PATTERNS:
+        for animation_pattern in _ANIMATION_FRAME_PATTERNS:
+            frames = [path for path in root.rglob(animation_pattern) if path.is_file()]
+            frames = [path for path in frames if path.suffix.lower() == ".ply"]
+            if frames:
+                return sorted(frames, key=lambda p: p.as_posix())
+
     initial = [path for path in root.rglob(pattern) if path.is_file()]
     initial = [path for path in initial if path.suffix.lower() == ".ply"]
     if not initial:

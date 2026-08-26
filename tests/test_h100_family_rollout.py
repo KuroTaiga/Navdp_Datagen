@@ -39,11 +39,15 @@ def test_build_worker_slots_respects_max_workers_and_cpu_override() -> None:
 
 def test_worker_env_pins_gpu_and_thread_budget(tmp_path: Path) -> None:
     slot = h100.WorkerSlot(slot_id=2, gpu_id="3", cpu_cores=(12, 13, 14), cpu_threads=3)
+    env_root = tmp_path / "env"
+    (env_root / "bin").mkdir(parents=True)
+    (env_root / "lib").mkdir()
 
     env = h100._worker_env(
         base_env={"PATH": "/bin"},
         slot=slot,
         ffmpeg_bin=tmp_path / "ffmpeg",
+        python_bin=env_root / "bin" / "python",
     )
 
     assert env["CUDA_VISIBLE_DEVICES"] == "3"
@@ -53,16 +57,23 @@ def test_worker_env_pins_gpu_and_thread_budget(tmp_path: Path) -> None:
     assert env["OPENBLAS_NUM_THREADS"] == "3"
     assert env["TORCH_NUM_THREADS"] == "3"
     assert env["GAUSSIAN_RENDER_BACKEND"] == "gsplat"
+    assert env["PYOPENGL_PLATFORM"] == "egl"
+    assert env["LD_LIBRARY_PATH"] == str(env_root / "lib")
     assert env["IMAGEIO_FFMPEG_EXE"] == str(tmp_path / "ffmpeg")
 
 
 def test_persistent_runner_env_forwards_ffmpeg_override(tmp_path: Path) -> None:
+    env_root = tmp_path / "env"
+    (env_root / "bin").mkdir(parents=True)
+    (env_root / "lib").mkdir()
     args = h100._parse_args(
         [
             "--package-root",
             str(tmp_path / "package"),
             "--results-root",
             str(tmp_path / "results"),
+            "--python-bin",
+            str(env_root / "bin" / "python"),
             "--ffmpeg-bin",
             str(tmp_path / "bin" / "ffmpeg"),
         ]
@@ -71,6 +82,8 @@ def test_persistent_runner_env_forwards_ffmpeg_override(tmp_path: Path) -> None:
     env = h100._persistent_runner_env(args)
 
     assert env["GAUSSIAN_RENDER_BACKEND"] == "gsplat"
+    assert env["PYOPENGL_PLATFORM"] == "egl"
+    assert env["LD_LIBRARY_PATH"].split(":")[0] == str(env_root / "lib")
     assert env["IMAGEIO_FFMPEG_EXE"] == str(tmp_path / "bin" / "ffmpeg")
     assert env["FFMPEG_BIN"] == str(tmp_path / "bin" / "ffmpeg")
 
