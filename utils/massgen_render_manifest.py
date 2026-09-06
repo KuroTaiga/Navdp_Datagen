@@ -28,6 +28,11 @@ ACTIVE_MASS_MISSION_FAMILIES = (
     "dense_dynamic_avoidance",
     "dense_multi_robot",
     "mission_stream",
+    "interruption_recovery",
+    "multi_robot_handoff",
+    "escort_and_rendezvous",
+    "implicit_need_fulfillment",
+    "conflict_resolution",
     "deliver_to_human",
     "navigate_with_social_constraints",
 )
@@ -39,6 +44,7 @@ MULTI_ROBOT_MISSION_FAMILIES = (
     "dense_multi_robot",
     "dense_dynamic_combined",
     "mission_stream",
+    "multi_robot_handoff",
 )
 
 def load_json(path: str | Path) -> JsonDict:
@@ -546,6 +552,15 @@ def _mission_target_action_hint(mission_type: str) -> str:
     if mission_type == "serve_queue":
         return "queue_wait"
     if mission_type == "human_guided_uncertain_region":
+        return "wave"
+    if mission_type == "escort_and_rendezvous":
+        return "walk"
+    if mission_type in {
+        "interruption_recovery",
+        "multi_robot_handoff",
+        "implicit_need_fulfillment",
+        "conflict_resolution",
+    }:
         return "wave"
     return "stand"
 

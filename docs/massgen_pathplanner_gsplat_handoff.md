@@ -151,6 +151,11 @@ Pathplanner schema mission types:
 - `human_guided_uncertain_region`
 - `human_guided_person_disambiguation`
 - `human_guided_route_correction`
+- `interruption_recovery`
+- `multi_robot_handoff`
+- `escort_and_rendezvous`
+- `implicit_need_fulfillment`
+- `conflict_resolution`
 - `dense_dynamic_avoidance`
 - `dense_dynamic_humans`
 - `dense_multi_robot`
@@ -165,6 +170,11 @@ Pathplanner active MassGen mission types:
 - `dense_dynamic_avoidance`
 - `dense_multi_robot`
 - `mission_stream`
+- `interruption_recovery`
+- `multi_robot_handoff`
+- `escort_and_rendezvous`
+- `implicit_need_fulfillment`
+- `conflict_resolution`
 - `deliver_to_human`
 - `navigate_with_social_constraints`
 

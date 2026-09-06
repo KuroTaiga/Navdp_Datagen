@@ -124,7 +124,11 @@ def _scenario(
 
 @pytest.mark.parametrize("mission_family", ACTIVE_MASS_MISSION_FAMILIES)
 def test_active_mission_family_gets_gsplat_render_jobs(mission_family: str) -> None:
-    robot_count = 2 if mission_family in {"dense_multi_robot", "dense_dynamic_combined", "mission_stream"} else 1
+    robot_count = (
+        2
+        if mission_family in {"dense_multi_robot", "dense_dynamic_combined", "mission_stream", "multi_robot_handoff"}
+        else 1
+    )
     scenario = _scenario(
         mission_family,
         robots=[_robot(f"robot_{idx}", idx) for idx in range(robot_count)],
@@ -195,6 +199,37 @@ def test_mission_specific_human_action_hints_are_preserved() -> None:
     informant = guided_manifest["actors"]["humans"][0]
     assert any(binding["action_hint"] == "wave" for binding in informant["mission_bindings"])
     assert informant["action_segments"][0]["render_action_id"] == "wave"
+
+
+@pytest.mark.parametrize(
+    ("mission_family", "expected_hint"),
+    [
+        ("interruption_recovery", "wave"),
+        ("multi_robot_handoff", "wave"),
+        ("escort_and_rendezvous", "walk"),
+        ("implicit_need_fulfillment", "wave"),
+        ("conflict_resolution", "wave"),
+    ],
+)
+def test_novelty_family_human_action_hints_are_manifest_ready(mission_family: str, expected_hint: str) -> None:
+    robots = (
+        [_robot("robot_alpha", 0), _robot("robot_beta", 1)]
+        if mission_family == "multi_robot_handoff"
+        else [_robot("robot_alpha", 0)]
+    )
+    scenario = _scenario(
+        mission_family,
+        robots=robots,
+        humans=[_human("human_0", role="target", tags=["target"])],
+    )
+    scenario["missions"][0]["target_human_id"] = "human_0"
+    scenario["missions"][0]["metadata"] = {"active_robot_ids": [robot["robot_id"] for robot in robots]}
+
+    manifest = scenario_to_render_manifest(scenario, action_catalog=_action_catalog())
+
+    target = manifest["actors"]["humans"][0]
+    assert any(binding["action_hint"] == expected_hint for binding in target["mission_bindings"])
+    assert not any("unknown mission family" in warning for warning in manifest["warnings"])
 
 
 def test_explicit_training_robot_ids_control_viewpoints() -> None:
