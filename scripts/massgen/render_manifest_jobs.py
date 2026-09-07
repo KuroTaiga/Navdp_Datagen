@@ -16,6 +16,7 @@ from navdp_datagen.massgen.render_executor import (  # noqa: E402
     format_plan_text,
     load_render_manifest,
 )
+from navdp_datagen.massgen.frame_selection import apply_frame_selection_to_manifest, load_json  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -23,6 +24,15 @@ def _parse_args() -> argparse.Namespace:
         description="Plan or execute MassGen render jobs from a render manifest."
     )
     parser.add_argument("--manifest-json", type=Path, required=True)
+    parser.add_argument(
+        "--frame-selection-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional frame-interest selection manifest. When provided, only the "
+            "selected 32+current+32 window jobs are planned/rendered."
+        ),
+    )
     parser.add_argument(
         "--summary-json",
         type=Path,
@@ -132,6 +142,20 @@ def main() -> int:
             return 2
     output_root = args.output_root or (args.manifest_json.resolve().parent / "render_jobs")
     manifest = load_render_manifest(args.manifest_json)
+    frame_selection_summary = None
+    if args.frame_selection_json is not None:
+        selection = load_json(args.frame_selection_json)
+        selection["selection_path"] = str(args.frame_selection_json)
+        manifest = apply_frame_selection_to_manifest(
+            manifest,
+            selection,
+            manifest_path=args.manifest_json,
+        )
+        frame_selection_summary = {
+            "selection_json": str(args.frame_selection_json),
+            "selected_window_count": len(manifest.get("jobs", [])),
+            "source_manifest_json": str(args.manifest_json),
+        }
     plan_payload = build_render_plans(
         manifest,
         manifest_path=args.manifest_json,
@@ -162,6 +186,8 @@ def main() -> int:
         robot_glb_up_axis=str(args.robot_glb_up_axis),
         robot_target_height=args.robot_target_height,
     )
+    if frame_selection_summary is not None:
+        plan_payload["frame_selection"] = frame_selection_summary
     if summary is not None:
         plan_payload["summary_status"] = summary.get("status") if isinstance(summary, dict) else None
     if args.json:

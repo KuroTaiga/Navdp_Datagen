@@ -227,6 +227,13 @@ def format_plan_text(plan_payload: Mapping[str, Any]) -> str:
             f"jobs={plan_payload.get('job_count')} output_root={plan_payload.get('output_root')}"
         )
     ]
+    frame_selection = plan_payload.get("frame_selection")
+    if isinstance(frame_selection, Mapping):
+        lines.append(
+            "Frame selection: "
+            f"{frame_selection.get('selected_window_count')} selected window job(s) "
+            f"from {frame_selection.get('selection_json')}"
+        )
     for plan in plan_payload.get("plans", []):
         if not isinstance(plan, Mapping):
             continue
@@ -419,9 +426,19 @@ def _build_job_plan(
         command.append("--save-depth-maps")
     if effective_save_rgb_frames:
         command.append("--rgb-frames")
+    human_ids = [str(item) for item in job.get("human_actor_ids", [])]
+    frame_count_hint = _job_camera_frame_count(job)
+    if (
+        _job_frame_selection_enabled(job)
+        and minimal_frames is not None
+        and 0 < int(minimal_frames) < int(frame_count_hint)
+    ):
+        blockers.append(
+            "minimal_frames would truncate a selected frame-interest window "
+            f"({minimal_frames} < {frame_count_hint})"
+        )
     if minimal_frames is not None and int(minimal_frames) > 0:
         command.extend(["--minimal-frames", str(int(minimal_frames))])
-    human_ids = [str(item) for item in job.get("human_actor_ids", [])]
     robot_overlay_commands, robot_overlay_paths, robot_blockers, robot_warnings = _peer_robot_overlay_bundle(
         manifest,
         job,
@@ -442,7 +459,7 @@ def _build_job_plan(
         write_inputs=write_inputs,
         fps=fps,
         scene_dir=scene_dir,
-        frame_count_hint=len(_trajectory_world_points(job.get("camera", {}).get("trajectory", []))),
+        frame_count_hint=frame_count_hint,
     )
     blockers.extend(robot_blockers)
     warnings.extend(robot_warnings)
@@ -453,7 +470,7 @@ def _build_job_plan(
         base_dir=manifest_base,
         actor_plan_path=tasks_root / scene_id / "actor_plans" / f"{job_id}.json",
         scene_dir=scene_dir,
-        frame_count_hint=len(_trajectory_world_points(job.get("camera", {}).get("trajectory", []))),
+        frame_count_hint=frame_count_hint,
     )
     blockers.extend(human_blockers)
     warnings.extend(human_warnings)
@@ -885,16 +902,21 @@ def _resolve_path(value: str, *, base_dir: Path) -> Path:
 
 
 def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Path) -> None:
-    trajectory = job.get("camera", {}).get("trajectory", [])
+    camera = job.get("camera", {})
+    if not isinstance(camera, Mapping):
+        raise ValueError("job.camera must be an object")
+    trajectory = camera.get("trajectory", [])
     if not isinstance(trajectory, list):
         raise ValueError("job.camera.trajectory must be a list")
-    points = _trajectory_world_points(trajectory)
+    preserve_samples = _job_preserve_frame_samples(job)
+    points = _trajectory_world_points(trajectory, preserve_stationary_samples=preserve_samples)
     if len(points) < 2:
         raise ValueError("job.camera.trajectory must contain at least two distinct positions")
     meta = _load_occupancy_metadata_for_label(scene_dir)
     raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in points]
     raster_pixel = [list(_scene_xy_to_pixel(meta, float(x), float(y))) for x, y, _ in points]
     coordinate_pipeline = _coordinate_pipeline_metadata(meta)
+    camera_metadata = dict(camera.get("metadata", {})) if isinstance(camera.get("metadata"), Mapping) else {}
     payload = {
         "ins_id": str(job.get("job_id") or label_path.stem),
         "scene_id": str(job.get("scene_id") or scene_dir.name),
@@ -911,6 +933,8 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
             "source_coordinate_frame": "pathplanner_left_handed",
             "coordinate_transform": "identity_xy",
             "coordinate_pipeline": coordinate_pipeline["label_path"],
+            "preserve_frame_samples": preserve_samples,
+            "camera": camera_metadata,
         },
     }
     label_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1071,7 +1095,40 @@ def _wrap_angle(value: float) -> float:
     return (float(value) + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _trajectory_world_points(trajectory: Sequence[Any]) -> list[tuple[float, float, float]]:
+def _job_preserve_frame_samples(job: Mapping[str, Any]) -> bool:
+    camera = job.get("camera", {})
+    if not isinstance(camera, Mapping):
+        return False
+    metadata = camera.get("metadata", {})
+    return bool(
+        camera.get("preserve_frame_samples")
+        or (isinstance(metadata, Mapping) and metadata.get("preserve_frame_samples"))
+        or job.get("frame_selection")
+    )
+
+
+def _job_frame_selection_enabled(job: Mapping[str, Any]) -> bool:
+    return bool(job.get("frame_selection"))
+
+
+def _job_camera_frame_count(job: Mapping[str, Any]) -> int:
+    camera = job.get("camera", {})
+    trajectory = camera.get("trajectory", []) if isinstance(camera, Mapping) else []
+    if not isinstance(trajectory, Sequence):
+        return 0
+    return len(
+        _trajectory_world_points(
+            trajectory,
+            preserve_stationary_samples=_job_preserve_frame_samples(job),
+        )
+    )
+
+
+def _trajectory_world_points(
+    trajectory: Sequence[Any],
+    *,
+    preserve_stationary_samples: bool = False,
+) -> list[tuple[float, float, float]]:
     points: list[tuple[float, float, float]] = []
     for item in trajectory:
         if not isinstance(item, Mapping):
@@ -1082,7 +1139,7 @@ def _trajectory_world_points(trajectory: Sequence[Any]) -> list[tuple[float, flo
         x = float(raw_position[0])
         y = float(raw_position[1])
         z = float(raw_position[2]) if len(raw_position) > 2 else 0.0
-        if points and math.dist(points[-1][:2], (x, y)) < 1e-4:
+        if not preserve_stationary_samples and points and math.dist(points[-1][:2], (x, y)) < 1e-4:
             continue
         points.append((x, y, z))
     return points

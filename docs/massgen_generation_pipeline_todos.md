@@ -26,6 +26,9 @@ The renderer must support:
 - import of robot sensor settings from an Isaac Sim/OpenUSD-compatible rig
   description instead of hard-coded per-script camera constants;
 - multi-GPU server scheduling.
+- frame-interest selection before rendering, so each selected train/test target
+  renders its required 32-past/current/32-future context instead of rendering
+  full paths by default.
 
 ## Mission Family Rendering Needs
 
@@ -249,7 +252,29 @@ Remaining:
 - [ ] Use the report to decide whether the next optimization target is
   video/photo output, human PLY transform/merge, or Gaussian rendering.
 
-### 8. Isaac Sim/OpenUSD Sensor Rig Import
+### 8. Frame-Interest Selection Before Rendering
+
+- [x] Add an adaptive dense-navigation frame selector based on interest buckets:
+  `critical_margin`, `human_interaction`, `route_decision`, and
+  `representative_motion`.
+- [x] Keep secondary action balancing configurable with defaults of
+  `stop=0.20`, `move=0.40`, `turn_left=0.20`, and `turn_right=0.20`.
+- [x] Expand every selected frame of interest to a 65-frame render contract:
+  32 past frames, current frame, and 32 future frames.
+- [x] Emit `navdp_frame_interest_selection/v0.1` manifests with selected chunks,
+  distribution summaries, and unique source-frame reuse counts.
+- [x] Add `scripts/massgen/select_frame_interest_windows.py` for selection-only
+  and selected-render-manifest export workflows.
+- [x] Allow `scripts/massgen/render_manifest_jobs.py --frame-selection-json` to
+  plan/render only selected 65-frame window jobs.
+- [x] Preserve repeated stationary/yield samples by carrying
+  `camera.preserve_frame_samples` through render executor label-path generation
+  and TeleSim path preparation.
+- [ ] Replace one-window-per-target execution with true sparse unique-source
+  frame rendering when the renderer supports frame-id-addressed outputs.
+- [ ] Execute selector/render-plan tests after testing is available again.
+
+### 9. Isaac Sim/OpenUSD Sensor Rig Import
 
 - [x] Document fallback camera/sensor profiles and the comparison between
   OpenUSD/Isaac Sim defaults, G1 assumptions, and previous NavDP settings in
@@ -278,7 +303,7 @@ Remaining:
 - [x] Add fixture tests for a minimal Isaac Sim/OpenUSD-style robot rig with RGB
   and depth modalities.
 
-### 9. Validation
+### 10. Validation
 
 Local macOS:
 
@@ -302,6 +327,8 @@ Local macOS:
 - [x] Multi-human human-only executor tests cover actor bundles for
   `serve_queue`, `navigate_with_social_constraints:queue_order`, and
   `dense_dynamic_humans`.
+- [ ] Frame-interest selector tests in `tests/test_frame_interest_selection.py`
+  are present but not executed in this pass per operator instruction.
 
 Server/platform:
 

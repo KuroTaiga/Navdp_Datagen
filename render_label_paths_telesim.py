@@ -531,7 +531,8 @@ def prepare_path_data(
     transformed = [
         np.array([a_x * pt[0] + b_x, a_y * pt[1] + b_y], dtype=np.float32) for pt in raw_points
     ]
-    points_xy = deduplicate_points(transformed)
+    preserve_samples = _label_preserve_frame_samples(json_path)
+    points_xy = transformed if preserve_samples else deduplicate_points(transformed)
     sampled_xy = sample_points(points_xy, stride)
     if len(sampled_xy) < 2:
         sampled_xy = points_xy
@@ -543,7 +544,7 @@ def prepare_path_data(
             np.array([center_x * 2.0 - pt[0], center_y * 2.0 - pt[1]], dtype=np.float32)
             for pt in sampled_xy
         ]
-    if resample_step > 0.0:
+    if resample_step > 0.0 and not preserve_samples:
         resampled = resample_path_by_distance(sampled_xy, resample_step)
         if len(resampled) >= 2:
             sampled_xy = resampled
@@ -552,6 +553,25 @@ def prepare_path_data(
         raw_points=raw_points,
         floor_z=float(meta["lower_z"]),
         ceiling=float(meta["upper_z"]),
+    )
+
+
+def _label_preserve_frame_samples(json_path: Path) -> bool:
+    try:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+    except Exception:  # pylint: disable=broad-except
+        return False
+    if not isinstance(payload, Mapping):
+        return False
+    metadata = payload.get("metadata", {})
+    if not isinstance(metadata, Mapping):
+        return False
+    return bool(
+        metadata.get("preserve_frame_samples")
+        or (
+            isinstance(metadata.get("camera"), Mapping)
+            and metadata["camera"].get("preserve_frame_samples")
+        )
     )
 
 
