@@ -26,8 +26,10 @@ The model contract for each selected frame of interest is:
 ```
 
 If frame `t` is selected for training or testing, the renderer must preserve and
-render all frames `t-32..t+32`. Stationary/yield/repeated-pose frames are valid
-context and must not be deduplicated away.
+render all frames `t-32..t+32`. At a required path endpoint, the nearest edge
+sample is repeated so the endpoint remains at index 32. Stationary, yield,
+edge-padded, and repeated-pose frames are valid context and must not be
+deduplicated away.
 
 ## Research Basis
 
@@ -38,11 +40,11 @@ dataset selector rather than an online RL simulator edit. Fixed action ratios
 such as 10/15/15/60 or 15/15/15/55 are therefore treated as starting heuristics,
 not as an optimal distribution.
 
-For NavDP-style navigation training, the selector uses two levels of balance:
+For NavDP-style navigation training, the selector uses two levels of guidance:
 
 1. Primary interest buckets decide which planning moments are worth rendering.
-2. Secondary action ratios prevent the selected targets from becoming all
-   forward motion or all stops.
+2. Secondary action ratios provide a soft tie-breaker and survey reference.
+   They are not quotas and do not reject an otherwise valuable point.
 
 Primary references:
 
@@ -55,7 +57,7 @@ Primary references:
 
 ## Default Distribution Policy
 
-Implemented policy: `adaptive_dense_navigation/v0.1`.
+Implemented policy: `whole_path_frame_interest_survey/v0.2`.
 
 Primary interest buckets:
 
@@ -67,9 +69,10 @@ Primary interest buckets:
 | `representative_motion` | clean motion needed for coverage after the informative states are sampled |
 
 Default bucket priors favor critical and interaction states, then route
-decisions, while bounding every bucket so representative motion remains present.
-The actual target ratios are derived from the available candidate distribution
-per run. Operators can override them with `--bucket-ratio`.
+decisions. Representative motion remains a first-class interest bucket. The
+actual target ratios are derived from the available candidate distribution per
+run, and operators can override them with `--bucket-ratio`. These priors guide
+which scored points are selected; they are not hard caps on action types.
 
 Secondary action target ratios default to:
 
@@ -80,9 +83,10 @@ Secondary action target ratios default to:
 | turn left | `2` | 20% |
 | turn right | `3` | 20% |
 
-These ratios are configurable with `--action-ratio`. They are deliberately less
-forward-heavy than the older 45-60% move targets because forward frames also
-enter the rendered set as context around stops, turns, and interactions.
+These ratios are configurable with `--action-ratio`, but currently affect only
+soft selection priority. The survey reports action distributions at selected
+centers and across the complete retained 65-frame windows. This avoids mistaking
+a critical-state-heavy center distribution for a dataset with no forward motion.
 
 ## Inputs
 
@@ -99,10 +103,16 @@ source without changing the selected-window render contract.
 
 ## Candidate Scoring
 
+The sampler first chooses complete source paths by deterministic seeded random
+rank, then scores every frame on each chosen path. It never feeds a pre-cut path
+fragment into candidate scoring. `--max-source-paths 0` selects all eligible
+paths; a positive value selects that many whole paths.
+
 Every camera trajectory sample that can support the requested window becomes a
-candidate. The default edge policy is `reject`, so a 65-frame run only selects
-targets with 32 valid past and 32 valid future frames. `clamp` is available for
-explicit padded-edge experiments.
+candidate. The default edge policy is `reject`, so an ordinary point requires 32
+valid past and 32 valid future frames. Required sub-mission and mission endpoints
+use the configured endpoint policy, `clamp` by default, which repeats the nearest
+edge sample to preserve an exact 65-frame tensor without moving the endpoint.
 
 Each candidate stores:
 
@@ -112,25 +122,35 @@ Each candidate stores:
 - interest bucket scores and selection reasons;
 - split and target role metadata.
 
+Pathplanner trajectories may contain sparse waypoints whose integer `frame`
+values span many renderer frames. By default, the selector linearly interpolates
+position, time, and wrapped yaw across those frame-id gaps before applying the
+65-frame eligibility rule. It preserves source/interpolation provenance in point
+metadata. `--no-densify-frame-gaps` is available only for compatibility audits.
+
 Score components include actor/robot proximity, event proximity, stop/turn
 transitions, turn magnitude, and representative clean-motion coverage.
 
 ## Selection Algorithm
 
-1. Load MassGen render manifests.
-2. Build per-frame candidates from every render job trajectory.
-3. Reject candidates that cannot satisfy the requested window under the edge
-   policy.
-4. Derive adaptive interest-bucket ratios from available candidates unless the
-   run provides explicit bucket ratios.
-5. Convert bucket ratios to integer target counts.
-6. Select the best candidates per bucket using interest score, secondary action
-   deficits, deterministic seed jitter, per-job caps, and minimum target spacing.
-7. Fill any remaining target count from the global best candidates.
-8. Emit a selection manifest and optional selected-window render manifest.
+1. Load MassGen render manifests and apply mission-family filtering.
+2. Deterministically random-rank complete source paths using the run seed, then
+   retain all paths or the requested `--max-source-paths` subset.
+3. Densify each selected path and score every eligible frame on the full path.
+4. Mark assigned sub-mission completion/checkpoint frames and each trajectory end
+   as mandatory anchors.
+5. Derive adaptive interest-bucket targets for the requested scored POI budget.
+6. Add mandatory anchors first. They are additive and do not consume the scored
+   POI budget, per-path POI cap, or action-deficit counts.
+7. Select scored POIs by bucket score, soft action deficit, deterministic seed
+   jitter, and minimum spacing. Multiple POIs may come from the same path;
+   `--max-targets-per-job 0` leaves that unlimited.
+8. Fill any remaining scored POI budget from the globally best eligible frames.
+9. Emit 65-frame windows and both selection and selected-render manifests.
 
-The target frame action is used for balance; surrounding context frames do not
-count toward the action histogram.
+The manifest separately reports actions at all selected centers, scored POI
+centers, all repeated window samples, and unique retained source frames. No
+action family currently has a hard minimum, maximum, or rejection quota.
 
 ## Selection Manifest
 
@@ -144,7 +164,7 @@ count toward the action histogram.
     "past_frames": 32,
     "future_frames": 32,
     "window_frame_count": 65,
-    "distribution_policy": "adaptive_dense_navigation/v0.1"
+    "distribution_policy": "whole_path_frame_interest_survey/v0.2"
   },
   "distribution": {
     "target_bucket_ratios": {
@@ -189,8 +209,61 @@ Write a selection manifest:
 ```bash
 python3 scripts/massgen/select_frame_interest_windows.py \
   --manifest-json out/massgen/render_manifest.json \
+  --family dense_dynamic_avoidance \
+  --max-source-paths 20 \
   --target-count 1000 \
   --output-selection-json out/frame_selection/selection_manifest.json
+```
+
+Prepare the all-family pilot matrix before source manifests are connected:
+
+```bash
+python3 scripts/massgen/prepare_frame_selection_family_pilot.py \
+  --output-root out/frame_selection_family_pilot
+```
+
+This writes a non-executing `pilot_plan.json` with every active family marked
+`waiting_for_source_manifest`. Once local or mounted databank manifests are
+available, prepare selections and self-contained selected render manifests with:
+
+```bash
+python3 scripts/massgen/prepare_frame_selection_family_pilot.py \
+  --scenario-json /path/to/pathplanner_scenario.json \
+  --output-root out/frame_selection_family_pilot \
+  --targets-per-family 2 \
+  --render-repo-root /team/telenav/code/Navdp_Datagen \
+  --remote-sources-connected
+```
+
+Both repeatable `--scenario-json` and `--manifest-json` inputs are supported.
+Scenario inputs are converted into renderer-owned manifests under
+`source_render_manifests/` before family selection.
+
+The pilot generator never runs render commands. Each ready family record stores
+separate `plan_argv` and `execute_argv` arrays, both with
+`execution_authorized=false`, so operators can inspect render plans before
+explicitly launching the 65-frame jobs.
+
+The default pilot also includes four separately audited social-navigation
+variants mapped to their law ids: personal space (`L1`), pedestrian yield
+(`L2`), group integrity (`L3`), and queue order (`L4`). Dedicated single-family
+manifests are preferred over mixed `mission_stream` manifests; mixed sources are
+used only when a family has no dedicated source.
+
+For an unambiguous family comparison, source exports should contain one mission
+family per manifest or accurate job-level family bindings. If every job in a
+multi-family manifest carries every family label, the same trajectory can enter
+more than one family pilot; the pilot plan preserves that fact rather than
+guessing which mission produced the frames.
+
+Generate BEV overlays and distribution plots from a completed pilot without
+running Gaussian rendering:
+
+```bash
+python3 scripts/massgen/visualize_frame_selection_outputs.py \
+  --pilot-root out/frame_selection_family_pilot \
+  --source-manifest-root out/frame_selection_family_pilot/source_render_manifests \
+  --output-root out/frame_sampling_visualization
 ```
 
 Write both selection and selected-window render manifest:
@@ -214,7 +287,7 @@ python3 scripts/massgen/render_manifest_jobs.py \
 
 ## Renderer Integration
 
-Current implementation renders one selected-window job per selected target. Each
+Current implementation prepares one selected-window job per selected target. Each
 window job contains a 65-point camera trajectory, rewrites renderer-local frame
 ids to `0..64`, and preserves original source frame indices in metadata.
 
@@ -230,10 +303,13 @@ The selection summary reports both:
 - `unique_source_render_frame_count`: de-duplicated source frames needed across
   overlapping windows.
 
+Selections can be constrained with repeatable `--family` arguments. The
+all-family pilot generator uses that constraint to prevent multi-family source
+collections from filling one family's budget with another family's jobs.
+
 A future sparse-frame renderer can render each unique source frame once and map
-it back to every chunk. The current selected-window implementation is the
-practical next step because it prevents full-path rendering while preserving the
-65-frame model contract.
+it back to every chunk. Until then, the selected-window manifests preserve the
+65-frame model contract without authorizing or executing rendering.
 
 ## Output Layout
 
@@ -255,6 +331,9 @@ out/frame_interest_selection/<run_id>/
 
 - `navdp_datagen/massgen/frame_selection.py`
 - `scripts/massgen/select_frame_interest_windows.py`
+- `navdp_datagen/massgen/frame_selection_pilot.py`
+- `scripts/massgen/prepare_frame_selection_family_pilot.py`
+- `scripts/massgen/visualize_frame_selection_outputs.py`
 - `scripts/massgen/render_manifest_jobs.py`
 - `navdp_datagen/massgen/render_executor.py`
 - `render_label_paths_telesim.py`
@@ -263,13 +342,33 @@ out/frame_interest_selection/<run_id>/
 
 ## Validation Status
 
-Tests were added but not executed in this pass because testing is currently not
-available per operator instruction.
+Focused local selector tests and source-side remote family validation were run
+on 2026-09-08. See `docs/frame_selection_remote_validation_20260908.md` for the
+paths, discovered bugs, family matrix, and remaining render validation.
 
-Planned validation when testing resumes:
+The final non-rendering survey selected 26 scored POIs plus 27 mandatory anchors
+across 13 ready cohorts. All 53 jobs passed structural audits; 2,728 of 3,445
+retained context samples (79.2%) were forward motion. Five requested novelty
+families remain waiting for source manifests.
+
+Validated:
 
 - selector emits 65-frame windows for selected targets;
+- seeded path selection consumes complete paths and permits multiple POIs per
+  path;
+- assigned sub-mission endpoints and whole-mission endpoints are mandatory and
+  additive to the scored POI budget;
+- action ratios remain soft and center/context action distributions are reported
+  separately;
 - selected-window manifest rewrites render jobs without mutating source jobs;
 - label-path materialization preserves repeated stationary frames;
-- action and bucket deficits are reported when quotas are impossible;
-- edge-window `reject` and `clamp` policies are covered.
+- sparse Pathplanner waypoints are densified into contiguous renderer frames;
+- all active mission families produce a family-constrained 65-frame pilot when
+  a suitable local manifest exists;
+- disconnected families remain explicitly `waiting_for_source_manifest` and do
+  not authorize execution.
+
+Still required:
+
+- source scenarios for the five missing novelty families;
+- Datagen asset preflight and one rendered 65-frame window per cohort.

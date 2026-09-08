@@ -59,6 +59,11 @@ class FrameSelectionConfig:
     max_targets_per_job: int = 0
     seed: int = DEFAULT_SEED
     split: str = "train"
+    mission_families: tuple[str, ...] = ()
+    densify_frame_gaps: bool = True
+    max_source_paths: int = 0
+    preserve_mission_endpoints: bool = True
+    endpoint_window_policy: str = "clamp"
     target_bucket_ratios: Mapping[str, float] | None = None
     target_action_ratios: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_ACTION_RATIOS))
     action_deficit_weight: float = 0.35
@@ -78,12 +83,17 @@ class FrameSelectionConfig:
             "max_targets_per_job": int(self.max_targets_per_job),
             "seed": int(self.seed),
             "split": str(self.split),
+            "mission_families": list(self.mission_families),
+            "densify_frame_gaps": bool(self.densify_frame_gaps),
+            "max_source_paths": int(self.max_source_paths),
+            "preserve_mission_endpoints": bool(self.preserve_mission_endpoints),
+            "endpoint_window_policy": str(self.endpoint_window_policy),
             "target_bucket_ratios": (
                 dict(self.target_bucket_ratios) if self.target_bucket_ratios is not None else None
             ),
             "target_action_ratios": dict(self.target_action_ratios),
             "action_deficit_weight": float(self.action_deficit_weight),
-            "distribution_policy": "adaptive_dense_navigation/v0.1",
+            "distribution_policy": "whole_path_frame_interest_survey/v0.2",
         }
 
 
@@ -97,6 +107,8 @@ class FrameCandidate:
     source_frame_index: int
     source_frame_id: int
     source_window_indices: tuple[int, ...]
+    source_window_actions: tuple[str, ...]
+    window_edge_policy: str
     time_s: float
     position: tuple[float, float, float]
     yaw_rad: float
@@ -109,6 +121,7 @@ class FrameCandidate:
     bucket_scores: Mapping[str, float]
     interest_score: float
     reasons: tuple[str, ...]
+    mandatory_anchor_types: tuple[str, ...]
     stable_key: str
 
 
@@ -151,13 +164,36 @@ def select_frame_interest_windows(
     cfg = config or FrameSelectionConfig()
     _validate_config(cfg)
     paths = list(manifest_paths or [None] * len(manifests))
-    candidates = _build_candidates(manifests, paths, cfg)
+    selected_source_paths = _select_source_paths(manifests, paths, cfg)
+    selected_source_path_keys = {
+        (int(record["source_manifest_index"]), str(record["source_job_id"]))
+        for record in selected_source_paths
+    }
+    candidates = _build_candidates(
+        manifests,
+        paths,
+        cfg,
+        selected_source_path_keys=selected_source_path_keys,
+    )
+    interest_candidates = [candidate for candidate in candidates if not candidate.mandatory_anchor_types]
     bucket_counts = _count_by(candidates, lambda candidate: candidate.target_bucket)
+    interest_bucket_counts = _count_by(
+        interest_candidates,
+        lambda candidate: candidate.target_bucket,
+    )
     action_candidate_counts = _count_by(candidates, lambda candidate: candidate.target_action_name)
-    target_count = int(cfg.target_count) if int(cfg.target_count) > 0 else len(candidates)
-    target_count = min(target_count, len(candidates))
+    mission_family_candidate_counts = _count_memberships(
+        candidates,
+        lambda candidate: candidate.mission_families,
+    )
+    target_count = (
+        int(cfg.target_count)
+        if int(cfg.target_count) > 0
+        else len(interest_candidates)
+    )
+    target_count = min(target_count, len(interest_candidates))
     bucket_ratios = _derive_bucket_ratios(
-        bucket_counts,
+        interest_bucket_counts,
         override=cfg.target_bucket_ratios,
     )
     bucket_targets = _integer_targets(bucket_ratios, target_count)
@@ -177,19 +213,33 @@ def select_frame_interest_windows(
         "source_manifests": _source_manifest_records(manifests, paths),
         "distribution": {
             "basis": (
-                "Dense-learning selection: keep representative navigation context, "
-                "but over-sample planner-informative states instead of fixed forward-heavy action quotas."
+                "Randomly choose complete source paths, score every frame on each selected path, "
+                "retain multiple planner-informative centers and mandatory mission/section endpoints, "
+                "and observe action coverage without hard action quotas."
             ),
+            "source_path_sampling": {
+                "policy": "deterministic_seeded_whole_path",
+                "available_source_path_count": _eligible_source_path_count(manifests, cfg),
+                "selected_source_path_count": len(selected_source_paths),
+                "max_source_paths": int(cfg.max_source_paths),
+                "whole_path_scoring": True,
+                "multiple_targets_per_source_path_allowed": int(cfg.max_targets_per_job) == 0,
+                "selected_source_paths": selected_source_paths,
+            },
             "available_bucket_counts": bucket_counts,
+            "available_interest_bucket_counts": interest_bucket_counts,
             "available_action_counts": action_candidate_counts,
+            "available_mission_family_counts": mission_family_candidate_counts,
             "target_bucket_ratios": bucket_ratios,
             "target_bucket_counts": bucket_targets,
             "target_action_ratios": _normalize_ratios(cfg.target_action_ratios, ACTION_NAMES),
+            "action_selection_policy": "soft_deficit_priority_no_hard_quota",
         },
         "selection_summary": _selection_summary(
             candidates=candidates,
             selected=selected,
             chunks=chunks,
+            target_count=target_count,
             bucket_targets=bucket_targets,
             config=cfg,
         ),
@@ -263,14 +313,91 @@ def _validate_config(config: FrameSelectionConfig) -> None:
         raise ValueError("window_frame_count must be positive")
     if str(config.edge_window_policy) not in {"reject", "clamp"}:
         raise ValueError("edge_window_policy must be 'reject' or 'clamp'")
+    if str(config.endpoint_window_policy) not in {"reject", "clamp"}:
+        raise ValueError("endpoint_window_policy must be 'reject' or 'clamp'")
     if int(config.target_count) < 0:
         raise ValueError("target_count must be non-negative")
+    if int(config.max_source_paths) < 0:
+        raise ValueError("max_source_paths must be non-negative")
+    if any(not str(family).strip() for family in config.mission_families):
+        raise ValueError("mission_families cannot contain empty values")
+
+
+def _job_mission_families(
+    manifest: Mapping[str, Any],
+    job: Mapping[str, Any],
+) -> tuple[str, ...]:
+    families = tuple(str(item) for item in job.get("mission_families", []) if str(item))
+    if families:
+        return families
+    return tuple(str(item) for item in manifest.get("mission_families", []) if str(item))
+
+
+def _eligible_source_path_records(
+    manifests: Sequence[Mapping[str, Any]],
+    manifest_paths: Sequence[str | None],
+    config: FrameSelectionConfig,
+) -> list[JsonDict]:
+    requested_families = {str(item) for item in config.mission_families}
+    records: list[JsonDict] = []
+    for manifest_index, manifest in enumerate(manifests):
+        manifest_path = manifest_paths[manifest_index] if manifest_index < len(manifest_paths) else None
+        for job in manifest.get("jobs", []):
+            if not isinstance(job, Mapping):
+                continue
+            families = _job_mission_families(manifest, job)
+            if requested_families and requested_families.isdisjoint(families):
+                continue
+            job_id = str(job.get("job_id") or "")
+            trajectory = _job_trajectory(job, densify_frame_gaps=bool(config.densify_frame_gaps))
+            if not trajectory:
+                continue
+            random_key = hashlib.sha256(
+                f"{int(config.seed)}::{manifest_path or manifest_index}::{job_id}".encode("utf-8")
+            ).hexdigest()
+            records.append(
+                {
+                    "source_manifest_index": int(manifest_index),
+                    "source_manifest_path": manifest_path,
+                    "source_job_id": job_id,
+                    "scene_id": str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
+                    "viewpoint_robot_id": str(job.get("viewpoint_robot_id") or ""),
+                    "mission_families": list(families),
+                    "whole_path_frame_count": len(trajectory),
+                    "random_rank_key": random_key[:16],
+                }
+            )
+    return records
+
+
+def _select_source_paths(
+    manifests: Sequence[Mapping[str, Any]],
+    manifest_paths: Sequence[str | None],
+    config: FrameSelectionConfig,
+) -> list[JsonDict]:
+    records = _eligible_source_path_records(manifests, manifest_paths, config)
+    ranked = sorted(records, key=lambda record: (str(record["random_rank_key"]), str(record["source_job_id"])))
+    if int(config.max_source_paths) > 0:
+        ranked = ranked[: int(config.max_source_paths)]
+    return sorted(
+        ranked,
+        key=lambda record: (int(record["source_manifest_index"]), str(record["source_job_id"])),
+    )
+
+
+def _eligible_source_path_count(
+    manifests: Sequence[Mapping[str, Any]],
+    config: FrameSelectionConfig,
+) -> int:
+    return len(_eligible_source_path_records(manifests, [None] * len(manifests), config))
 
 
 def _build_candidates(
     manifests: Sequence[Mapping[str, Any]],
     manifest_paths: Sequence[str | None],
     config: FrameSelectionConfig,
+    *,
+    selected_source_path_keys: set[tuple[int, str]],
 ) -> list[FrameCandidate]:
     candidates: list[FrameCandidate] = []
     for manifest_index, manifest in enumerate(manifests):
@@ -280,17 +407,40 @@ def _build_candidates(
         jobs = [job for job in manifest.get("jobs", []) if isinstance(job, Mapping)]
         event_times = _event_times(manifest)
         for job in jobs:
-            trajectory = _job_trajectory(job)
+            job_id = str(job.get("job_id") or "")
+            if (manifest_index, job_id) not in selected_source_path_keys:
+                continue
+            trajectory = _job_trajectory(job, densify_frame_gaps=bool(config.densify_frame_gaps))
             if not trajectory:
                 continue
+            mandatory_anchors = _mandatory_anchor_indices(
+                manifest,
+                job,
+                trajectory,
+                enabled=bool(config.preserve_mission_endpoints),
+            )
             human_ids = tuple(str(item) for item in job.get("human_actor_ids", []) if str(item))
             peer_robot_ids = tuple(str(item) for item in job.get("peer_robot_ids", []) if str(item))
-            family_tuple = tuple(str(item) for item in job.get("mission_families", []) if str(item))
+            family_tuple = _job_mission_families(manifest, job)
             for frame_index, point in enumerate(trajectory):
                 source_window_indices = _window_indices(frame_index, len(trajectory), config)
+                window_edge_policy = str(config.edge_window_policy)
+                anchor_types = mandatory_anchors.get(frame_index, ())
+                if not source_window_indices and anchor_types:
+                    source_window_indices = _window_indices(
+                        frame_index,
+                        len(trajectory),
+                        config,
+                        policy=str(config.endpoint_window_policy),
+                    )
+                    window_edge_policy = str(config.endpoint_window_policy)
                 if not source_window_indices:
                     continue
                 target_action_name = _action_name(trajectory, frame_index)
+                source_window_actions = tuple(
+                    _action_name(trajectory, int(source_index))
+                    for source_index in source_window_indices
+                )
                 bucket_scores = _bucket_scores(
                     manifest,
                     job,
@@ -315,12 +465,14 @@ def _build_candidates(
                     FrameCandidate(
                         manifest_index=manifest_index,
                         manifest_path=manifest_path,
-                        job_id=str(job.get("job_id") or ""),
+                        job_id=job_id,
                         scene_id=str(job.get("scene_id") or manifest.get("source", {}).get("scene_id") or ""),
                         viewpoint_robot_id=str(job.get("viewpoint_robot_id") or ""),
                         source_frame_index=frame_index,
                         source_frame_id=source_frame_id,
                         source_window_indices=tuple(int(item) for item in source_window_indices),
+                        source_window_actions=source_window_actions,
+                        window_edge_policy=window_edge_policy,
                         time_s=_point_time(point, frame_index),
                         position=_point_position(point),
                         yaw_rad=float(point.get("yaw_rad", 0.0) or 0.0),
@@ -332,7 +484,8 @@ def _build_candidates(
                         target_bucket=target_bucket,
                         bucket_scores=bucket_scores,
                         interest_score=score,
-                        reasons=reasons,
+                        reasons=tuple((*reasons, *(f"mandatory:{item}" for item in anchor_types))),
+                        mandatory_anchor_types=tuple(anchor_types),
                         stable_key=stable_key,
                     )
                 )
@@ -442,9 +595,23 @@ def _select_candidates(
     selected_by_job: dict[str, list[int]] = {}
     action_counts: dict[str, int] = {name: 0 for name in ACTION_NAMES}
 
+    mandatory = sorted(
+        (candidate for candidate in candidates if candidate.mandatory_anchor_types),
+        key=lambda item: (item.manifest_index, item.scene_id, item.job_id, item.source_frame_index),
+    )
+    for candidate in mandatory:
+        _mark_selected(candidate, selected, selected_keys, selected_by_job, per_job_counts, action_counts)
+
     for bucket in INTEREST_BUCKETS:
-        needed = int(bucket_targets.get(bucket, 0))
-        for _ in range(needed):
+        while (
+            _interest_selected_count(selected) < target_count
+            and sum(
+                1
+                for item in selected
+                if not item.mandatory_anchor_types and item.target_bucket == bucket
+            )
+            < int(bucket_targets.get(bucket, 0))
+        ):
             candidate = _best_candidate(
                 candidates,
                 selected_keys=selected_keys,
@@ -459,7 +626,7 @@ def _select_candidates(
                 break
             _mark_selected(candidate, selected, selected_keys, selected_by_job, per_job_counts, action_counts)
 
-    while len(selected) < target_count:
+    while _interest_selected_count(selected) < target_count:
         candidate = _best_candidate(
             candidates,
             selected_keys=selected_keys,
@@ -565,8 +732,14 @@ def _mark_selected(
     selected.append(candidate)
     selected_keys.add(candidate.stable_key)
     selected_by_job.setdefault(job_key, []).append(candidate.source_frame_index)
-    per_job_counts[job_key] = per_job_counts.get(job_key, 0) + 1
-    action_counts[candidate.target_action_name] = action_counts.get(candidate.target_action_name, 0) + 1
+    if not candidate.mandatory_anchor_types:
+        per_job_counts[job_key] = per_job_counts.get(job_key, 0) + 1
+    if not candidate.mandatory_anchor_types:
+        action_counts[candidate.target_action_name] = action_counts.get(candidate.target_action_name, 0) + 1
+
+
+def _interest_selected_count(selected: Sequence[FrameCandidate]) -> int:
+    return sum(1 for candidate in selected if not candidate.mandatory_anchor_types)
 
 
 def _chunk_record(candidate: FrameCandidate, *, index: int, config: FrameSelectionConfig) -> JsonDict:
@@ -594,20 +767,23 @@ def _chunk_record(candidate: FrameCandidate, *, index: int, config: FrameSelecti
         "target_time_s": float(candidate.time_s),
         "target_action_name": candidate.target_action_name,
         "target_bucket": candidate.target_bucket,
-        "target_role": "frame_of_interest",
+        "target_role": "mandatory_anchor" if candidate.mandatory_anchor_types else "frame_of_interest",
+        "mandatory_anchor_types": list(candidate.mandatory_anchor_types),
+        "window_action_counts": _count_by(candidate.source_window_actions, lambda action: action),
         "bucket_scores": {key: round(float(value), 6) for key, value in candidate.bucket_scores.items()},
         "interest_score": round(float(candidate.interest_score), 6),
         "selection_reasons": list(candidate.reasons),
         "window": {
             "past_frames": int(config.past_frames),
             "future_frames": int(config.future_frames),
-            "edge_policy": str(config.edge_window_policy),
+            "edge_policy": candidate.window_edge_policy,
             "source_frame_indices": [int(item) for item in window_indices],
             "render_frame_count": len(window_indices),
         },
         "render_contract": {
             "must_render_all_window_frames": True,
             "preserve_stationary_frames": True,
+            "densify_frame_gaps": bool(config.densify_frame_gaps),
             "renderer_frame_indices": list(range(len(window_indices))),
         },
     }
@@ -618,11 +794,48 @@ def _selection_summary(
     candidates: Sequence[FrameCandidate],
     selected: Sequence[FrameCandidate],
     chunks: Sequence[Mapping[str, Any]],
+    target_count: int,
     bucket_targets: Mapping[str, int],
     config: FrameSelectionConfig,
 ) -> JsonDict:
     selected_bucket_counts = _count_by(selected, lambda candidate: candidate.target_bucket)
     selected_action_counts = _count_by(selected, lambda candidate: candidate.target_action_name)
+    selected_interest = [candidate for candidate in selected if not candidate.mandatory_anchor_types]
+    selected_interest_bucket_counts = _count_by(
+        selected_interest,
+        lambda candidate: candidate.target_bucket,
+    )
+    selected_interest_action_counts = _count_by(
+        selected_interest,
+        lambda candidate: candidate.target_action_name,
+    )
+    selected_window_action_counts = _count_memberships(
+        selected,
+        lambda candidate: candidate.source_window_actions,
+    )
+    unique_source_actions: dict[tuple[int, str, int], str] = {}
+    for candidate in selected:
+        for frame_index, action in zip(candidate.source_window_indices, candidate.source_window_actions):
+            unique_source_actions.setdefault(
+                (int(candidate.manifest_index), candidate.job_id, int(frame_index)),
+                str(action),
+            )
+    selected_unique_window_action_counts = _count_by(
+        list(unique_source_actions.values()),
+        lambda action: action,
+    )
+    mandatory_anchor_type_counts = _count_memberships(
+        selected,
+        lambda candidate: candidate.mandatory_anchor_types,
+    )
+    selected_mission_family_counts = _count_memberships(
+        selected,
+        lambda candidate: candidate.mission_families,
+    )
+    selected_targets_per_source_path = _count_by(
+        selected,
+        lambda candidate: _candidate_job_key(candidate),
+    )
     unique_source_frames = {
         (
             str(chunk.get("source_manifest_index")),
@@ -638,13 +851,31 @@ def _selection_summary(
     return {
         "candidate_count": len(candidates),
         "selected_target_count": len(selected),
+        "selected_interest_target_count": _interest_selected_count(selected),
+        "requested_target_count": int(config.target_count),
+        "selection_interest_target_count": int(target_count),
+        "mandatory_anchor_count": sum(1 for candidate in selected if candidate.mandatory_anchor_types),
+        "mandatory_anchor_type_counts": mandatory_anchor_type_counts,
         "window_frame_count": int(config.window_frame_count),
         "requested_window_frame_renders": requested_window_frames,
         "unique_source_render_frame_count": len(unique_source_frames),
         "selected_bucket_counts": selected_bucket_counts,
+        "selected_interest_bucket_counts": selected_interest_bucket_counts,
         "selected_action_counts": selected_action_counts,
+        "selected_center_action_counts": selected_action_counts,
+        "selected_interest_action_counts": selected_interest_action_counts,
+        "selected_window_action_counts": selected_window_action_counts,
+        "selected_unique_window_action_counts": selected_unique_window_action_counts,
+        "selected_window_action_ratios": _count_ratios(selected_window_action_counts),
+        "selected_unique_window_action_ratios": _count_ratios(selected_unique_window_action_counts),
+        "selected_mission_family_counts": selected_mission_family_counts,
+        "selected_targets_per_source_path": selected_targets_per_source_path,
         "bucket_deficits": {
-            bucket: max(0, int(bucket_targets.get(bucket, 0)) - int(selected_bucket_counts.get(bucket, 0)))
+            bucket: max(
+                0,
+                int(bucket_targets.get(bucket, 0))
+                - int(selected_interest_bucket_counts.get(bucket, 0)),
+            )
             for bucket in sorted(bucket_targets)
         },
         "render_frames_per_target": (
@@ -737,7 +968,16 @@ def _chunks_for_manifest(
 
 def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> JsonDict:
     job = deepcopy(dict(source_job))
-    source_trajectory = _job_trajectory(source_job)
+    render_contract = chunk.get("render_contract", {})
+    densify_frame_gaps = bool(
+        render_contract.get("densify_frame_gaps", False)
+        if isinstance(render_contract, Mapping)
+        else False
+    )
+    source_trajectory = _job_trajectory(
+        source_job,
+        densify_frame_gaps=densify_frame_gaps,
+    )
     selected_points: list[JsonDict] = []
     source_indices = [int(item) for item in chunk.get("window", {}).get("source_frame_indices", [])]
     for window_frame, source_index in enumerate(source_indices):
@@ -772,6 +1012,8 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
+        "target_role": chunk.get("target_role"),
+        "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
         "preserve_frame_samples": True,
     }
     job["camera"] = camera
@@ -794,6 +1036,9 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
+        "target_role": chunk.get("target_role"),
+        "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
+        "window_action_counts": dict(chunk.get("window_action_counts", {})),
         "source_frame_indices": source_indices,
         "window_frame_count": len(selected_points),
         "preserve_stationary_frames": True,
@@ -801,29 +1046,194 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
     return job
 
 
-def _job_trajectory(job: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+def _job_trajectory(
+    job: Mapping[str, Any],
+    *,
+    densify_frame_gaps: bool = False,
+) -> list[Mapping[str, Any]]:
     camera = job.get("camera", {})
     if not isinstance(camera, Mapping):
         return []
     trajectory = camera.get("trajectory", [])
     if not isinstance(trajectory, list):
         return []
-    return [point for point in trajectory if isinstance(point, Mapping)]
+    points = [point for point in trajectory if isinstance(point, Mapping)]
+    return _densify_trajectory_by_frame(points) if densify_frame_gaps else points
+
+
+def _densify_trajectory_by_frame(
+    trajectory: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    if len(trajectory) < 2:
+        return list(trajectory)
+
+    by_frame: dict[int, Mapping[str, Any]] = {}
+    for index, point in enumerate(trajectory):
+        by_frame[_int_or(point.get("frame"), index)] = point
+    framed = sorted(by_frame.items())
+    if len(framed) < 2 or all(right[0] - left[0] == 1 for left, right in zip(framed, framed[1:])):
+        return [point for _frame, point in framed]
+
+    dense: list[JsonDict] = []
+    for segment_index, ((left_frame, left), (right_frame, right)) in enumerate(
+        zip(framed, framed[1:])
+    ):
+        if segment_index == 0:
+            dense.append(_dense_endpoint(left, dense_index=0, source_frame=left_frame))
+        gap = int(right_frame) - int(left_frame)
+        if gap <= 0:
+            continue
+        left_position = _point_position(left)
+        right_position = _point_position(right)
+        left_time = _point_time(left, left_frame)
+        right_time = _point_time(right, right_frame)
+        left_yaw = _point_yaw(left, 0, (left, right))
+        right_yaw = _point_yaw(right, 1, (left, right))
+        yaw_delta = _wrap_angle(right_yaw - left_yaw)
+        for step in range(1, gap + 1):
+            alpha = float(step) / float(gap)
+            if step == gap:
+                dense.append(
+                    _dense_endpoint(
+                        right,
+                        dense_index=len(dense),
+                        source_frame=right_frame,
+                    )
+                )
+                continue
+            nearest = left if alpha < 0.5 else right
+            point = deepcopy(dict(nearest))
+            metadata = dict(point.get("metadata", {})) if isinstance(point.get("metadata"), Mapping) else {}
+            metadata.update(
+                {
+                    "frame_selection_interpolated": True,
+                    "interpolation_source_frames": [int(left_frame), int(right_frame)],
+                    "interpolation_alpha": round(alpha, 8),
+                    "original_sample_index": point.get("sample_index"),
+                }
+            )
+            point.update(
+                {
+                    "sample_index": len(dense),
+                    "frame": int(left_frame + step),
+                    "t": float(left_time + (right_time - left_time) * alpha),
+                    "time_s": float(left_time + (right_time - left_time) * alpha),
+                    "position": [
+                        float(left_position[axis] + (right_position[axis] - left_position[axis]) * alpha)
+                        for axis in range(3)
+                    ],
+                    "yaw_rad": _wrap_angle(left_yaw + yaw_delta * alpha),
+                    "metadata": metadata,
+                }
+            )
+            dense.append(point)
+    return dense
+
+
+def _dense_endpoint(
+    source: Mapping[str, Any],
+    *,
+    dense_index: int,
+    source_frame: int,
+) -> JsonDict:
+    point = deepcopy(dict(source))
+    metadata = dict(point.get("metadata", {})) if isinstance(point.get("metadata"), Mapping) else {}
+    metadata.setdefault("original_sample_index", point.get("sample_index"))
+    point["sample_index"] = int(dense_index)
+    point["frame"] = int(source_frame)
+    point["metadata"] = metadata
+    return point
 
 
 def _window_indices(
     target_index: int,
     trajectory_len: int | None,
     config: FrameSelectionConfig,
+    *,
+    policy: str | None = None,
 ) -> list[int]:
+    edge_policy = str(policy or config.edge_window_policy)
     start = int(target_index) - int(config.past_frames)
     end = int(target_index) + int(config.future_frames)
-    if trajectory_len is not None and str(config.edge_window_policy) == "reject":
+    if trajectory_len is not None and edge_policy == "reject":
         if start < 0 or end >= int(trajectory_len):
             return []
-    if trajectory_len is None or str(config.edge_window_policy) == "reject":
+    if trajectory_len is None or edge_policy == "reject":
         return list(range(start, end + 1))
     return [min(max(0, index), int(trajectory_len) - 1) for index in range(start, end + 1)]
+
+
+def _mandatory_anchor_indices(
+    manifest: Mapping[str, Any],
+    job: Mapping[str, Any],
+    trajectory: Sequence[Mapping[str, Any]],
+    *,
+    enabled: bool,
+) -> dict[int, tuple[str, ...]]:
+    if not enabled or not trajectory:
+        return {}
+
+    anchors: dict[int, list[str]] = {}
+
+    def add(time_s: float, anchor_type: str) -> None:
+        index = min(
+            range(len(trajectory)),
+            key=lambda item: abs(_point_time(trajectory[item], item) - float(time_s)),
+        )
+        labels = anchors.setdefault(index, [])
+        if anchor_type not in labels:
+            labels.append(anchor_type)
+
+    anchors[len(trajectory) - 1] = ["trajectory_end"]
+    assigned_mission_ids = {
+        str(item) for item in job.get("assigned_mission_ids", []) if str(item)
+    }
+    viewpoint_robot_id = str(
+        job.get("viewpoint_robot_id")
+        or (job.get("camera", {}).get("source_actor_id") if isinstance(job.get("camera"), Mapping) else "")
+        or ""
+    )
+    completed_missions: set[str] = set()
+    for event in manifest.get("events", []):
+        if not isinstance(event, Mapping) or event.get("t") is None:
+            continue
+        event_type = str(event.get("event_type") or "").lower().replace("-", "_")
+        if not any(token in event_type for token in ("completion", "complete", "robot_eos", "mission_end", "section_end")):
+            continue
+        mission_id = str(event.get("mission_id") or "")
+        if assigned_mission_ids and mission_id and mission_id not in assigned_mission_ids:
+            continue
+        event_actor_id = str(event.get("actor_id") or event.get("robot_id") or "")
+        if event_actor_id and viewpoint_robot_id and event_actor_id != viewpoint_robot_id:
+            continue
+        label = f"mission_section_end:{mission_id}" if mission_id else f"event:{event_type}"
+        add(float(event.get("t") or 0.0), label)
+        if mission_id:
+            completed_missions.add(mission_id)
+
+    for mission in manifest.get("missions", []):
+        if not isinstance(mission, Mapping):
+            continue
+        mission_id = str(mission.get("mission_id") or "")
+        if assigned_mission_ids and mission_id not in assigned_mission_ids:
+            continue
+        if mission_id in completed_missions:
+            continue
+        metadata = mission.get("metadata", {})
+        metadata = metadata if isinstance(metadata, Mapping) else {}
+        completion_time = next(
+            (
+                float(metadata[key])
+                for key in ("robot_eos_t", "expected_completion_t", "robot_arrival_t")
+                if metadata.get(key) is not None
+            ),
+            None,
+        )
+        if completion_time is not None:
+            label = f"mission_section_end:{mission_id}" if mission_id else "mission_section_end"
+            add(completion_time, label)
+
+    return {index: tuple(labels) for index, labels in sorted(anchors.items())}
 
 
 def _bucket_scores(
@@ -1079,6 +1489,25 @@ def _count_by(items: Sequence[Any], key_fn) -> JsonDict:
         key = str(key_fn(item))
         counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _count_memberships(items: Sequence[Any], key_fn) -> JsonDict:
+    counts: dict[str, int] = {}
+    for item in items:
+        for raw_key in key_fn(item):
+            key = str(raw_key)
+            counts[key] = counts.get(key, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _count_ratios(counts: Mapping[str, int]) -> JsonDict:
+    total = sum(int(value) for value in counts.values())
+    if total <= 0:
+        return {}
+    return {
+        str(key): round(int(value) / float(total), 6)
+        for key, value in sorted(counts.items())
+    }
 
 
 def _manifest_fingerprint(manifest: Mapping[str, Any]) -> str:

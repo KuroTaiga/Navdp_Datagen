@@ -257,22 +257,51 @@ Remaining:
 - [x] Add an adaptive dense-navigation frame selector based on interest buckets:
   `critical_margin`, `human_interaction`, `route_decision`, and
   `representative_motion`.
-- [x] Keep secondary action balancing configurable with defaults of
-  `stop=0.20`, `move=0.40`, `turn_left=0.20`, and `turn_right=0.20`.
+- [x] Keep secondary action ratios configurable as soft selection priorities,
+  with no hard action-family minimums, maximums, or rejection quotas.
+- [x] Seed-sample complete source paths before frame scoring; never score a
+  pre-cut path fragment.
+- [x] Allow multiple points of interest from one selected path and leave the
+  per-path POI limit disabled by default.
+- [x] Keep assigned sub-mission completion/checkpoint frames and final mission
+  trajectory endpoints as mandatory anchors additive to the scored POI budget.
 - [x] Expand every selected frame of interest to a 65-frame render contract:
   32 past frames, current frame, and 32 future frames.
 - [x] Emit `navdp_frame_interest_selection/v0.1` manifests with selected chunks,
-  distribution summaries, and unique source-frame reuse counts.
+  center-role/action summaries, retained-window action distributions, and
+  unique source-frame reuse counts.
 - [x] Add `scripts/massgen/select_frame_interest_windows.py` for selection-only
   and selected-render-manifest export workflows.
 - [x] Allow `scripts/massgen/render_manifest_jobs.py --frame-selection-json` to
   plan/render only selected 65-frame window jobs.
+- [x] Add explicit mission-family filtering to candidate generation and report
+  available/selected family membership counts.
+- [x] Add `scripts/massgen/prepare_frame_selection_family_pilot.py` to prepare
+  non-executing selections, selected render manifests, acceptance criteria, and
+  plan/execute command arrays for every active family.
+- [x] Represent the pre-databank state as `waiting_for_source_manifest` instead
+  of treating absent remote data as a selector failure.
 - [x] Preserve repeated stationary/yield samples by carrying
   `camera.preserve_frame_samples` through render executor label-path generation
   and TeleSim path preparation.
 - [ ] Replace one-window-per-target execution with true sparse unique-source
   frame rendering when the renderer supports frame-id-addressed outputs.
-- [ ] Execute selector/render-plan tests after testing is available again.
+- [x] Execute focused selector/render-plan tests (`30 passed`) and a source-side
+  remote family matrix through `pathGen_lxh` (`13/18` cohorts ready, remaining
+  five blocked only by absent source scenarios).
+- [x] Execute the broader selector/manifest/executor suite (`65 passed`).
+- [x] Validate all 53 remotely selected jobs structurally: 26 scored POIs plus
+  27 mandatory anchors, exact 65-sample windows, centered targets, stationary
+  endpoint padding, and zero audit errors.
+- [x] Confirm the remote survey retains forward motion: 2,728 of 3,445 repeated
+  window samples are `move` (79.2%).
+- [x] Add non-rendered BEV GIF/PNG overlays and distribution graphs that show
+  whole selected paths, selected windows, POIs, mandatory endpoints, and
+  before/after action and bucket composition.
+- [ ] Connect the databank or mounted remote render-manifest directory, rebuild
+  the family pilot matrix, and inspect every `plan_argv` before execution.
+- [ ] Execute one complete 65-frame selected window for every active mission
+  family and record plan blockers, frame counts, and actor metadata results.
 
 ### 9. Isaac Sim/OpenUSD Sensor Rig Import
 
@@ -327,8 +356,8 @@ Local macOS:
 - [x] Multi-human human-only executor tests cover actor bundles for
   `serve_queue`, `navigate_with_social_constraints:queue_order`, and
   `dense_dynamic_humans`.
-- [ ] Frame-interest selector tests in `tests/test_frame_interest_selection.py`
-  are present but not executed in this pass per operator instruction.
+- [x] Frame-interest selector tests in `tests/test_frame_interest_selection.py`
+  pass (`30 passed`). No Gaussian rendering was executed.
 
 Server/platform:
 

@@ -65,7 +65,32 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--min-target-spacing-frames", type=int, default=16)
     parser.add_argument("--max-targets-per-job", type=int, default=0)
     parser.add_argument("--split", default="train")
+    parser.add_argument(
+        "--family",
+        action="append",
+        default=None,
+        help="Only consider jobs belonging to this mission family. Repeatable.",
+    )
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
+    parser.add_argument(
+        "--densify-frame-gaps",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Interpolate sparse trajectory samples across integer source frame ids.",
+    )
+    parser.add_argument(
+        "--preserve-mission-endpoints",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Always select assigned mission/section completions and each trajectory endpoint.",
+    )
+    parser.add_argument("--endpoint-window-policy", choices=["reject", "clamp"], default="clamp")
+    parser.add_argument(
+        "--max-source-paths",
+        type=int,
+        default=0,
+        help="Seeded random whole-path sample size; zero keeps all eligible paths.",
+    )
     parser.add_argument(
         "--bucket-ratio",
         action="append",
@@ -106,6 +131,11 @@ def main() -> int:
         max_targets_per_job=int(args.max_targets_per_job),
         seed=int(args.seed),
         split=str(args.split),
+        mission_families=tuple(str(item) for item in (args.family or [])),
+        densify_frame_gaps=bool(args.densify_frame_gaps),
+        max_source_paths=int(args.max_source_paths),
+        preserve_mission_endpoints=bool(args.preserve_mission_endpoints),
+        endpoint_window_policy=str(args.endpoint_window_policy),
         target_bucket_ratios=_ratio_map(args.bucket_ratio) if args.bucket_ratio else None,
         target_action_ratios=_ratio_map(args.action_ratio, DEFAULT_ACTION_RATIOS),
         action_deficit_weight=float(args.action_deficit_weight),
