@@ -31,72 +31,75 @@ the dirty primary Datagen checkout untouched.
   `formal_social_slow_v1`;
 - deterministic seed: `20260909`;
 - 12 mission-family cohorts;
-- 25 randomly ranked nonempty scenes per family;
+- every nonempty scene discovered for each family;
 - up to 50 randomly ranked complete robot source paths per selected scene;
-- two scored POIs per source path, with unlimited POIs per individual path;
+- a cohort scored-POI budget of two times its sampled source-path count, with
+  no per-path POI cap;
 - mandatory endpoint/checkpoint anchors additive;
 - trajectory gaps densified at 10 FPS;
 - no image rendering executed.
 
-Of 300 scene cohorts, 281 supplied all 50 paths. Nineteen cohorts contained
-fewer than 50 usable generated paths, producing 14,535 paths rather than the
-15,000 upper bound. The minimum cohort contained one path. No scenario
-conversion or selection errors occurred.
+Of 12,318 nonempty scene cohorts, 11,326 supplied all 50 paths. The remaining
+992 cohorts contained fewer than 50 usable generated paths, producing 583,188
+paths rather than the 615,900 upper bound. The minimum cohort contained one
+path. No scenario conversion or selection errors occurred. Two cohorts lacked
+enough valid candidates to fill the nominal scored-POI budget: one was short by
+four and one was short by four, for an aggregate deficit of eight POIs.
 
 ## Aggregate Result
 
 | Measure | Value |
 | --- | ---: |
-| Sampled scenes | 300 |
-| Sampled scenarios | 10,834 |
-| Sampled robot source paths | 14,535 |
-| Source frames | 3,651,322 |
-| Scored POI centers | 29,070 |
-| Mandatory anchors | 21,433 |
-| All selected centers | 50,503 |
-| Repeated 65-frame samples | 3,282,695 |
-| Unique retained source frames | 1,977,047 |
-| Unique retention | 54.15% |
+| Sampled scenes | 12,318 |
+| Sampled scenarios | 434,835 |
+| Sampled robot source paths | 583,188 |
+| Source frames | 145,899,714 |
+| Scored POI centers | 1,166,368 |
+| Mandatory anchors | 880,511 |
+| All selected centers | 2,046,879 |
+| Repeated 65-frame samples | 133,047,135 |
+| Unique retained source frames | 79,815,018 |
+| Unique retention | 54.71% |
 
-Repeated window execution would process 89.90% as many frame samples as full
-paths. Reusing overlapping frames reduces this to 54.15% of source frames, or
-60.23% of the repeated-window workload.
+Repeated window execution would process 91.19% as many frame samples as full
+paths. Reusing overlapping frames reduces this to 54.71% of source frames, or
+59.99% of the repeated-window workload.
 
 ## Action Coverage
 
 | Population | Move | Stop | Left | Right |
 | --- | ---: | ---: | ---: | ---: |
-| Scored POI centers | 60.85% | 8.71% | 15.02% | 15.43% |
-| Mandatory anchors | 18.01% | 44.31% | 16.45% | 21.22% |
-| All selected centers | 42.67% | 23.82% | 15.62% | 17.89% |
-| Repeated 65-frame windows | 59.60% | 19.12% | 10.02% | 11.25% |
-| Unique retained frames | 67.89% | 14.34% | 8.64% | 9.12% |
+| Scored POI centers | 60.44% | 8.83% | 15.11% | 15.62% |
+| Mandatory anchors | 17.65% | 44.74% | 16.96% | 20.65% |
+| All selected centers | 42.03% | 24.28% | 15.91% | 17.78% |
+| Repeated 65-frame windows | 58.68% | 19.26% | 10.45% | 11.61% |
+| Unique retained frames | 66.82% | 14.28% | 9.18% | 9.72% |
 
 The scored POI pool reaches the 15% left/right objective. Stop reaches only
-8.71% because several mission families have no non-anchor stop candidates;
+8.83% because several mission families have no non-anchor stop candidates;
 mandatory anchors independently provide substantial stop coverage.
 
 Compared with the previous 2,484-path survey:
 
 | Population/action | Previous | Anchor-aware | Delta |
 | --- | ---: | ---: | ---: |
-| Scored POI left | 13.33% | 15.02% | +1.69 pp |
-| Scored POI right | 13.04% | 15.43% | +2.39 pp |
-| Repeated-window left | 3.78% | 10.02% | +6.24 pp |
-| Repeated-window right | 3.87% | 11.25% | +7.38 pp |
-| Unique-frame left | 3.56% | 8.64% | +5.08 pp |
-| Unique-frame right | 3.66% | 9.12% | +5.46 pp |
+| Scored POI left | 13.33% | 15.11% | +1.78 pp |
+| Scored POI right | 13.04% | 15.62% | +2.58 pp |
+| Repeated-window left | 3.78% | 10.45% | +6.67 pp |
+| Repeated-window right | 3.87% | 11.61% | +7.74 pp |
+| Unique-frame left | 3.56% | 9.18% | +5.62 pp |
+| Unique-frame right | 3.66% | 9.72% | +6.06 pp |
 
-Combined unique-frame turn coverage increased from 7.22% to 17.76%.
+Combined unique-frame turn coverage increased from 7.22% to 18.90%.
 
 ## Window Dilution
 
 | Center action | Windows | Mean matching frames in 65 | At least 5 | At least 10 |
 | --- | ---: | ---: | ---: | ---: |
-| Left | 4,365 | 8.90 | 68.06% | 37.43% |
-| Right | 4,485 | 9.07 | 68.25% | 37.99% |
-| Stop | 2,532 | 32.34 | 93.48% | 88.15% |
-| Move | 17,688 | 49.88 | 99.87% | 99.41% |
+| Left | 176,262 | 9.19 | 69.55% | 39.70% |
+| Right | 182,193 | 9.26 | 69.08% | 39.48% |
+| Stop | 102,995 | 31.68 | 93.33% | 87.50% |
+| Move | 704,918 | 49.18 | 99.84% | 99.34% |
 
 Turn-centered examples therefore contain about nine explicitly turning frames
 on average. The remaining frames are approach/departure context, not additional
@@ -110,29 +113,29 @@ because its meaningful stops are mandatory service/checkpoint anchors. The
 availability-aware policy records these deficits and redistributes the scored
 POI budget rather than relabeling weak geometric states as stops.
 
-Aggregate unmet scored-center targets were 4 move, 396 stop, 164 left, and 184
-right out of 29,070 selected POIs. Despite these scene-local deficits, aggregate
-left/right coverage met the target.
+Aggregate unmet scored-center targets were 276 move, 16,443 stop, 7,183 left,
+and 7,189 right out of 1,166,368 selected POIs. Despite these scene-local
+deficits, aggregate left/right coverage met the target.
 
 ## Artifacts
 
 Local:
 
-- `out/path_sampling_anchor_aware_20260909_50paths/report.md`
-- `out/path_sampling_anchor_aware_20260909_50paths/corpus_survey.json`
-- `out/path_sampling_anchor_aware_20260909_50paths/per_scene_sampling.csv`
-- `out/path_sampling_anchor_aware_20260909_50paths/per_scene_counts.csv`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/report.md`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/corpus_survey.json`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/per_scene_sampling.csv`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/per_scene_counts.csv`
 
 Remote:
 
-- `/private_lxh/dongjk/navdata/mass_generation_runs/frame_sampling_anchor_aware_20260909_50paths/`
+- `/private_lxh/dongjk/navdata/mass_generation_runs/frame_sampling_anchor_aware_20260909_allscenes_50paths/`
 
 SHA-256:
 
-- `corpus_survey.json`: `1a73e423fad3dc38c6ce5cc0c76e425fb79be6c79dd4d6326e4c500d657ecd8f`
+- `corpus_survey.json`: `7c70b530c74767bb185092ba429c24c4a80458b25bdb92b9aff38f73ee5ce87e`
 - `per_scene_counts.csv`: `49d43eb7b2bfe00272135e0ea5eb97c42d189a37efee89e9caf6e37c14de64d7`
-- `per_scene_sampling.csv`: `d62a241a3ec184494d26ae709871b37988d93ff672b3cfab9c478e437c65ec04`
-- `report.md`: `6d7839369ef1afc9a9ae830d28ea9a2242daf77dfd2457000621b62b6927e1bb`
+- `per_scene_sampling.csv`: `ad229beba1955d7aceee7f2a87be172e593b685335e41b26b45b3717aa64a8fb`
+- `report.md`: `20abeee5d476457ad796a94638928863c60e304c11e26d65126322894dd7f15a`
 
 ## Verification
 
@@ -140,5 +143,11 @@ SHA-256:
 - Local selector tests after multiprocessing change: 31 passed.
 - Python compilation and `git diff --check`: passed.
 - Remote end-to-end smoke: 24 paths across 12 families, passed.
-- Remote full survey: 300 scene cohorts, 14,535 paths, zero errors.
+- Remote stratified survey: 300 scene cohorts, 14,535 paths, zero errors.
+- Remote exhaustive survey: 12,318 scene cohorts, 583,188 paths, zero errors.
+- Artifact audit: all action populations sum to their reported totals, all
+  selected centers expand to exactly 65 repeated frames, and retained frames
+  never exceed source frames. The scored-POI total is eight below its nominal
+  `2 * source paths` cohort budget due to unavailable valid candidates in two
+  scenes.
 - Remote `pytest`: unavailable because the host system Python has no `pytest`.
