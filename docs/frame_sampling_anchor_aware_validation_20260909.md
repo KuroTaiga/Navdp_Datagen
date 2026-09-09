@@ -2,49 +2,44 @@
 
 ## Decision
 
-Frame selection now balances scored frame-of-interest centers separately from
-mandatory mission, checkpoint, and trajectory-end anchors. The scored-center
-target is `55% move / 15% stop / 15% left / 15% right`. Targets are minimums,
-not per-path caps, and unavailable action capacity is redistributed. Every
-mandatory anchor remains selected and every selected center retains its full
-`32 past + current + 32 future` context.
+The package contains `32 past frames + current frame` for each selected point
+of interest. Future frames are not packaged, so every selected example has 33
+frames. The selector still supports an explicit nonzero `future_frames` value
+for experiments, but the package default is zero.
 
-The selection manifest also emits:
-
-- mandatory-anchor action counts as a separate population;
-- scored-center action deficits when a requested action is unavailable;
-- per-action training weights for center-balanced loading;
-- action composition conditioned on the scored center action;
-- a unique source-frame index for reuse across overlapping windows.
+Frame selection balances scored POI centers separately from mandatory mission,
+checkpoint, and trajectory-end anchors. The scored-center target is
+`55% move / 15% stop / 15% left / 15% right`. Targets are availability-aware
+minimums, not per-path caps. Every mandatory anchor remains additive.
 
 Implementation commits:
 
 - `d0c097f Balance scored frame-interest centers by action`
 - `4a47cf4 Parallelize frame sampling corpus survey`
+- `264e771 Package past and current sampling frames`
 
 ## Validation Scope
 
-The survey ran on `pathGen_lxh` from an isolated worktree at `4a47cf4`, leaving
-the dirty primary Datagen checkout untouched.
+The corrected survey ran on `pathGen_lxh` from an isolated worktree at
+`264e771`, leaving the dirty primary Datagen checkout untouched.
 
 - formal roots: `formal_fast_v1`, `formal_slow_v1`, and
   `formal_social_slow_v1`;
 - deterministic seed: `20260909`;
-- 12 mission-family cohorts;
-- every nonempty scene discovered for each family;
-- up to 50 randomly ranked complete robot source paths per selected scene;
-- a cohort scored-POI budget of two times its sampled source-path count, with
-  no per-path POI cap;
+- all 12 mission families and every discovered nonempty scene;
+- up to 50 randomly ranked complete robot source paths per scene;
+- a cohort scored-POI budget equal to two times its sampled source-path count,
+  with no per-path POI cap;
 - mandatory endpoint/checkpoint anchors additive;
 - trajectory gaps densified at 10 FPS;
+- 32 historical frames, current frame, zero future frames;
 - no image rendering executed.
 
 Of 12,318 nonempty scene cohorts, 11,326 supplied all 50 paths. The remaining
 992 cohorts contained fewer than 50 usable generated paths, producing 583,188
 paths rather than the 615,900 upper bound. The minimum cohort contained one
-path. No scenario conversion or selection errors occurred. Two cohorts lacked
-enough valid candidates to fill the nominal scored-POI budget: one was short by
-four and one was short by four, for an aggregate deficit of eight POIs.
+path. No scenario conversion or selection errors occurred. The corrected
+history-only eligibility rule filled the complete scored-POI budget.
 
 ## Aggregate Result
 
@@ -54,100 +49,103 @@ four and one was short by four, for an aggregate deficit of eight POIs.
 | Sampled scenarios | 434,835 |
 | Sampled robot source paths | 583,188 |
 | Source frames | 145,899,714 |
-| Scored POI centers | 1,166,368 |
+| Scored POI centers | 1,166,376 |
 | Mandatory anchors | 880,511 |
-| All selected centers | 2,046,879 |
-| Repeated 65-frame samples | 133,047,135 |
-| Unique retained source frames | 79,815,018 |
-| Unique retention | 54.71% |
+| All selected centers | 2,046,887 |
+| Repeated 33-frame samples | 67,547,271 |
+| Unique retained source frames | 59,953,875 |
+| Unique retention | 41.09% |
 
-Repeated window execution would process 91.19% as many frame samples as full
-paths. Reusing overlapping frames reduces this to 54.71% of source frames, or
-59.99% of the repeated-window workload.
+Repeated window execution would process 46.30% as many samples as all source
+paths. Reusing overlapping frames reduces this to 41.09% of source frames, or
+88.76% of the repeated-window workload.
 
 ## Action Coverage
 
 | Population | Move | Stop | Left | Right |
 | --- | ---: | ---: | ---: | ---: |
-| Scored POI centers | 60.44% | 8.83% | 15.11% | 15.62% |
+| Scored POI centers | 60.31% | 8.86% | 15.17% | 15.66% |
 | Mandatory anchors | 17.65% | 44.74% | 16.96% | 20.65% |
-| All selected centers | 42.03% | 24.28% | 15.91% | 17.78% |
-| Repeated 65-frame windows | 58.68% | 19.26% | 10.45% | 11.61% |
-| Unique retained frames | 66.82% | 14.28% | 9.18% | 9.72% |
+| All selected centers | 41.96% | 24.29% | 15.94% | 17.81% |
+| Repeated 33-frame windows | 65.59% | 13.97% | 9.91% | 10.53% |
+| Unique retained frames | 66.27% | 13.68% | 9.72% | 10.33% |
 
 The scored POI pool reaches the 15% left/right objective. Stop reaches only
-8.83% because several mission families have no non-anchor stop candidates;
-mandatory anchors independently provide substantial stop coverage.
+8.86% because several mission families have no non-anchor stop candidates;
+mandatory anchors independently provide substantial stop coverage. Training
+balance must use scored-center labels or emitted per-action weights rather than
+treating every retained context frame as an independent example.
 
-Compared with the previous 2,484-path survey:
+## Contract Comparison
 
-| Population/action | Previous | Anchor-aware | Delta |
+The 65-frame run used the same source roots, random seed, scene set, and path
+sample. Its results are retained only for comparison.
+
+| Measure | Former 65-frame | Current 33-frame | Change |
 | --- | ---: | ---: | ---: |
-| Scored POI left | 13.33% | 15.11% | +1.78 pp |
-| Scored POI right | 13.04% | 15.62% | +2.58 pp |
-| Repeated-window left | 3.78% | 10.45% | +6.67 pp |
-| Repeated-window right | 3.87% | 11.61% | +7.74 pp |
-| Unique-frame left | 3.56% | 9.18% | +5.62 pp |
-| Unique-frame right | 3.66% | 9.72% | +6.06 pp |
+| Repeated window samples | 133,047,135 | 67,547,271 | -49.23% |
+| Unique retained frames | 79,815,018 | 59,953,875 | -24.88% |
+| Unique source retention | 54.71% | 41.09% | -13.61 pp |
+| Scored POI left | 15.11% | 15.17% | +0.06 pp |
+| Scored POI right | 15.62% | 15.66% | +0.04 pp |
+| Unique-frame left | 9.18% | 9.72% | +0.54 pp |
+| Unique-frame right | 9.72% | 10.33% | +0.61 pp |
 
-Combined unique-frame turn coverage increased from 7.22% to 18.90%.
+Removing future context saves 19,861,143 unique frame renders while preserving
+the center distribution. Combined unique-frame turn coverage increases slightly
+from 18.90% to 20.05%.
 
-## Window Dilution
+## Window Composition
 
-| Center action | Windows | Mean matching frames in 65 | At least 5 | At least 10 |
+| Center action | Windows | Mean matching frames in 33 | At least 5 | At least 10 |
 | --- | ---: | ---: | ---: | ---: |
-| Left | 176,262 | 9.19 | 69.55% | 39.70% |
-| Right | 182,193 | 9.26 | 69.08% | 39.48% |
-| Stop | 102,995 | 31.68 | 93.33% | 87.50% |
-| Move | 704,918 | 49.18 | 99.84% | 99.34% |
+| Left | 176,956 | 5.07 | 44.98% | 11.86% |
+| Right | 182,633 | 5.11 | 45.28% | 12.34% |
+| Stop | 103,339 | 16.35 | 72.76% | 60.84% |
+| Move | 703,448 | 24.28 | 95.94% | 88.74% |
 
-Turn-centered examples therefore contain about nine explicitly turning frames
-on average. The remaining frames are approach/departure context, not additional
-move-centered training records.
+The context now contains only the lead-up to each POI. Lower matching-action
+frame counts are expected because a turn or stop may begin near the current
+frame. The scored current-frame action remains the training-balance label.
 
 ## Family Limits
 
 `deliver_to_human`, `group_integrity`, `personal_space`, and `queue_order`
-contain almost no non-anchor stop candidates. `serve_queue` has the same issue
-because its meaningful stops are mandatory service/checkpoint anchors. The
-availability-aware policy records these deficits and redistributes the scored
-POI budget rather than relabeling weak geometric states as stops.
+contain almost no non-anchor stop candidates. Their important states are often
+social or geometric events while the robot is still moving, so action balance
+alone cannot represent mission criticality. Family-specific event POIs remain
+the next sampling improvement.
 
-Aggregate unmet scored-center targets were 276 move, 16,443 stop, 7,183 left,
-and 7,189 right out of 1,166,368 selected POIs. Despite these scene-local
-deficits, aggregate left/right coverage met the target.
+Aggregate unmet scored-center targets were 216 move, 16,172 stop, 9,367 left,
+and 9,542 right out of 1,166,376 selected POIs. These are scene-local
+availability deficits; aggregate left/right coverage still meets the target.
 
 ## Artifacts
 
 Local:
 
-- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/report.md`
-- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/corpus_survey.json`
-- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/per_scene_sampling.csv`
-- `out/path_sampling_anchor_aware_20260909_allscenes_50paths/per_scene_counts.csv`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths_33frame/report.md`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths_33frame/corpus_survey.json`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths_33frame/per_scene_sampling.csv`
+- `out/path_sampling_anchor_aware_20260909_allscenes_50paths_33frame/per_scene_counts.csv`
 
 Remote:
 
-- `/private_lxh/dongjk/navdata/mass_generation_runs/frame_sampling_anchor_aware_20260909_allscenes_50paths/`
+- `/private_lxh/dongjk/navdata/mass_generation_runs/frame_sampling_anchor_aware_20260909_allscenes_50paths_33frame/`
 
 SHA-256:
 
-- `corpus_survey.json`: `7c70b530c74767bb185092ba429c24c4a80458b25bdb92b9aff38f73ee5ce87e`
+- `corpus_survey.json`: `285b3132ff0d52a9d362dadb0366c16b28af03ab7a988143f0f15211800000a3`
 - `per_scene_counts.csv`: `49d43eb7b2bfe00272135e0ea5eb97c42d189a37efee89e9caf6e37c14de64d7`
-- `per_scene_sampling.csv`: `ad229beba1955d7aceee7f2a87be172e593b685335e41b26b45b3717aa64a8fb`
-- `report.md`: `20abeee5d476457ad796a94638928863c60e304c11e26d65126322894dd7f15a`
+- `per_scene_sampling.csv`: `efe19d06b8b7e5d8ecf9b874af317d1113e2aa3105c11c9baa356fcbcb323006`
+- `report.md`: `61edc364adc7e923ad2b2569562fcadb0073e9df4515dc3edc1e7a1759d862ec`
 
 ## Verification
 
-- Local focused tests: 64 passed before the multiprocessing-only survey change.
-- Local selector tests after multiprocessing change: 31 passed.
+- Local selector/manifest/executor suite: 64 passed after the contract change.
 - Python compilation and `git diff --check`: passed.
-- Remote end-to-end smoke: 24 paths across 12 families, passed.
-- Remote stratified survey: 300 scene cohorts, 14,535 paths, zero errors.
 - Remote exhaustive survey: 12,318 scene cohorts, 583,188 paths, zero errors.
-- Artifact audit: all action populations sum to their reported totals, all
-  selected centers expand to exactly 65 repeated frames, and retained frames
-  never exceed source frames. The scored-POI total is eight below its nominal
-  `2 * source paths` cohort budget due to unavailable valid candidates in two
-  scenes.
-- Remote `pytest`: unavailable because the host system Python has no `pytest`.
+- Artifact audit: config is exactly `32 + 1 + 0`; all action populations sum to
+  their totals; all selected centers expand to exactly 33 samples; scored POI
+  budget is filled; retained frames never exceed source frames.
+- No Gaussian, RGB, depth, or actor rendering was executed.
