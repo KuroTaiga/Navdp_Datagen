@@ -9,6 +9,7 @@ import math
 import statistics
 import sys
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -44,6 +45,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scored-pois-per-source-path", type=int, default=2)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=20260909)
+    parser.add_argument("--workers", type=int, default=1)
     return parser.parse_args()
 
 
@@ -331,7 +333,13 @@ def _survey_family(
         nonempty,
         key=lambda item: _rank(int(args.seed), family, item["scene_key"]),
     )[: int(args.scenes_per_family)]
-    scene_results = [_survey_scene(family, scene, args=args) for scene in selected_scenes]
+    tasks = [(family, scene, args) for scene in selected_scenes]
+    worker_count = min(max(1, int(args.workers)), max(1, len(tasks)))
+    if worker_count > 1 and len(tasks) > 1:
+        with ProcessPoolExecutor(max_workers=worker_count) as pool:
+            scene_results = list(pool.map(_survey_scene_task, tasks))
+    else:
+        scene_results = [_survey_scene_task(task) for task in tasks]
     source_frame_counts = [
         count
         for record in scene_results
@@ -381,6 +389,11 @@ def _survey_family(
     return family_result, scene_results
 
 
+def _survey_scene_task(task: tuple[str, Mapping[str, Any], argparse.Namespace]) -> JsonDict:
+    family, scene, args = task
+    return _survey_scene(family, scene, args=args)
+
+
 def _percent(ratios: Mapping[str, float], action: str) -> str:
     return f"{100.0 * float(ratios.get(action, 0.0)):.2f}%"
 
@@ -397,6 +410,7 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
         f"- Random scene cohorts per family: up to `{config['scenes_per_family']}`.",
         f"- Random robot source paths per selected scene: up to `{config['paths_per_scene']}`.",
         f"- Scored POI budget: `{config['scored_pois_per_source_path']}` per sampled source path.",
+        f"- Scene survey workers: `{config['workers']}`.",
         "- Mandatory mission/checkpoint/path endpoints remain additive and are reported separately.",
         "- Every selected center contributes a 32+1+32 frame context window; no rendering was executed.",
         "",
@@ -524,6 +538,11 @@ def main() -> int:
         family_result, scene_results = _survey_family(family, scenes, args=args)
         family_sampling.append(family_result)
         sampling_scenes.extend(scene_results)
+        print(
+            f"surveyed family={family} scenes={family_result['sampled_scene_count']} "
+            f"paths={family_result['sampled_source_path_count']}",
+            flush=True,
+        )
 
     selected_center_actions = _sum_counts(
         [item["actions"]["selected_centers"]["counts"] for item in family_sampling]
@@ -549,6 +568,7 @@ def main() -> int:
             "scored_pois_per_source_path": int(args.scored_pois_per_source_path),
             "fps": float(args.fps),
             "seed": int(args.seed),
+            "workers": int(args.workers),
             "sampling_scope": "deterministic_stratified_survey_not_full_corpus_export",
         },
         "generation": {
