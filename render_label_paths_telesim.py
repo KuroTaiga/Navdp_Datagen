@@ -494,6 +494,21 @@ def forward_direction(points: Sequence[np.ndarray], idx: int, window: int = 1) -
             accum += delta
             count += 1
     if count == 0:
+        # A long stop can exceed the stabilization window. Look beyond it so
+        # the camera retains the path heading instead of snapping to +Y.
+        for nxt in range(idx + 1, len(points)):
+            delta = points[nxt][:2] - points[idx][:2]
+            if np.linalg.norm(delta) > 1e-4:
+                accum += delta
+                count += 1
+                break
+        for prev in range(idx - 1, -1, -1):
+            delta = points[idx][:2] - points[prev][:2]
+            if np.linalg.norm(delta) > 1e-4:
+                accum += delta
+                count += 1
+                break
+    if count == 0:
         return np.array([0.0, 1.0, 0.0], dtype=np.float32)
     direction_xy = accum / float(count)
     norm = np.linalg.norm(direction_xy)
@@ -508,6 +523,7 @@ class PreparedPath:
     raw_points: list[np.ndarray]
     floor_z: float
     ceiling: float
+    preserve_frame_samples: bool = False
 
 
 def prepare_path_data(
@@ -553,6 +569,7 @@ def prepare_path_data(
         raw_points=raw_points,
         floor_z=float(meta["lower_z"]),
         ceiling=float(meta["upper_z"]),
+        preserve_frame_samples=preserve_samples,
     )
 
 
@@ -791,19 +808,21 @@ def build_camera_poses(
     look_ahead: float,
     look_down: float,
     stabilize: bool,
+    preserve_frame_samples: bool = False,
 ) -> list[tuple[Pose, np.ndarray]]:
-    sampler = PathSampler([pt[:2] for pt in path_xy])
-    distances = list(sampler.cumulative)
-    total_length = sampler.total_length
+    sampler, distances, total_length, stationary_xy = _path_sampling_plan(
+        path_xy,
+        preserve_frame_samples=preserve_frame_samples,
+    )
     follow = max(float(follow_distance), 0.0)
     max_cam_dist = max(total_length - follow, 0.0)
 
     camera_positions: list[np.ndarray] = []
     for dist in distances:
         cam_dist = min(dist, max_cam_dist)
-        xy = sampler.position_at(cam_dist)
+        xy = sampler.position_at(cam_dist) if sampler is not None else stationary_xy
         camera_positions.append(np.array([xy[0], xy[1], ceiling + height_offset], dtype=np.float32))
-        if cam_dist >= max_cam_dist - 1e-6:
+        if not preserve_frame_samples and cam_dist >= max_cam_dist - 1e-6:
             break
 
     poses: list[tuple[Pose, np.ndarray]] = []
@@ -831,6 +850,29 @@ def build_camera_poses(
     return poses
 
 
+def _path_sampling_plan(
+    path_xy: Sequence[np.ndarray],
+    *,
+    preserve_frame_samples: bool,
+) -> tuple[PathSampler | None, list[float], float, np.ndarray]:
+    if len(path_xy) < 2:
+        raise ValueError("Camera path requires at least two temporal samples.")
+    raw_xy = [np.asarray(point[:2], dtype=np.float32) for point in path_xy]
+    if preserve_frame_samples:
+        distances = [0.0]
+        for left, right in zip(raw_xy, raw_xy[1:]):
+            distances.append(distances[-1] + float(np.linalg.norm(right - left)))
+        geometry = deduplicate_points(raw_xy)
+    else:
+        geometry = raw_xy
+        sampler = PathSampler(geometry)
+        return sampler, [float(item) for item in sampler.cumulative], sampler.total_length, raw_xy[0]
+    if len(geometry) < 2:
+        return None, distances, 0.0, raw_xy[0]
+    sampler = PathSampler(geometry)
+    return sampler, distances, sampler.total_length, raw_xy[0]
+
+
 def build_actor_follow_plans(
     path_xy: Sequence[np.ndarray],
     *,
@@ -842,10 +884,12 @@ def build_actor_follow_plans(
     look_down: float,
     stabilize: bool,
     actor_runtime: ActorRuntime,
+    preserve_frame_samples: bool = False,
 ) -> tuple[list[tuple[Pose, np.ndarray]], list[np.ndarray], list[int]]:
-    sampler = PathSampler([pt[:2] for pt in path_xy])
-    distances = list(sampler.cumulative)
-    total_length = sampler.total_length
+    sampler, distances, total_length, stationary_xy = _path_sampling_plan(
+        path_xy,
+        preserve_frame_samples=preserve_frame_samples,
+    )
 
     follow_distance_m = max(float(actor_runtime.options.follow_distance), 0.0)
     max_camera_distance = max(total_length - follow_distance_m, 0.0)
@@ -866,7 +910,11 @@ def build_actor_follow_plans(
         camera_distance = min(dist, max_camera_distance)
         actor_distance = min(camera_distance + follow_distance_m, total_length)
 
-        direction_xy = sampler.direction_at(actor_distance)
+        direction_xy = (
+            sampler.direction_at(actor_distance)
+            if sampler is not None
+            else cached_direction
+        )
         if np.linalg.norm(direction_xy) < 1e-6:
             direction_xy = cached_direction
         actor_dir = direction_xy.copy()
@@ -882,7 +930,7 @@ def build_actor_follow_plans(
         theta = math.atan2(actor_dir[0], actor_dir[1]) + math.pi
         rotation_np = rotation_matrix_z_np(theta)
 
-        actor_pos_xy = sampler.position_at(actor_distance)
+        actor_pos_xy = sampler.position_at(actor_distance) if sampler is not None else stationary_xy
         translation_vec = np.array([actor_pos_xy[0], actor_pos_xy[1], actor_ground_z], dtype=np.float64)
         transform = build_transform_matrix(rotation_np, translation_vec)
 
@@ -895,9 +943,9 @@ def build_actor_follow_plans(
         actor_plans.append(transform)
         actor_indices.append(anim_idx)
 
-        cam_xy = sampler.position_at(camera_distance)
+        cam_xy = sampler.position_at(camera_distance) if sampler is not None else stationary_xy
         camera_positions.append(np.array([cam_xy[0], cam_xy[1], ceiling + height_offset], dtype=np.float32))
-        if camera_distance >= max_camera_distance - 1e-6:
+        if not preserve_frame_samples and camera_distance >= max_camera_distance - 1e-6:
             break
 
     poses: list[tuple[Pose, np.ndarray]] = []
@@ -1283,6 +1331,7 @@ def render_label(
         look_ahead=args.look_ahead,
         look_down=args.look_down,
         stabilize=args.stabilize,
+        preserve_frame_samples=prepared.preserve_frame_samples,
     )
 
     if args.minimal_frames is not None and args.minimal_frames > 0:
@@ -1478,6 +1527,7 @@ def _camera_xy_sequence(
             look_ahead=args.look_ahead,
             look_down=args.look_down,
             stabilize=args.stabilize,
+            preserve_frame_samples=prepared.preserve_frame_samples,
         )
         return [pos[:2].copy() for _, pos in poses]
     poses, _, _ = build_actor_follow_plans(
@@ -1490,6 +1540,7 @@ def _camera_xy_sequence(
         look_down=args.look_down,
         stabilize=args.stabilize,
         actor_runtime=actor_runtime,
+        preserve_frame_samples=prepared.preserve_frame_samples,
     )
     return [pos[:2].copy() for _, pos in poses]
 
@@ -1702,6 +1753,7 @@ def render_label_with_actor_plans(
         look_ahead=args.look_ahead,
         look_down=args.look_down,
         stabilize=args.stabilize,
+        preserve_frame_samples=prepared.preserve_frame_samples,
     )
     actor_tracks = [
         build_actor_motion_plan_transforms(
@@ -2079,6 +2131,7 @@ def render_label_with_actor(
             look_ahead=args.look_ahead,
             look_down=args.look_down,
             stabilize=args.stabilize,
+            preserve_frame_samples=prepared.preserve_frame_samples,
         )
         actor_transforms, actor_indices, actor_active_flags = build_actor_motion_plan_transforms(
             actor_motion_plan,
@@ -2097,6 +2150,7 @@ def render_label_with_actor(
             look_down=args.look_down,
             stabilize=args.stabilize,
             actor_runtime=actor_runtime,
+            preserve_frame_samples=prepared.preserve_frame_samples,
         )
         actor_active_flags = [True] * len(actor_indices)
 

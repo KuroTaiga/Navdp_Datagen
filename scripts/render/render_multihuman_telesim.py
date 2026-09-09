@@ -996,6 +996,7 @@ def main() -> int:
         look_ahead=float(args.look_ahead),
         look_down=float(args.look_down),
         stabilize=bool(args.stabilize),
+        preserve_frame_samples=camera_prepared.preserve_frame_samples,
     )
     if int(args.minimal_frames) > 0:
         camera_poses = camera_poses[: int(args.minimal_frames)]

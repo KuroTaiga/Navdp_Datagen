@@ -244,7 +244,8 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert label_payload["path"]["raster_world"][0]["x"] == 1.0
     assert label_payload["path"]["raster_world"][0]["y"] == 1.0
     assert label_payload["path"]["raster_pixel"][0] == [2, 30]
-    assert len(label_payload["path"]["raster_world"]) == 3
+    assert label_payload["metadata"]["preserve_frame_samples"] is True
+    assert len(label_payload["path"]["raster_world"]) == 21
     actor_payload = json.loads(Path(job_plan["actor_plan_path"]).read_text(encoding="utf-8"))
     assert actor_payload["schema_version"] == "massgen_actor_bundle.v1"
     assert actor_payload["coordinate_pipeline"][0]["stage"] == "massgen_render_manifest"
@@ -257,7 +258,56 @@ def test_deliver_to_human_executor_materializes_label_and_plans_renderer_command
     assert actor["actor_id"] == "human_target"
     assert actor["action"]["render_action_id"] == "receive_item"
     assert actor["frames"][0]["position"][:2] == [6.0, 4.5]
-    assert len(actor["frames"]) == 3
+    assert len(actor["frames"]) == 21
+
+
+def test_executor_keeps_stationary_camera_frames_while_human_moves(tmp_path) -> None:
+    manifest, scenario_json, output_root = _prepared_manifest(tmp_path, moving_human=True)
+    manifest["jobs"][0]["camera"]["trajectory"] = [
+        {
+            "sample_index": 0,
+            "frame": 0,
+            "t": 0.0,
+            "position": [1.0, 1.0, 0.0],
+            "yaw_rad": 0.0,
+            "motion_state": "stopped",
+        },
+        {
+            "sample_index": 1,
+            "frame": 5,
+            "t": 0.5,
+            "position": [1.0, 1.0, 0.0],
+            "yaw_rad": 0.0,
+            "motion_state": "stopped",
+        },
+        {
+            "sample_index": 2,
+            "frame": 10,
+            "t": 1.0,
+            "position": [2.0, 1.0, 0.0],
+            "yaw_rad": 0.0,
+            "motion_state": "moving",
+        },
+    ]
+
+    plan = build_render_plans(
+        manifest,
+        manifest_path=scenario_json,
+        output_root=output_root,
+        write_inputs=True,
+        python_bin=sys.executable,
+    )
+
+    job_plan = plan["plans"][0]
+    label = json.loads(Path(job_plan["label_path"]).read_text(encoding="utf-8"))
+    camera_points = label["path"]["raster_world"]
+    assert len(camera_points) == 11
+    assert all(point["x"] == 1.0 and point["y"] == 1.0 for point in camera_points[:6])
+
+    actors = json.loads(Path(job_plan["actor_plan_path"]).read_text(encoding="utf-8"))
+    human_frames = actors["actors"][0]["frames"]
+    assert len(human_frames) == 11
+    assert human_frames[0]["position"] != human_frames[5]["position"]
 
 
 def test_executor_can_disable_actor_runtime_cache(tmp_path) -> None:
@@ -551,7 +601,7 @@ def test_executor_supports_multi_human_human_only_bundle(tmp_path) -> None:
         assert actor_payload["schema_version"] == "massgen_actor_bundle.v1"
         assert {actor["actor_id"] for actor in actor_payload["actors"]} == {"human_target", "human_peer"}
         assert len(actor_payload["actors"]) == 2
-        assert all(len(actor["frames"]) == 3 for actor in actor_payload["actors"])
+        assert all(len(actor["frames"]) == 21 for actor in actor_payload["actors"])
 
 
 def test_executor_supports_multi_sequence_same_human_bundle(tmp_path) -> None:
@@ -597,8 +647,8 @@ def test_executor_supports_multi_sequence_same_human_bundle(tmp_path) -> None:
     assert {actor["action"]["render_action_id"] for actor in actor_payload["actors"]} == {"stand", "wave"}
     stand = next(actor for actor in actor_payload["actors"] if actor["action"]["render_action_id"] == "stand")
     wave = next(actor for actor in actor_payload["actors"] if actor["action"]["render_action_id"] == "wave")
-    assert [frame["active"] for frame in stand["frames"]] == [True, True, False]
-    assert [frame["active"] for frame in wave["frames"]] == [False, True, True]
+    assert [frame["active"] for frame in stand["frames"]] == [True] * 11 + [False] * 10
+    assert [frame["active"] for frame in wave["frames"]] == [False] * 10 + [True] * 11
     assert stand["action"]["animation_frame_policy"] == "first_frame_static"
     assert wave["action"]["animation_frame_policy"] == "first_frame_static"
     assert {frame["animation_frame_index"] for frame in stand["frames"]} == {0}
@@ -667,6 +717,6 @@ def test_executor_plans_chained_peer_robot_overlays(tmp_path) -> None:
     pose_payload = json.loads(Path(first["poses_json"]).read_text(encoding="utf-8"))
     amo_payload = json.loads(Path(first["amo_poses_json"]).read_text(encoding="utf-8"))
     assert pose_payload["schema_version"] == "massgen_robot_overlay_poses.v1"
-    assert len(pose_payload["frames"]) == 3
+    assert len(pose_payload["frames"]) == 21
     assert amo_payload["schema_version"] == "g1_amo_retarget.v1"
     assert amo_payload["frames"][0]["joint_positions"]["left_shoulder_roll_joint"] == 0.18

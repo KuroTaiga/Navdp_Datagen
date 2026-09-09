@@ -146,6 +146,11 @@ Render executors and label-path helpers must honor
 prevents stop/yield/repeated-pose context from being removed by trajectory
 deduplication or distance resampling. Executor planning also blocks
 `--minimal-frames` values that would truncate selected frame-interest windows.
+All MassGen camera jobs set this flag, including full-path jobs. If exported
+trajectory samples have gaps in their frame indices, the executor interpolates
+one camera timestamp per missing frame before building camera, human, and peer
+robot tracks. Repeated camera positions remain repeated render frames so scene
+actors can continue moving while the ego robot is stopped.
 
 Self-service run extension:
 

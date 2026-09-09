@@ -582,7 +582,7 @@ def _peer_robot_overlay_bundle(
         blockers.append(f"unable to load scene occupancy metadata for robot coordinates: {exc}")
         coord_meta = None
 
-    camera_times = _trajectory_times(job.get("camera", {}).get("trajectory", []))
+    camera_times = _trajectory_times(_job_camera_trajectory(job))
     if not camera_times:
         camera_times = [float(index) for index in range(max(1, int(frame_count_hint)))]
 
@@ -905,13 +905,14 @@ def _write_label_path(job: Mapping[str, Any], *, label_path: Path, scene_dir: Pa
     camera = job.get("camera", {})
     if not isinstance(camera, Mapping):
         raise ValueError("job.camera must be an object")
-    trajectory = camera.get("trajectory", [])
-    if not isinstance(trajectory, list):
+    raw_trajectory = camera.get("trajectory", [])
+    if not isinstance(raw_trajectory, list):
         raise ValueError("job.camera.trajectory must be a list")
     preserve_samples = _job_preserve_frame_samples(job)
+    trajectory = _job_camera_trajectory(job)
     points = _trajectory_world_points(trajectory, preserve_stationary_samples=preserve_samples)
     if len(points) < 2:
-        raise ValueError("job.camera.trajectory must contain at least two distinct positions")
+        raise ValueError("job.camera.trajectory must contain at least two samples")
     meta = _load_occupancy_metadata_for_label(scene_dir)
     raster_world = [{"x": float(x), "y": float(y), "z": float(z)} for x, y, z in points]
     raster_pixel = [list(_scene_xy_to_pixel(meta, float(x), float(y))) for x, y, _ in points]
@@ -1100,11 +1101,15 @@ def _job_preserve_frame_samples(job: Mapping[str, Any]) -> bool:
     if not isinstance(camera, Mapping):
         return False
     metadata = camera.get("metadata", {})
-    return bool(
-        camera.get("preserve_frame_samples")
-        or (isinstance(metadata, Mapping) and metadata.get("preserve_frame_samples"))
-        or job.get("frame_selection")
-    )
+    if "preserve_frame_samples" in camera:
+        return bool(camera.get("preserve_frame_samples"))
+    if isinstance(metadata, Mapping) and "preserve_frame_samples" in metadata:
+        return bool(metadata.get("preserve_frame_samples"))
+    if job.get("frame_selection"):
+        return True
+    # MassGen trajectories are temporal samples, including repeated poses while
+    # the ego robot is stopped and other actors continue moving.
+    return True
 
 
 def _job_frame_selection_enabled(job: Mapping[str, Any]) -> bool:
@@ -1112,16 +1117,96 @@ def _job_frame_selection_enabled(job: Mapping[str, Any]) -> bool:
 
 
 def _job_camera_frame_count(job: Mapping[str, Any]) -> int:
-    camera = job.get("camera", {})
-    trajectory = camera.get("trajectory", []) if isinstance(camera, Mapping) else []
-    if not isinstance(trajectory, Sequence):
-        return 0
+    trajectory = _job_camera_trajectory(job)
     return len(
         _trajectory_world_points(
             trajectory,
             preserve_stationary_samples=_job_preserve_frame_samples(job),
         )
     )
+
+
+def _job_camera_trajectory(job: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    camera = job.get("camera", {})
+    trajectory = camera.get("trajectory", []) if isinstance(camera, Mapping) else []
+    if not isinstance(trajectory, Sequence):
+        return []
+    points = [item for item in trajectory if isinstance(item, Mapping)]
+    if not _job_preserve_frame_samples(job):
+        return points
+    return _densify_trajectory_by_frame(points)
+
+
+def _densify_trajectory_by_frame(
+    trajectory: Sequence[Mapping[str, Any]],
+) -> list[Mapping[str, Any]]:
+    """Expand sparse frame-indexed trajectory samples without dropping stops."""
+
+    if len(trajectory) < 2:
+        return list(trajectory)
+    by_frame: dict[int, Mapping[str, Any]] = {}
+    for index, point in enumerate(trajectory):
+        try:
+            frame = int(point.get("frame", index))
+        except (TypeError, ValueError):
+            frame = index
+        by_frame[frame] = point
+    framed = sorted(by_frame.items())
+    if len(framed) < 2 or all(right[0] - left[0] <= 1 for left, right in zip(framed, framed[1:])):
+        return [point for _frame, point in framed]
+
+    dense: list[Mapping[str, Any]] = []
+    for segment_index, ((left_frame, left), (right_frame, right)) in enumerate(zip(framed, framed[1:])):
+        if segment_index == 0:
+            dense.append(left)
+        gap = right_frame - left_frame
+        if gap <= 0:
+            continue
+        left_position = _trajectory_position(left)
+        right_position = _trajectory_position(right)
+        left_time = _trajectory_time(left, left_frame)
+        right_time = _trajectory_time(right, right_frame)
+        left_yaw = float(left.get("yaw_rad", 0.0) or 0.0)
+        right_yaw = float(right.get("yaw_rad", left_yaw) or left_yaw)
+        yaw_delta = _wrap_angle(right_yaw - left_yaw)
+        for step in range(1, gap + 1):
+            if step == gap:
+                dense.append(right)
+                continue
+            alpha = float(step) / float(gap)
+            source = left if alpha < 0.5 else right
+            point = dict(source)
+            point.update(
+                {
+                    "sample_index": len(dense),
+                    "frame": left_frame + step,
+                    "t": left_time + (right_time - left_time) * alpha,
+                    "time_s": left_time + (right_time - left_time) * alpha,
+                    "position": [
+                        left_position[axis] + (right_position[axis] - left_position[axis]) * alpha
+                        for axis in range(3)
+                    ],
+                    "yaw_rad": _wrap_angle(left_yaw + yaw_delta * alpha),
+                }
+            )
+            dense.append(point)
+    return dense
+
+
+def _trajectory_position(point: Mapping[str, Any]) -> tuple[float, float, float]:
+    raw = point.get("position", ())
+    if not isinstance(raw, Sequence) or len(raw) < 2:
+        return 0.0, 0.0, 0.0
+    return (
+        float(raw[0]),
+        float(raw[1]),
+        float(raw[2]) if len(raw) > 2 else 0.0,
+    )
+
+
+def _trajectory_time(point: Mapping[str, Any], frame: int) -> float:
+    value = point.get("time_s", point.get("t"))
+    return float(value) if value is not None else float(frame)
 
 
 def _trajectory_world_points(
@@ -1229,7 +1314,7 @@ def _human_actor_plan_bundle(
         if isinstance(human, Mapping) and human.get("actor_id")
     }
 
-    camera_times = _trajectory_times(job.get("camera", {}).get("trajectory", []))
+    camera_times = _trajectory_times(_job_camera_trajectory(job))
     if not camera_times:
         camera_times = [float(index) for index in range(max(1, int(frame_count_hint)))]
     try:

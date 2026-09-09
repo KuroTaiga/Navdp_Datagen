@@ -1025,6 +1025,7 @@ def _render_job(
         "camera": {
             "mode": "robot_fpv",
             "source_actor_id": viewpoint_robot_id,
+            "preserve_frame_samples": True,
             "trajectory": list(ego_robot["trajectory"]),
         },
         "human_actor_ids": [str(human["actor_id"]) for human in humans],

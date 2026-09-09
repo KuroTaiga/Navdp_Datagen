@@ -166,6 +166,7 @@ def test_dense_combined_manifest_tracks_dynamic_humans_and_peer_robots() -> None
 
     assert len(manifest["jobs"]) == 3
     for job in manifest["jobs"]:
+        assert job["camera"]["preserve_frame_samples"] is True
         assert len(job["peer_robot_ids"]) == 2
         assert len(job["peer_robot_pose_tracks"]) == 2
         assert all(track["trajectory"] for track in job["peer_robot_pose_tracks"])

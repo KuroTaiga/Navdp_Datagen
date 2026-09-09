@@ -39,6 +39,7 @@ class PreparedPath:
     path_xyz: list[np.ndarray]
     floor_z: float
     ceiling: float
+    preserve_frame_samples: bool = False
 
 
 class PathSampler:
@@ -121,6 +122,19 @@ def forward_direction(points_xyz: Sequence[np.ndarray], idx: int, window: int) -
             accum += delta
             count += 1
     if count == 0:
+        for nxt in range(idx + 1, len(points_xyz)):
+            delta = points_xyz[nxt][:2] - points_xyz[idx][:2]
+            if np.linalg.norm(delta) > 1e-4:
+                accum += delta
+                count += 1
+                break
+        for prev in range(idx - 1, -1, -1):
+            delta = points_xyz[idx][:2] - points_xyz[prev][:2]
+            if np.linalg.norm(delta) > 1e-4:
+                accum += delta
+                count += 1
+                break
+    if count == 0:
         return np.array([0.0, 1.0, 0.0], dtype=np.float32)
     direction_xy = accum / float(count)
     norm = np.linalg.norm(direction_xy)
@@ -170,6 +184,7 @@ def prepare_path_data(
         path_xyz=[np.array([pt[0], pt[1], 0.0], dtype=np.float32) for pt in sampled_xy],
         floor_z=float(meta["lower_z"]),
         ceiling=float(meta["upper_z"]),
+        preserve_frame_samples=preserve_samples,
     )
 
 
@@ -286,20 +301,31 @@ def build_camera_frame_payloads_for_path(
     znear: float,
     zfar: float,
 ) -> list[dict[str, Any]]:
-    sampler = PathSampler([pt[:2] for pt in prepared.path_xyz])
-    distances = list(sampler.cumulative)
-    total_length = sampler.total_length
+    raw_xy = [np.asarray(point[:2], dtype=np.float32) for point in prepared.path_xyz]
+    if len(raw_xy) < 2:
+        raise ValueError("Camera path requires at least two temporal samples.")
+    if prepared.preserve_frame_samples:
+        distances = [0.0]
+        for left, right in zip(raw_xy, raw_xy[1:]):
+            distances.append(distances[-1] + float(np.linalg.norm(right - left)))
+        geometry = deduplicate_points(raw_xy)
+    else:
+        geometry = raw_xy
+        sampler = PathSampler(geometry)
+        distances = [float(item) for item in sampler.cumulative]
+    sampler = PathSampler(geometry) if len(geometry) >= 2 else None
+    total_length = sampler.total_length if sampler is not None else 0.0
     follow = max(0.0, float(follow_distance))
     max_cam_dist = max(total_length - follow, 0.0)
 
     camera_positions: list[np.ndarray] = []
     for dist in distances:
         cam_dist = min(float(dist), max_cam_dist)
-        xy = sampler.position_at(float(cam_dist))
+        xy = sampler.position_at(float(cam_dist)) if sampler is not None else raw_xy[0]
         camera_positions.append(
             np.array([xy[0], xy[1], prepared.ceiling + float(height_offset)], dtype=np.float32)
         )
-        if cam_dist >= max_cam_dist - 1e-6:
+        if not prepared.preserve_frame_samples and cam_dist >= max_cam_dist - 1e-6:
             break
 
     direction_window = 5 if stabilize else 1
