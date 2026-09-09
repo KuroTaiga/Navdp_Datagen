@@ -119,8 +119,8 @@ The generated JSON has:
 
 The frame-interest selector is a Datagen-side step between Pathplanner manifest
 export and rendering. It chooses target frames for training/testing, expands
-each selected target to the required `32 past + current + 32 future` window, and
-passes only those window jobs to the renderer.
+each selected target to the required `32 past + current` window, and passes only
+those window jobs to the renderer. Future frames are not packaged.
 
 Selection manifests use schema `navdp_frame_interest_selection/v0.1` and store:
 
@@ -128,7 +128,7 @@ Selection manifests use schema `navdp_frame_interest_selection/v0.1` and store:
 - adaptive interest-bucket and secondary action distributions;
 - selected chunks with target frame, action, bucket, score, reasons, and source
   frame indices;
-- a render contract requiring all 65 window frames to be rendered;
+- a render contract requiring all 33 window frames to be rendered;
 - a render frame index with unique source frames for future sparse rendering.
 
 The selected-window render manifest keeps the original source manifest metadata
@@ -136,8 +136,8 @@ but replaces `jobs` with one job per selected frame of interest. Each selected
 job:
 
 - has `job_id` suffixed with `__m<source_manifest_index>__foi_<target_frame>`;
-- carries only the selected 65 camera trajectory samples;
-- rewrites renderer-local frame/sample ids to `0..64`;
+- carries only the selected 33 camera trajectory samples;
+- rewrites renderer-local frame/sample ids to `0..32`;
 - preserves source frame indices in point and camera metadata;
 - sets `camera.preserve_frame_samples=true`.
 
@@ -200,6 +200,6 @@ Schema-only Pathplanner families are converted with warnings only:
   normalized sensor-rig import path before users can render with arbitrary
   Isaac Sim/OpenUSD robot sensor setups. Until then, default and comparison
   profiles are documented in `docs/camera_sensor_defaults.md`.
-- Frame-interest selection currently materializes one 65-frame render job per
+- Frame-interest selection currently materializes one 33-frame render job per
   selected target. The manifest already reports unique source frame reuse, but a
   renderer that renders each unique source frame only once is still future work.

@@ -78,14 +78,14 @@ Secondary action target ratios default to:
 
 | Action | Code | Default Share |
 | --- | ---: | ---: |
-| stop | `0` | 20% |
-| forward / move | `1` | 40% |
-| turn left | `2` | 20% |
-| turn right | `3` | 20% |
+| stop | `0` | 15% |
+| forward / move | `1` | 55% |
+| turn left | `2` | 15% |
+| turn right | `3` | 15% |
 
 These ratios are configurable with `--action-ratio`, but currently affect only
 soft selection priority. The survey reports action distributions at selected
-centers and across the complete retained 65-frame windows. This avoids mistaking
+centers and across the complete retained 33-frame windows. This avoids mistaking
 a critical-state-heavy center distribution for a dataset with no forward motion.
 
 ## Inputs
@@ -110,22 +110,21 @@ paths; a positive value selects that many whole paths.
 
 Every camera trajectory sample that can support the requested window becomes a
 candidate. The default edge policy is `reject`, so an ordinary point requires 32
-valid past and 32 valid future frames. Required sub-mission and mission endpoints
-use the configured endpoint policy, `clamp` by default, which repeats the nearest
-edge sample to preserve an exact 65-frame tensor without moving the endpoint.
+valid past frames. Required sub-mission and mission endpoints use the configured
+endpoint policy, `clamp` by default. No future frames are packaged.
 
 Each candidate stores:
 
 - source manifest index/path and source render job id;
 - source frame index/id, timestamp, pose, yaw, and coarse action;
-- all 65 source frame indices required for rendering;
+- all 33 source frame indices required for rendering;
 - interest bucket scores and selection reasons;
 - split and target role metadata.
 
 Pathplanner trajectories may contain sparse waypoints whose integer `frame`
 values span many renderer frames. By default, the selector linearly interpolates
 position, time, and wrapped yaw across those frame-id gaps before applying the
-65-frame eligibility rule. It preserves source/interpolation provenance in point
+33-frame eligibility rule. It preserves source/interpolation provenance in point
 metadata. `--no-densify-frame-gaps` is available only for compatibility audits.
 
 Score components include actor/robot proximity, event proximity, stop/turn
@@ -146,7 +145,7 @@ transitions, turn magnitude, and representative clean-motion coverage.
    jitter, and minimum spacing. Multiple POIs may come from the same path;
    `--max-targets-per-job 0` leaves that unlimited.
 8. Fill any remaining scored POI budget from the globally best eligible frames.
-9. Emit 65-frame windows and both selection and selected-render manifests.
+9. Emit 33-frame windows and both selection and selected-render manifests.
 
 The manifest separately reports actions at all selected centers, scored POI
 centers, mandatory anchors, all repeated window samples, and unique retained
@@ -164,8 +163,8 @@ No per-path action maximum is imposed.
   "schema_version": "navdp_frame_interest_selection/v0.1",
   "config": {
     "past_frames": 32,
-    "future_frames": 32,
-    "window_frame_count": 65,
+    "future_frames": 0,
+    "window_frame_count": 33,
     "distribution_policy": "anchor_aware_center_balance/v0.3"
   },
   "distribution": {
@@ -244,7 +243,7 @@ Scenario inputs are converted into renderer-owned manifests under
 The pilot generator never runs render commands. Each ready family record stores
 separate `plan_argv` and `execute_argv` arrays, both with
 `execution_authorized=false`, so operators can inspect render plans before
-explicitly launching the 65-frame jobs.
+explicitly launching the 33-frame jobs.
 
 The default pilot also includes four separately audited social-navigation
 variants mapped to their law ids: personal space (`L1`), pedestrian yield
@@ -290,8 +289,8 @@ python3 scripts/massgen/render_manifest_jobs.py \
 ## Renderer Integration
 
 Current implementation prepares one selected-window job per selected target. Each
-window job contains a 65-point camera trajectory, rewrites renderer-local frame
-ids to `0..64`, and preserves original source frame indices in metadata.
+window job contains a 33-point camera trajectory, rewrites renderer-local frame
+ids to `0..32`, and preserves original source frame indices in metadata.
 
 The renderer path now respects `camera.preserve_frame_samples` and
 `metadata.preserve_frame_samples`, so repeated stationary poses are kept in the
@@ -301,9 +300,9 @@ selected frame-interest window.
 
 The selection summary reports both:
 
-- `requested_window_frame_renders`: selected targets multiplied by 65;
+- `requested_window_frame_renders`: selected targets multiplied by 33;
 - `unique_source_render_frame_count`: de-duplicated source frames needed across
-  overlapping windows.
+overlapping windows.
 
 Selections can be constrained with repeatable `--family` arguments. The
 all-family pilot generator uses that constraint to prevent multi-family source
@@ -311,7 +310,7 @@ collections from filling one family's budget with another family's jobs.
 
 A future sparse-frame renderer can render each unique source frame once and map
 it back to every chunk. Until then, the selected-window manifests preserve the
-65-frame model contract without authorizing or executing rendering.
+33-frame model contract without authorizing or executing rendering.
 
 ## Output Layout
 
@@ -355,7 +354,7 @@ families remain waiting for source manifests.
 
 Validated:
 
-- selector emits 65-frame windows for selected targets;
+- selector emits 33-frame windows for selected targets;
 - seeded path selection consumes complete paths and permits multiple POIs per
   path;
 - assigned sub-mission endpoints and whole-mission endpoints are mandatory and
@@ -365,7 +364,7 @@ Validated:
 - selected-window manifest rewrites render jobs without mutating source jobs;
 - label-path materialization preserves repeated stationary frames;
 - sparse Pathplanner waypoints are densified into contiguous renderer frames;
-- all active mission families produce a family-constrained 65-frame pilot when
+- all active mission families produce a family-constrained 33-frame pilot when
   a suitable local manifest exists;
 - disconnected families remain explicitly `waiting_for_source_manifest` and do
   not authorize execution.
@@ -373,4 +372,4 @@ Validated:
 Still required:
 
 - source scenarios for the five missing novelty families;
-- Datagen asset preflight and one rendered 65-frame window per cohort.
+- Datagen asset preflight and one rendered 33-frame window per cohort.

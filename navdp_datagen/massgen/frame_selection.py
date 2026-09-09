@@ -13,7 +13,7 @@ JsonDict = dict[str, Any]
 
 FRAME_SELECTION_SCHEMA_VERSION = "navdp_frame_interest_selection/v0.1"
 DEFAULT_PAST_FRAMES = 32
-DEFAULT_FUTURE_FRAMES = 32
+DEFAULT_FUTURE_FRAMES = 0
 DEFAULT_SEED = 20260907
 INTEREST_BUCKETS = (
     "critical_margin",
@@ -273,7 +273,7 @@ def apply_frame_selection_to_manifest(
     *,
     manifest_path: str | Path | None = None,
 ) -> JsonDict:
-    """Return a render manifest whose jobs are selected 65-frame windows."""
+    """Return a render manifest whose jobs are selected temporal windows."""
 
     source_chunks = _chunks_for_manifest(selection, manifest_path=manifest_path)
     out = deepcopy(dict(manifest))

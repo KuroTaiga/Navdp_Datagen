@@ -1,5 +1,9 @@
 # Frame-Selection Remote Validation - 2026-09-08
 
+> Historical contract: this validation exercised `32 past + current + 32
+> future`. The package default changed on 2026-09-09 to `32 past + current`
+> (33 frames), so these counts must not be used for current render sizing.
+
 ## Scope
 
 The frame-interest sampler was exercised through the `pathGen_lxh` SSH target

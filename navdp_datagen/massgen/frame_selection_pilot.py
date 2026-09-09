@@ -299,7 +299,7 @@ def _prepare_family(
     status = "ready"
     next_action = "run each plan_argv after local or remote scene assets are connected"
     if selected_interest_count == 0 and selected_count == 0:
-        status = "no_eligible_65_frame_window"
+        status = "no_eligible_temporal_window"
         next_action = "provide trajectories with enough frames for the configured temporal window"
     elif selected_interest_count < int(config.targets_per_family):
         status = "insufficient_candidates"

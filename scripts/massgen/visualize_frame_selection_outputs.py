@@ -360,7 +360,7 @@ def _draw_bev(ax: plt.Axes, family: FamilyVisualization, fraction: float) -> Non
         handles=[
             Line2D([0], [0], color=UNSELECTED_SOURCE_COLOR, linewidth=1.2, label="Unselected eligible path"),
             Line2D([0], [0], color=SOURCE_COLOR, linewidth=2, label="Selected whole path"),
-            Line2D([0], [0], color=WINDOW_COLORS[0], linewidth=4, label="Selected 65-frame window"),
+            Line2D([0], [0], color=WINDOW_COLORS[0], linewidth=4, label="Selected context window"),
             Line2D([0], [0], marker="o", color="none", markerfacecolor=CENTER_COLOR,
                    markeredgecolor="white", markersize=8, label="Frame of interest"),
             Line2D([0], [0], marker="D", color="none", markerfacecolor=ANCHOR_COLOR,
@@ -485,7 +485,7 @@ def write_distributions(families: Sequence[FamilyVisualization], output_root: Pa
     )
     _stacked_distribution(
         axes[1, 2], families, categories=action_categories, colors=ACTION_COLORS,
-        counts_attribute="retained_window_actions", title="Actions in retained 65-frame windows",
+        counts_attribute="retained_window_actions", title="Actions in retained context windows",
     )
     for ax in axes[:, 1:].flat:
         ax.tick_params(axis="y", labelleft=False)

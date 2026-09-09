@@ -20,6 +20,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from navdp_datagen.massgen.frame_selection import (  # noqa: E402
     DEFAULT_ACTION_RATIOS,
+    DEFAULT_FUTURE_FRAMES,
+    DEFAULT_PAST_FRAMES,
     FrameSelectionConfig,
     select_frame_interest_windows,
 )
@@ -43,6 +45,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scenes-per-family", type=int, default=25)
     parser.add_argument("--paths-per-scene", type=int, default=50)
     parser.add_argument("--scored-pois-per-source-path", type=int, default=2)
+    parser.add_argument("--past-frames", type=int, default=DEFAULT_PAST_FRAMES)
+    parser.add_argument("--future-frames", type=int, default=DEFAULT_FUTURE_FRAMES)
     parser.add_argument("--fps", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=20260909)
     parser.add_argument("--workers", type=int, default=1)
@@ -202,6 +206,8 @@ def _survey_scene(
         manifest_paths=manifest_paths,
         config=FrameSelectionConfig(
             target_count=int(args.scored_pois_per_source_path) * requested_source_paths,
+            past_frames=int(args.past_frames),
+            future_frames=int(args.future_frames),
             mission_families=(selector_family,),
             max_source_paths=int(args.paths_per_scene),
             max_targets_per_job=0,
@@ -401,6 +407,7 @@ def _percent(ratios: Mapping[str, float], action: str) -> str:
 def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
     config = payload["config"]
     totals = payload["sampling"]["totals"]
+    window_frame_count = int(config["window_frame_count"])
     lines = [
         "# Anchor-Aware Frame-Sampling Survey",
         "",
@@ -412,7 +419,8 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
         f"- Scored POI budget: `{config['scored_pois_per_source_path']}` per sampled source path.",
         f"- Scene survey workers: `{config['workers']}`.",
         "- Mandatory mission/checkpoint/path endpoints remain additive and are reported separately.",
-        "- Every selected center contributes a 32+1+32 frame context window; no rendering was executed.",
+        f"- Every selected center contributes `{config['past_frames']}` past frames plus the current frame "
+        f"and `{config['future_frames']}` future frames ({window_frame_count} total); no rendering was executed.",
         "",
         "## Aggregate Results",
         "",
@@ -432,7 +440,7 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
         ("Scored POI centers", "scored_poi_center_actions"),
         ("Mandatory anchors", "mandatory_anchor_actions"),
         ("All selected centers", "selected_center_actions"),
-        ("Repeated 65-frame windows", "repeated_window_actions"),
+        (f"Repeated {window_frame_count}-frame windows", "repeated_window_actions"),
         ("Unique retained frames", "unique_retained_actions"),
     ):
         ratios = totals[key]["ratios"]
@@ -466,7 +474,8 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
             "",
             "## Turn-Window Dilution",
             "",
-            "These rows condition on the scored center action. They show how many matching-action frames occur inside each 65-frame input.",
+            "These rows condition on the scored center action. They show how many matching-action "
+            f"frames occur inside each {window_frame_count}-frame input.",
             "",
             "| Center action | Windows | Mean matching frames | At least 5 matching frames | At least 10 matching frames |",
             "| --- | ---: | ---: | ---: | ---: |",
@@ -566,6 +575,9 @@ def main() -> int:
             "scenes_per_family": int(args.scenes_per_family),
             "paths_per_scene": int(args.paths_per_scene),
             "scored_pois_per_source_path": int(args.scored_pois_per_source_path),
+            "past_frames": int(args.past_frames),
+            "future_frames": int(args.future_frames),
+            "window_frame_count": int(args.past_frames) + 1 + int(args.future_frames),
             "fps": float(args.fps),
             "seed": int(args.seed),
             "workers": int(args.workers),

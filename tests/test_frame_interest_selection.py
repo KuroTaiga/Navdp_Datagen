@@ -123,7 +123,7 @@ def _manifest(
     }
 
 
-def test_frame_interest_selection_emits_65_frame_windows(tmp_path: Path) -> None:
+def test_frame_interest_selection_emits_past_and_current_windows(tmp_path: Path) -> None:
     manifest = _manifest(_scene(tmp_path))
     config = FrameSelectionConfig(target_count=4, seed=1234, preserve_mission_endpoints=False)
 
@@ -131,8 +131,13 @@ def test_frame_interest_selection_emits_65_frame_windows(tmp_path: Path) -> None
 
     assert selection["schema_version"] == "navdp_frame_interest_selection/v0.1"
     assert selection["selection_summary"]["selected_target_count"] == 4
-    assert selection["selection_summary"]["window_frame_count"] == 65
-    assert selection["selection_summary"]["requested_window_frame_renders"] == 4 * 65
+    expected_window_frames = DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
+    assert expected_window_frames == 33
+    assert selection["selection_summary"]["window_frame_count"] == expected_window_frames
+    assert (
+        selection["selection_summary"]["requested_window_frame_renders"]
+        == 4 * expected_window_frames
+    )
     for chunk in selection["chunks"]:
         frames = chunk["window"]["source_frame_indices"]
         assert len(frames) == DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
@@ -151,7 +156,10 @@ def test_apply_frame_selection_rewrites_jobs_to_selected_windows(tmp_path: Path)
     assert len(selected_manifest["jobs"]) == 2
     for job in selected_manifest["jobs"]:
         assert job["job_id"].startswith("scenario_001__view_robot_alpha__m000__foi_")
-        assert len(job["camera"]["trajectory"]) == 65
+        assert (
+            len(job["camera"]["trajectory"])
+            == DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
+        )
         assert job["camera"]["preserve_frame_samples"] is True
         assert job["frame_selection"]["preserve_stationary_frames"] is True
         assert job["camera"]["trajectory"][0]["metadata"]["source_frame_index"] >= 0
@@ -199,8 +207,11 @@ def test_selected_render_plan_preserves_stationary_frame_samples(tmp_path: Path)
     label_path = Path(plan["plans"][0]["label_path"])
     label = json.loads(label_path.read_text(encoding="utf-8"))
     assert label["metadata"]["preserve_frame_samples"] is True
-    assert len(label["path"]["raster_world"]) == 65
-    assert sum(1 for point in label["path"]["raster_world"] if point["x"] == 4.7) == 7
+    assert (
+        len(label["path"]["raster_world"])
+        == DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
+    )
+    assert sum(1 for point in label["path"]["raster_world"] if point["x"] == 4.7) == 4
 
 
 def test_family_filter_excludes_other_manifest_jobs(tmp_path: Path) -> None:
@@ -232,7 +243,7 @@ def test_family_filter_excludes_other_manifest_jobs(tmp_path: Path) -> None:
     assert all(chunk["mission_families"] == ["deliver_to_human"] for chunk in selection["chunks"])
 
 
-def test_sparse_source_frame_ids_are_densified_for_65_frame_windows(tmp_path: Path) -> None:
+def test_sparse_source_frame_ids_are_densified_for_temporal_windows(tmp_path: Path) -> None:
     manifest = _manifest(_scene(tmp_path))
     job = manifest["jobs"][0]
     job["camera"]["trajectory"] = [
@@ -284,12 +295,15 @@ def test_sparse_source_frame_ids_are_densified_for_65_frame_windows(tmp_path: Pa
     )
     selected_points = selected_manifest["jobs"][0]["camera"]["trajectory"]
     source_frame_ids = [point["metadata"]["source_frame_id"] for point in selected_points]
-    assert len(selected_points) == 65
-    assert source_frame_ids == list(range(source_frame_ids[0], source_frame_ids[0] + 65))
+    expected_window_frames = DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
+    assert len(selected_points) == expected_window_frames
+    assert source_frame_ids == list(
+        range(source_frame_ids[0], source_frame_ids[0] + expected_window_frames)
+    )
     assert any(point["metadata"].get("frame_selection_interpolated") for point in selected_points)
 
 
-def test_final_trajectory_endpoint_is_a_mandatory_clamped_anchor(tmp_path: Path) -> None:
+def test_final_trajectory_endpoint_is_a_mandatory_past_and_current_anchor(tmp_path: Path) -> None:
     manifest = _manifest(_scene(tmp_path))
 
     selection = select_frame_interest_windows(
@@ -313,10 +327,11 @@ def test_final_trajectory_endpoint_is_a_mandatory_clamped_anchor(tmp_path: Path)
     assert chunk["target_frame"] == 99
     assert chunk["target_role"] == "mandatory_anchor"
     assert chunk["mandatory_anchor_types"] == ["trajectory_end"]
-    assert chunk["window"]["edge_policy"] == "clamp"
+    assert chunk["window"]["edge_policy"] == "reject"
+    assert chunk["window"]["source_frame_indices"][0] == 99 - DEFAULT_PAST_FRAMES
     assert chunk["window"]["source_frame_indices"][32] == 99
     assert chunk["window"]["source_frame_indices"][-1] == 99
-    assert len(chunk["window"]["source_frame_indices"]) == 65
+    assert len(chunk["window"]["source_frame_indices"]) == DEFAULT_PAST_FRAMES + 1
 
 
 def test_assigned_sub_mission_completions_are_always_selected(tmp_path: Path) -> None:
@@ -377,7 +392,7 @@ def test_summary_separates_center_actions_from_retained_window_actions(tmp_path:
 
     summary = selection["selection_summary"]
     assert summary["selected_center_action_counts"] == summary["selected_action_counts"]
-    assert sum(summary["selected_window_action_counts"].values()) == 65
+    assert sum(summary["selected_window_action_counts"].values()) == DEFAULT_PAST_FRAMES + 1
     assert summary["selected_window_action_counts"]["move"] > 0
     assert sum(summary["selected_window_action_ratios"].values()) == pytest.approx(1.0)
 
@@ -623,7 +638,7 @@ def test_family_pilot_prepares_one_poi_plus_endpoint_render_tests(
     assert record["selected_interest_target_count"] == 1
     assert record["mandatory_anchor_count"] == 1
     assert record["selected_target_count"] == 2
-    assert record["requested_window_frame_renders"] == 130
+    assert record["requested_window_frame_renders"] == 2 * (DEFAULT_PAST_FRAMES + 1)
     assert len(record["selected_render_manifests"]) == 1
     assert record["commands"][0]["execution_authorized"] is False
     assert "--execute" not in record["commands"][0]["plan_argv"]
@@ -631,4 +646,7 @@ def test_family_pilot_prepares_one_poi_plus_endpoint_render_tests(
 
     selection = json.loads(Path(record["selection_json"]).read_text(encoding="utf-8"))
     assert all(chunk["mission_families"] == [mission_family] for chunk in selection["chunks"])
-    assert all(len(chunk["window"]["source_frame_indices"]) == 65 for chunk in selection["chunks"])
+    assert all(
+        len(chunk["window"]["source_frame_indices"]) == DEFAULT_PAST_FRAMES + 1
+        for chunk in selection["chunks"]
+    )

@@ -47,7 +47,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Select navigation frame-of-interest windows and optionally emit a "
-            "render manifest that renders only those 32+1+32 frame windows."
+            "render manifest that renders only those past+current temporal windows."
         )
     )
     parser.add_argument("--manifest-json", type=Path, action="append", required=True)
