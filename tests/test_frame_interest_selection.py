@@ -382,6 +382,67 @@ def test_summary_separates_center_actions_from_retained_window_actions(tmp_path:
     assert sum(summary["selected_window_action_ratios"].values()) == pytest.approx(1.0)
 
 
+def test_scored_center_action_minimums_exclude_mandatory_anchors(tmp_path: Path) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    trajectory = []
+    for index in range(220):
+        motion_state = "moving"
+        yaw = 0.0
+        if 45 <= index < 85:
+            motion_state = "stopped"
+        elif 85 <= index < 130:
+            yaw = (index - 85) * 0.2
+        elif 130 <= index < 175:
+            yaw = 9.0 - (index - 130) * 0.2
+        if index == 219:
+            motion_state = "done"
+        trajectory.append(
+            {
+                "sample_index": index,
+                "frame": index,
+                "t": index * 0.1,
+                "position": [index * 0.1, 0.0, 0.0],
+                "yaw_rad": yaw,
+                "motion_state": motion_state,
+            }
+        )
+    manifest["jobs"][0]["camera"]["trajectory"] = trajectory
+
+    selection = select_frame_interest_windows(
+        [manifest],
+        manifest_paths=["manifest.json"],
+        config=FrameSelectionConfig(
+            target_count=20,
+            min_target_spacing_frames=0,
+            target_bucket_ratios={"route_decision": 1.0},
+        ),
+    )
+
+    assert selection["distribution"]["target_action_counts"] == {
+        "move": 11,
+        "stop": 3,
+        "turn_left": 3,
+        "turn_right": 3,
+    }
+    summary = selection["selection_summary"]
+    assert summary["selected_interest_action_counts"] == {
+        "move": 11,
+        "stop": 3,
+        "turn_left": 3,
+        "turn_right": 3,
+    }
+    assert summary["mandatory_anchor_action_counts"] == {"stop": 1}
+    assert summary["action_deficits"] == {
+        "move": 0,
+        "stop": 0,
+        "turn_left": 0,
+        "turn_right": 0,
+    }
+    assert summary["training_center_sampling"]["population"] == "scored_poi_centers"
+    assert summary["training_center_sampling"]["mandatory_anchor_policy"] == "retained_separate_pool"
+    assert summary["scored_center_window_composition"]["turn_left"]["window_count"] == 3
+
+
 def test_seeded_source_path_sampling_keeps_complete_paths(tmp_path: Path) -> None:
     scene_ply = _scene(tmp_path)
     manifests = [

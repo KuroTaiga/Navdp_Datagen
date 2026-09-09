@@ -57,7 +57,7 @@ Primary references:
 
 ## Default Distribution Policy
 
-Implemented policy: `whole_path_frame_interest_survey/v0.2`.
+Implemented policy: `anchor_aware_center_balance/v0.3`.
 
 Primary interest buckets:
 
@@ -149,8 +149,10 @@ transitions, turn magnitude, and representative clean-motion coverage.
 9. Emit 65-frame windows and both selection and selected-render manifests.
 
 The manifest separately reports actions at all selected centers, scored POI
-centers, all repeated window samples, and unique retained source frames. No
-action family currently has a hard minimum, maximum, or rejection quota.
+centers, mandatory anchors, all repeated window samples, and unique retained
+source frames. Availability-aware action minimums apply only to scored POIs;
+mandatory mission and trajectory endpoints remain in a separate additive pool.
+No per-path action maximum is imposed.
 
 ## Selection Manifest
 
@@ -164,7 +166,7 @@ action family currently has a hard minimum, maximum, or rejection quota.
     "past_frames": 32,
     "future_frames": 32,
     "window_frame_count": 65,
-    "distribution_policy": "whole_path_frame_interest_survey/v0.2"
+    "distribution_policy": "anchor_aware_center_balance/v0.3"
   },
   "distribution": {
     "target_bucket_ratios": {
@@ -174,10 +176,10 @@ action family currently has a hard minimum, maximum, or rejection quota.
       "route_decision": 0.25
     },
     "target_action_ratios": {
-      "move": 0.4,
-      "stop": 0.2,
-      "turn_left": 0.2,
-      "turn_right": 0.2
+      "move": 0.55,
+      "stop": 0.15,
+      "turn_left": 0.15,
+      "turn_right": 0.15
     }
   },
   "chunks": [

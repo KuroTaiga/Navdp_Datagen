@@ -108,6 +108,13 @@ def _parse_args() -> argparse.Namespace:
         help="Override secondary action ratios, e.g. stop=0.2 move=0.4.",
     )
     parser.add_argument("--action-deficit-weight", type=float, default=0.35)
+    parser.add_argument("--bucket-deficit-weight", type=float, default=0.35)
+    parser.add_argument(
+        "--enforce-action-minimums",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Meet availability-aware scored-center action targets before unconstrained filling.",
+    )
     parser.add_argument("--json", action="store_true", help="Print the selection summary as JSON.")
     return parser.parse_args()
 
@@ -139,6 +146,8 @@ def main() -> int:
         target_bucket_ratios=_ratio_map(args.bucket_ratio) if args.bucket_ratio else None,
         target_action_ratios=_ratio_map(args.action_ratio, DEFAULT_ACTION_RATIOS),
         action_deficit_weight=float(args.action_deficit_weight),
+        bucket_deficit_weight=float(args.bucket_deficit_weight),
+        enforce_action_minimums=bool(args.enforce_action_minimums),
     )
     selection = select_frame_interest_windows_from_paths(args.manifest_json, config=config)
     selection["selection_path"] = str(args.output_selection_json)

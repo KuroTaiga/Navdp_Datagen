@@ -42,10 +42,10 @@ DEFAULT_BUCKET_MAX_SHARE = {
     "representative_motion": 0.25,
 }
 DEFAULT_ACTION_RATIOS = {
-    "stop": 0.20,
-    "move": 0.40,
-    "turn_left": 0.20,
-    "turn_right": 0.20,
+    "stop": 0.15,
+    "move": 0.55,
+    "turn_left": 0.15,
+    "turn_right": 0.15,
 }
 
 
@@ -67,6 +67,8 @@ class FrameSelectionConfig:
     target_bucket_ratios: Mapping[str, float] | None = None
     target_action_ratios: Mapping[str, float] = field(default_factory=lambda: dict(DEFAULT_ACTION_RATIOS))
     action_deficit_weight: float = 0.35
+    bucket_deficit_weight: float = 0.35
+    enforce_action_minimums: bool = True
 
     @property
     def window_frame_count(self) -> int:
@@ -93,7 +95,9 @@ class FrameSelectionConfig:
             ),
             "target_action_ratios": dict(self.target_action_ratios),
             "action_deficit_weight": float(self.action_deficit_weight),
-            "distribution_policy": "whole_path_frame_interest_survey/v0.2",
+            "bucket_deficit_weight": float(self.bucket_deficit_weight),
+            "enforce_action_minimums": bool(self.enforce_action_minimums),
+            "distribution_policy": "anchor_aware_center_balance/v0.3",
         }
 
 
@@ -182,6 +186,10 @@ def select_frame_interest_windows(
         lambda candidate: candidate.target_bucket,
     )
     action_candidate_counts = _count_by(candidates, lambda candidate: candidate.target_action_name)
+    interest_action_candidate_counts = _count_by(
+        interest_candidates,
+        lambda candidate: candidate.target_action_name,
+    )
     mission_family_candidate_counts = _count_memberships(
         candidates,
         lambda candidate: candidate.mission_families,
@@ -197,10 +205,18 @@ def select_frame_interest_windows(
         override=cfg.target_bucket_ratios,
     )
     bucket_targets = _integer_targets(bucket_ratios, target_count)
+    action_ratios = _normalize_ratios(cfg.target_action_ratios, ACTION_NAMES)
+    action_targets = _capacity_constrained_targets(
+        action_ratios,
+        target_count,
+        capacities=interest_action_candidate_counts,
+    )
     selected = _select_candidates(
         candidates,
         target_count=target_count,
         bucket_targets=bucket_targets,
+        action_targets=action_targets,
+        action_candidate_counts=interest_action_candidate_counts,
         config=cfg,
     )
     chunks = [
@@ -214,8 +230,8 @@ def select_frame_interest_windows(
         "distribution": {
             "basis": (
                 "Randomly choose complete source paths, score every frame on each selected path, "
-                "retain multiple planner-informative centers and mandatory mission/section endpoints, "
-                "and observe action coverage without hard action quotas."
+                "balance scored centers with availability-aware action minimums, and retain "
+                "mandatory mission/section endpoints in a separate additive pool."
             ),
             "source_path_sampling": {
                 "policy": "deterministic_seeded_whole_path",
@@ -229,11 +245,13 @@ def select_frame_interest_windows(
             "available_bucket_counts": bucket_counts,
             "available_interest_bucket_counts": interest_bucket_counts,
             "available_action_counts": action_candidate_counts,
+            "available_interest_action_counts": interest_action_candidate_counts,
             "available_mission_family_counts": mission_family_candidate_counts,
             "target_bucket_ratios": bucket_ratios,
             "target_bucket_counts": bucket_targets,
-            "target_action_ratios": _normalize_ratios(cfg.target_action_ratios, ACTION_NAMES),
-            "action_selection_policy": "soft_deficit_priority_no_hard_quota",
+            "target_action_ratios": action_ratios,
+            "target_action_counts": action_targets,
+            "action_selection_policy": "availability_aware_scored_center_minimums",
         },
         "selection_summary": _selection_summary(
             candidates=candidates,
@@ -241,6 +259,7 @@ def select_frame_interest_windows(
             chunks=chunks,
             target_count=target_count,
             bucket_targets=bucket_targets,
+            action_targets=action_targets,
             config=cfg,
         ),
         "chunks": chunks,
@@ -582,11 +601,49 @@ def _integer_targets(ratios: Mapping[str, float], total: int) -> JsonDict:
     return dict(sorted(out.items()))
 
 
+def _capacity_constrained_targets(
+    ratios: Mapping[str, float],
+    total: int,
+    *,
+    capacities: Mapping[str, int],
+) -> JsonDict:
+    """Allocate integer action goals and redistribute unavailable capacity."""
+
+    remaining = max(0, int(total))
+    targets = {str(key): 0 for key in ratios}
+    active = {
+        str(key)
+        for key, value in ratios.items()
+        if float(value) > 0.0 and int(capacities.get(key, 0)) > 0
+    }
+    while remaining > 0 and active:
+        normalized = _normalize_ratios(ratios, sorted(active))
+        proposed = _integer_targets(normalized, remaining)
+        saturated = False
+        for key in sorted(active):
+            capacity_left = int(capacities.get(key, 0)) - int(targets.get(key, 0))
+            requested = int(proposed.get(key, 0))
+            if requested >= capacity_left:
+                targets[key] += max(0, capacity_left)
+                remaining -= max(0, capacity_left)
+                active.remove(key)
+                saturated = True
+        if saturated:
+            continue
+        for key, count in proposed.items():
+            targets[key] += int(count)
+            remaining -= int(count)
+        break
+    return dict(sorted((key, value) for key, value in targets.items() if value > 0))
+
+
 def _select_candidates(
     candidates: Sequence[FrameCandidate],
     *,
     target_count: int,
     bucket_targets: Mapping[str, int],
+    action_targets: Mapping[str, int],
+    action_candidate_counts: Mapping[str, int],
     config: FrameSelectionConfig,
 ) -> list[FrameCandidate]:
     selected: list[FrameCandidate] = []
@@ -594,23 +651,66 @@ def _select_candidates(
     per_job_counts: dict[str, int] = {}
     selected_by_job: dict[str, list[int]] = {}
     action_counts: dict[str, int] = {name: 0 for name in ACTION_NAMES}
+    bucket_counts: dict[str, int] = {name: 0 for name in INTEREST_BUCKETS}
 
     mandatory = sorted(
         (candidate for candidate in candidates if candidate.mandatory_anchor_types),
         key=lambda item: (item.manifest_index, item.scene_id, item.job_id, item.source_frame_index),
     )
     for candidate in mandatory:
-        _mark_selected(candidate, selected, selected_keys, selected_by_job, per_job_counts, action_counts)
+        _mark_selected(
+            candidate,
+            selected,
+            selected_keys,
+            selected_by_job,
+            per_job_counts,
+            action_counts,
+            bucket_counts,
+        )
+
+    if config.enforce_action_minimums:
+        action_order = sorted(
+            action_targets,
+            key=lambda action: (
+                float(action_candidate_counts.get(action, 0))
+                / max(1, int(action_targets.get(action, 0))),
+                action,
+            ),
+        )
+        for action in action_order:
+            while (
+                _interest_selected_count(selected) < target_count
+                and int(action_counts.get(action, 0)) < int(action_targets.get(action, 0))
+            ):
+                candidate = _best_candidate(
+                    candidates,
+                    selected_keys=selected_keys,
+                    selected_by_job=selected_by_job,
+                    per_job_counts=per_job_counts,
+                    action_counts=action_counts,
+                    bucket_counts=bucket_counts,
+                    bucket_targets=bucket_targets,
+                    config=config,
+                    bucket=None,
+                    target_action=action,
+                    enforce_spacing=True,
+                )
+                if candidate is None:
+                    break
+                _mark_selected(
+                    candidate,
+                    selected,
+                    selected_keys,
+                    selected_by_job,
+                    per_job_counts,
+                    action_counts,
+                    bucket_counts,
+                )
 
     for bucket in INTEREST_BUCKETS:
         while (
             _interest_selected_count(selected) < target_count
-            and sum(
-                1
-                for item in selected
-                if not item.mandatory_anchor_types and item.target_bucket == bucket
-            )
-            < int(bucket_targets.get(bucket, 0))
+            and int(bucket_counts.get(bucket, 0)) < int(bucket_targets.get(bucket, 0))
         ):
             candidate = _best_candidate(
                 candidates,
@@ -618,13 +718,24 @@ def _select_candidates(
                 selected_by_job=selected_by_job,
                 per_job_counts=per_job_counts,
                 action_counts=action_counts,
+                bucket_counts=bucket_counts,
+                bucket_targets=bucket_targets,
                 config=config,
                 bucket=bucket,
+                target_action=None,
                 enforce_spacing=True,
             )
             if candidate is None:
                 break
-            _mark_selected(candidate, selected, selected_keys, selected_by_job, per_job_counts, action_counts)
+            _mark_selected(
+                candidate,
+                selected,
+                selected_keys,
+                selected_by_job,
+                per_job_counts,
+                action_counts,
+                bucket_counts,
+            )
 
     while _interest_selected_count(selected) < target_count:
         candidate = _best_candidate(
@@ -633,8 +744,11 @@ def _select_candidates(
             selected_by_job=selected_by_job,
             per_job_counts=per_job_counts,
             action_counts=action_counts,
+            bucket_counts=bucket_counts,
+            bucket_targets=bucket_targets,
             config=config,
             bucket=None,
+            target_action=None,
             enforce_spacing=True,
         )
         if candidate is None:
@@ -644,13 +758,24 @@ def _select_candidates(
                 selected_by_job=selected_by_job,
                 per_job_counts=per_job_counts,
                 action_counts=action_counts,
+                bucket_counts=bucket_counts,
+                bucket_targets=bucket_targets,
                 config=config,
                 bucket=None,
+                target_action=None,
                 enforce_spacing=False,
             )
         if candidate is None:
             break
-        _mark_selected(candidate, selected, selected_keys, selected_by_job, per_job_counts, action_counts)
+        _mark_selected(
+            candidate,
+            selected,
+            selected_keys,
+            selected_by_job,
+            per_job_counts,
+            action_counts,
+            bucket_counts,
+        )
 
     return sorted(
         selected,
@@ -665,8 +790,11 @@ def _best_candidate(
     selected_by_job: Mapping[str, Sequence[int]],
     per_job_counts: Mapping[str, int],
     action_counts: Mapping[str, int],
+    bucket_counts: Mapping[str, int],
+    bucket_targets: Mapping[str, int],
     config: FrameSelectionConfig,
     bucket: str | None,
+    target_action: str | None,
     enforce_spacing: bool,
 ) -> FrameCandidate | None:
     best: tuple[float, FrameCandidate] | None = None
@@ -675,12 +803,20 @@ def _best_candidate(
             continue
         if bucket is not None and candidate.target_bucket != bucket:
             continue
+        if target_action is not None and candidate.target_action_name != target_action:
+            continue
         job_key = _candidate_job_key(candidate)
         if int(config.max_targets_per_job) > 0 and per_job_counts.get(job_key, 0) >= int(config.max_targets_per_job):
             continue
         if enforce_spacing and _violates_spacing(candidate, selected_by_job, int(config.min_target_spacing_frames)):
             continue
-        priority = _selection_priority(candidate, action_counts=action_counts, config=config)
+        priority = _selection_priority(
+            candidate,
+            action_counts=action_counts,
+            bucket_counts=bucket_counts,
+            bucket_targets=bucket_targets,
+            config=config,
+        )
         if best is None or priority > best[0]:
             best = (priority, candidate)
     return best[1] if best is not None else None
@@ -690,6 +826,8 @@ def _selection_priority(
     candidate: FrameCandidate,
     *,
     action_counts: Mapping[str, int],
+    bucket_counts: Mapping[str, int],
+    bucket_targets: Mapping[str, int],
     config: FrameSelectionConfig,
 ) -> float:
     selected_total = max(1, sum(action_counts.values()))
@@ -697,10 +835,18 @@ def _selection_priority(
     current_share = float(action_counts.get(candidate.target_action_name, 0)) / float(selected_total)
     target_share = float(action_ratios.get(candidate.target_action_name, 0.0))
     deficit = max(0.0, target_share - current_share)
+    bucket_target = int(bucket_targets.get(candidate.target_bucket, 0))
+    bucket_deficit = max(0, bucket_target - int(bucket_counts.get(candidate.target_bucket, 0)))
+    bucket_deficit_share = float(bucket_deficit) / float(max(1, bucket_target))
     jitter_key = f"{int(config.seed)}::{candidate.stable_key}"
     jitter_seed = int.from_bytes(hashlib.sha256(jitter_key.encode("utf-8")).digest()[:8], "big")
     jitter = float(jitter_seed) / float(1 << 64) * 1e-6
-    return float(candidate.interest_score) + float(config.action_deficit_weight) * deficit + jitter
+    return (
+        float(candidate.interest_score)
+        + float(config.action_deficit_weight) * deficit
+        + float(config.bucket_deficit_weight) * bucket_deficit_share
+        + jitter
+    )
 
 
 def _candidate_job_key(candidate: FrameCandidate) -> str:
@@ -727,6 +873,7 @@ def _mark_selected(
     selected_by_job: dict[str, list[int]],
     per_job_counts: dict[str, int],
     action_counts: dict[str, int],
+    bucket_counts: dict[str, int],
 ) -> None:
     job_key = _candidate_job_key(candidate)
     selected.append(candidate)
@@ -736,6 +883,7 @@ def _mark_selected(
         per_job_counts[job_key] = per_job_counts.get(job_key, 0) + 1
     if not candidate.mandatory_anchor_types:
         action_counts[candidate.target_action_name] = action_counts.get(candidate.target_action_name, 0) + 1
+        bucket_counts[candidate.target_bucket] = bucket_counts.get(candidate.target_bucket, 0) + 1
 
 
 def _interest_selected_count(selected: Sequence[FrameCandidate]) -> int:
@@ -796,6 +944,7 @@ def _selection_summary(
     chunks: Sequence[Mapping[str, Any]],
     target_count: int,
     bucket_targets: Mapping[str, int],
+    action_targets: Mapping[str, int],
     config: FrameSelectionConfig,
 ) -> JsonDict:
     selected_bucket_counts = _count_by(selected, lambda candidate: candidate.target_bucket)
@@ -809,6 +958,12 @@ def _selection_summary(
         selected_interest,
         lambda candidate: candidate.target_action_name,
     )
+    mandatory = [candidate for candidate in selected if candidate.mandatory_anchor_types]
+    mandatory_anchor_action_counts = _count_by(
+        mandatory,
+        lambda candidate: candidate.target_action_name,
+    )
+    scored_center_window_composition = _center_window_composition(selected_interest)
     selected_window_action_counts = _count_memberships(
         selected,
         lambda candidate: candidate.source_window_actions,
@@ -856,6 +1011,7 @@ def _selection_summary(
         "selection_interest_target_count": int(target_count),
         "mandatory_anchor_count": sum(1 for candidate in selected if candidate.mandatory_anchor_types),
         "mandatory_anchor_type_counts": mandatory_anchor_type_counts,
+        "mandatory_anchor_action_counts": mandatory_anchor_action_counts,
         "window_frame_count": int(config.window_frame_count),
         "requested_window_frame_renders": requested_window_frames,
         "unique_source_render_frame_count": len(unique_source_frames),
@@ -864,6 +1020,8 @@ def _selection_summary(
         "selected_action_counts": selected_action_counts,
         "selected_center_action_counts": selected_action_counts,
         "selected_interest_action_counts": selected_interest_action_counts,
+        "selected_interest_action_ratios": _count_ratios(selected_interest_action_counts),
+        "scored_center_window_composition": scored_center_window_composition,
         "selected_window_action_counts": selected_window_action_counts,
         "selected_unique_window_action_counts": selected_unique_window_action_counts,
         "selected_window_action_ratios": _count_ratios(selected_window_action_counts),
@@ -878,6 +1036,19 @@ def _selection_summary(
             )
             for bucket in sorted(bucket_targets)
         },
+        "action_deficits": {
+            action: max(
+                0,
+                int(action_targets.get(action, 0))
+                - int(selected_interest_action_counts.get(action, 0)),
+            )
+            for action in sorted(action_targets)
+        },
+        "training_center_sampling": _training_center_sampling_plan(
+            selected_interest_action_counts,
+            target_ratios=config.target_action_ratios,
+            mandatory_anchor_count=len(mandatory),
+        ),
         "render_frames_per_target": (
             round(requested_window_frames / float(len(selected)), 6) if selected else 0.0
         ),
@@ -885,6 +1056,65 @@ def _selection_summary(
             round(len(unique_source_frames) / float(len(selected)), 6) if selected else 0.0
         ),
     }
+
+
+def _training_center_sampling_plan(
+    counts: Mapping[str, int],
+    *,
+    target_ratios: Mapping[str, float],
+    mandatory_anchor_count: int,
+) -> JsonDict:
+    available = [action for action in ACTION_NAMES if int(counts.get(action, 0)) > 0]
+    ratios = _normalize_ratios(target_ratios, available)
+    per_example_weights = {
+        action: round(float(ratios[action]) / float(counts[action]), 12)
+        for action in available
+    }
+    return {
+        "population": "scored_poi_centers",
+        "mandatory_anchor_policy": "retained_separate_pool",
+        "mandatory_anchor_count": int(mandatory_anchor_count),
+        "target_action_ratios": ratios,
+        "per_example_action_weights": per_example_weights,
+        "weight_contract": (
+            "Sampling each scored center with its action weight yields the target action mix in expectation; "
+            "mandatory anchors remain addressable through their separate target_role pool."
+        ),
+    }
+
+
+def _center_window_composition(
+    selected: Sequence[FrameCandidate],
+) -> JsonDict:
+    grouped: dict[str, list[FrameCandidate]] = {}
+    for candidate in selected:
+        grouped.setdefault(candidate.target_action_name, []).append(candidate)
+    out: JsonDict = {}
+    for center_action, candidates in sorted(grouped.items()):
+        window_counts = _count_memberships(
+            candidates,
+            lambda candidate: candidate.source_window_actions,
+        )
+        matching_counts = [
+            sum(1 for action in candidate.source_window_actions if action == center_action)
+            for candidate in candidates
+        ]
+        out[center_action] = {
+            "window_count": len(candidates),
+            "window_frame_count": sum(len(candidate.source_window_actions) for candidate in candidates),
+            "window_action_counts": window_counts,
+            "window_action_ratios": _count_ratios(window_counts),
+            "matching_action_frame_count": sum(matching_counts),
+            "mean_matching_action_frames": round(
+                sum(matching_counts) / float(len(matching_counts)),
+                6,
+            ),
+            "windows_with_matching_action_at_least": {
+                str(threshold): sum(1 for count in matching_counts if count >= threshold)
+                for threshold in (1, 5, 10)
+            },
+        }
+    return out
 
 
 def _render_frame_index(chunks: Sequence[Mapping[str, Any]]) -> JsonDict:

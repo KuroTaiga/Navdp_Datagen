@@ -258,7 +258,8 @@ Remaining:
   `critical_margin`, `human_interaction`, `route_decision`, and
   `representative_motion`.
 - [x] Keep secondary action ratios configurable as soft selection priorities,
-  with no hard action-family minimums, maximums, or rejection quotas.
+  with availability-aware scored-center action minimums, no per-path action
+  maximums, and mandatory endpoints retained in a separate additive pool.
 - [x] Seed-sample complete source paths before frame scoring; never score a
   pre-cut path fragment.
 - [x] Allow multiple points of interest from one selected path and leave the
