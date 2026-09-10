@@ -202,6 +202,39 @@ def test_mission_specific_human_action_hints_are_preserved() -> None:
     assert informant["action_segments"][0]["render_action_id"] == "wave"
 
 
+def test_navigation_supervision_is_preserved_in_manifest_and_render_job() -> None:
+    scenario = _scenario("deliver_to_human")
+    supervision = {
+        "schema_version": "navdp_navigation_supervision/v1.0",
+        "plans": [{"plan_id": "robot_0:mission_deliver_to_human_001"}],
+    }
+    scenario["metadata"]["navigation_supervision"] = {
+        "schema_version": "navdp_navigation_supervision/v1.0",
+        "llm_used": False,
+    }
+    scenario["robots"][0]["metadata"] = {"navigation_supervision": supervision}
+    scenario["robots"][0]["trajectory"][0]["metadata"] = {
+        "navigation": {
+            "instruction_section_id": "section_001",
+            "decision": {"primary_reason": "FOLLOW_PLANNED_ROUTE"},
+        }
+    }
+
+    manifest = scenario_to_render_manifest(scenario, action_catalog=_action_catalog())
+
+    assert manifest["navigation_supervision"]["llm_used"] is False
+    assert manifest["actors"]["robots"][0]["navigation_supervision"] == supervision
+    assert manifest["jobs"][0]["navigation_supervision"] == supervision
+    assert manifest["rendering_metadata_contract"]["selection_policy"] == "consumer_defined"
+    assert manifest["rendering_metadata_contract"]["source_jobs_contain_complete_trajectories"] is True
+    frame_catalog = manifest["jobs"][0]["frame_catalog"]
+    assert frame_catalog["trajectory_scope"] == "complete_source_path"
+    assert frame_catalog["complete_source_trajectory"] is True
+    assert frame_catalog["sample_count"] == len(manifest["jobs"][0]["camera"]["trajectory"])
+    navigation = manifest["jobs"][0]["camera"]["trajectory"][0]["metadata"]["navigation"]
+    assert navigation["instruction_section_id"] == "section_001"
+
+
 @pytest.mark.parametrize(
     ("mission_family", "expected_hint"),
     [

@@ -186,6 +186,11 @@ def scenario_to_render_manifest(
         humans=humans,
         action_catalog=action_catalog,
     )
+    navigation_summary = dict(
+        _mapping_or_empty(
+            _mapping_or_empty(scenario.get("metadata")).get("navigation_supervision")
+        )
+    )
 
     return {
         "schema_version": MANIFEST_SCHEMA_VERSION,
@@ -237,6 +242,8 @@ def scenario_to_render_manifest(
         },
         "missions": missions,
         "events": _events(scenario),
+        "navigation_supervision": navigation_summary,
+        "rendering_metadata_contract": _rendering_metadata_contract(navigation_summary),
         "jobs": jobs,
         "warnings": warnings,
     }
@@ -472,6 +479,9 @@ def _robot_actor_record(
             "height_m": height_m,
         },
         "metadata": metadata,
+        "navigation_supervision": dict(
+            _mapping_or_empty(metadata.get("navigation_supervision"))
+        ),
     }
 
 
@@ -1016,17 +1026,22 @@ def _render_job(
         or mission.get("mission_type") == "mission_stream"
     ]
     job_id = f"{scenario_id}__view_{viewpoint_robot_id}"
+    ego_trajectory = list(ego_robot["trajectory"])
     return {
         "job_id": job_id,
         "scene_id": scene_id,
         "viewpoint_robot_id": viewpoint_robot_id,
         "mission_families": list(mission_families),
         "assigned_mission_ids": assigned_mission_ids,
+        "navigation_supervision": dict(
+            _mapping_or_empty(ego_robot.get("navigation_supervision"))
+        ),
+        "frame_catalog": _frame_catalog(ego_trajectory),
         "camera": {
             "mode": "robot_fpv",
             "source_actor_id": viewpoint_robot_id,
             "preserve_frame_samples": True,
-            "trajectory": list(ego_robot["trajectory"]),
+            "trajectory": ego_trajectory,
         },
         "human_actor_ids": [str(human["actor_id"]) for human in humans],
         "peer_robot_ids": peer_robot_ids,
@@ -1050,6 +1065,57 @@ def _render_job(
             "camera_metadata_name": f"{job_id}_camera.json",
             "actor_debug_name": f"{job_id}_actors.json",
         },
+    }
+
+
+def _rendering_metadata_contract(navigation_summary: Mapping[str, Any]) -> JsonDict:
+    source = _mapping_or_empty(navigation_summary.get("rendering_contract"))
+    contract = dict(source)
+    contract.update(
+        {
+            "schema_version": str(source.get("schema_version") or "navdp_rendering_metadata/v1.0"),
+            "selection_policy": "consumer_defined",
+            "source_jobs_contain_complete_trajectories": True,
+            "complete_robot_tracks_path": "actors.robots[*].trajectory",
+            "render_job_trajectory_path": "jobs[*].camera.trajectory",
+            "render_job_frame_catalog_path": "jobs[*].frame_catalog",
+            "point_supervision_path": "jobs[*].camera.trajectory[*].metadata.navigation",
+            "preserve_stationary_samples": True,
+        }
+    )
+    contract.setdefault(
+        "recommended_training_context",
+        {
+            "past_frames": 32,
+            "current_frames": 1,
+            "future_frames": 0,
+            "required_for_dataset_use": False,
+        },
+    )
+    return contract
+
+
+def _frame_catalog(trajectory: Sequence[Mapping[str, Any]]) -> JsonDict:
+    frames = [
+        int(point.get("frame") if point.get("frame") is not None else index)
+        for index, point in enumerate(trajectory)
+    ]
+    sample_indices = [
+        int(point.get("sample_index") if point.get("sample_index") is not None else index)
+        for index, point in enumerate(trajectory)
+    ]
+    times = [float(point.get("t", 0.0) or 0.0) for point in trajectory]
+    return {
+        "selection_policy": "consumer_defined",
+        "trajectory_scope": "complete_source_path",
+        "complete_source_trajectory": True,
+        "sample_count": len(trajectory),
+        "sample_index_range": [min(sample_indices), max(sample_indices)] if sample_indices else None,
+        "frame_range": [min(frames), max(frames)] if frames else None,
+        "time_range_s": [min(times), max(times)] if times else None,
+        "trajectory_path": "camera.trajectory",
+        "point_supervision_path": "camera.trajectory[*].metadata.navigation",
+        "preserve_stationary_samples": True,
     }
 
 

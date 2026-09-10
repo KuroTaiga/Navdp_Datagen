@@ -117,6 +117,7 @@ class FrameCandidate:
     position: tuple[float, float, float]
     yaw_rad: float
     motion_state: str
+    navigation: Mapping[str, Any]
     mission_families: tuple[str, ...]
     human_actor_ids: tuple[str, ...]
     peer_robot_ids: tuple[str, ...]
@@ -294,6 +295,23 @@ def apply_frame_selection_to_manifest(
                 or DEFAULT_PAST_FRAMES + 1 + DEFAULT_FUTURE_FRAMES
             ),
         }
+    rendering_contract = out.get("rendering_metadata_contract")
+    if not isinstance(rendering_contract, dict):
+        rendering_contract = {}
+        out["rendering_metadata_contract"] = rendering_contract
+    rendering_contract.update(
+        {
+            "schema_version": str(
+                rendering_contract.get("schema_version") or "navdp_rendering_metadata/v1.0"
+            ),
+            "manifest_job_scope": "selected_windows",
+            "source_jobs_contain_complete_trajectories": False,
+            "complete_robot_tracks_retained": True,
+            "complete_robot_tracks_path": "actors.robots[*].trajectory",
+            "selection_policy": "producer_selection_manifest",
+            "preserve_stationary_samples": True,
+        }
+    )
 
     jobs = [job for job in manifest.get("jobs", []) if isinstance(job, Mapping)]
     job_by_id = {str(job.get("job_id")): job for job in jobs}
@@ -496,6 +514,7 @@ def _build_candidates(
                         position=_point_position(point),
                         yaw_rad=float(point.get("yaw_rad", 0.0) or 0.0),
                         motion_state=str(point.get("motion_state") or ""),
+                        navigation=_point_navigation(point),
                         mission_families=family_tuple,
                         human_actor_ids=human_ids,
                         peer_robot_ids=peer_robot_ids,
@@ -915,6 +934,7 @@ def _chunk_record(candidate: FrameCandidate, *, index: int, config: FrameSelecti
         "target_time_s": float(candidate.time_s),
         "target_action_name": candidate.target_action_name,
         "target_bucket": candidate.target_bucket,
+        "target_navigation": dict(candidate.navigation),
         "target_role": "mandatory_anchor" if candidate.mandatory_anchor_types else "frame_of_interest",
         "mandatory_anchor_types": list(candidate.mandatory_anchor_types),
         "window_action_counts": _count_by(candidate.source_window_actions, lambda action: action),
@@ -1242,11 +1262,26 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
+        "target_navigation": dict(chunk.get("target_navigation", {})),
         "target_role": chunk.get("target_role"),
         "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
         "preserve_frame_samples": True,
     }
     job["camera"] = camera
+    job["frame_catalog"] = {
+        "selection_policy": "producer_selection_manifest",
+        "trajectory_scope": "selected_past_context_window",
+        "complete_source_trajectory": False,
+        "complete_source_trajectory_path": "actors.robots[*].trajectory",
+        "source_job_id": chunk.get("source_job_id"),
+        "sample_count": len(selected_points),
+        "sample_index_range": [0, len(selected_points) - 1] if selected_points else None,
+        "source_frame_indices": source_indices,
+        "target_frame": chunk.get("target_frame"),
+        "trajectory_path": "camera.trajectory",
+        "point_supervision_path": "camera.trajectory[*].metadata.navigation",
+        "preserve_stationary_samples": True,
+    }
     job["job_id"] = str(chunk.get("window_job_id") or chunk.get("chunk_id") or job.get("job_id"))
     outputs = deepcopy(dict(job.get("outputs", {}))) if isinstance(job.get("outputs"), Mapping) else {}
     outputs.update(
@@ -1266,6 +1301,7 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
+        "target_navigation": dict(chunk.get("target_navigation", {})),
         "target_role": chunk.get("target_role"),
         "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
         "window_action_counts": dict(chunk.get("window_action_counts", {})),
@@ -1479,6 +1515,10 @@ def _bucket_scores(
     point = trajectory[frame_index]
     time_s = _point_time(point, frame_index)
     position = _point_position(point)
+    navigation = _point_navigation(point)
+    decision = navigation.get("decision") if isinstance(navigation.get("decision"), Mapping) else {}
+    decision_reason = str(decision.get("primary_reason") or "")
+    section_type = str(navigation.get("instruction_section_type") or "")
     human_min = _min_actor_distance(position, time_s, humans)
     peer_min = _min_peer_distance(position, time_s, job)
     turn_delta = abs(_turn_delta(trajectory, frame_index))
@@ -1497,6 +1537,19 @@ def _bucket_scores(
         0.35 if target_action_name == "stop" and human_min is not None and human_min < 3.0 else 0.0,
         event_score,
     )
+    if decision_reason in {"HUMAN_COLLISION_AVOIDANCE", "ROBOT_COLLISION_AVOIDANCE"}:
+        critical_margin = max(critical_margin, 0.95)
+    if decision_reason in {
+        "L2_PEDESTRIAN_YIELD",
+        "HUMAN_GUIDANCE_APPROACH",
+        "HUMAN_GUIDANCE_CONVERSATION",
+        "TARGET_HUMAN_APPROACH",
+    }:
+        human_interaction = max(human_interaction, 0.90)
+    elif decision_reason.startswith(("L1_", "L3_", "L4_")):
+        human_interaction = max(human_interaction, 0.65)
+    if section_type == "turn":
+        route_decision = max(route_decision, 0.85)
     representative = 0.25
     if target_action_name == "move":
         representative += 0.20
@@ -1706,6 +1759,16 @@ def _point_position(point: Mapping[str, Any]) -> tuple[float, float, float]:
         float(pose.get("y", 0.0) or 0.0),
         0.0,
     )
+
+
+def _point_navigation(point: Mapping[str, Any]) -> JsonDict:
+    direct = point.get("navigation")
+    if isinstance(direct, Mapping):
+        return dict(direct)
+    metadata = point.get("metadata")
+    if isinstance(metadata, Mapping) and isinstance(metadata.get("navigation"), Mapping):
+        return dict(metadata["navigation"])
+    return {}
 
 
 def _point_time(point: Mapping[str, Any], index: int) -> float:

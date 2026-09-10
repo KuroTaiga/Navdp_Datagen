@@ -153,6 +153,8 @@ def test_apply_frame_selection_rewrites_jobs_to_selected_windows(tmp_path: Path)
     selected_manifest = apply_frame_selection_to_manifest(manifest, selection, manifest_path="manifest.json")
 
     assert selected_manifest["timing"]["selection_mode"] == "frame_interest_windows"
+    assert selected_manifest["rendering_metadata_contract"]["manifest_job_scope"] == "selected_windows"
+    assert selected_manifest["rendering_metadata_contract"]["complete_robot_tracks_retained"] is True
     assert len(selected_manifest["jobs"]) == 2
     for job in selected_manifest["jobs"]:
         assert job["job_id"].startswith("scenario_001__view_robot_alpha__m000__foi_")
@@ -162,7 +164,38 @@ def test_apply_frame_selection_rewrites_jobs_to_selected_windows(tmp_path: Path)
         )
         assert job["camera"]["preserve_frame_samples"] is True
         assert job["frame_selection"]["preserve_stationary_frames"] is True
+        assert job["frame_catalog"]["complete_source_trajectory"] is False
+        assert job["frame_catalog"]["trajectory_scope"] == "selected_past_context_window"
+        assert job["frame_catalog"]["sample_count"] == len(job["camera"]["trajectory"])
         assert job["camera"]["trajectory"][0]["metadata"]["source_frame_index"] >= 0
+
+
+def test_frame_selection_exports_target_and_window_navigation_metadata(tmp_path: Path) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    for point in manifest["jobs"][0]["camera"]["trajectory"]:
+        point["metadata"] = {
+            "navigation": {
+                "plan_id": "robot_alpha:mission_001",
+                "instruction_section_id": "section_002",
+                "instruction_section_type": "turn",
+                "decision": {"primary_reason": "L2_PEDESTRIAN_YIELD"},
+            }
+        }
+    selection = select_frame_interest_windows(
+        [manifest],
+        manifest_paths=["manifest.json"],
+        config=FrameSelectionConfig(target_count=1, seed=77, preserve_mission_endpoints=False),
+    )
+
+    chunk = selection["chunks"][0]
+    assert chunk["target_navigation"]["instruction_section_id"] == "section_002"
+    selected = apply_frame_selection_to_manifest(manifest, selection, manifest_path="manifest.json")
+    job = selected["jobs"][0]
+    assert job["frame_selection"]["target_navigation"]["decision"]["primary_reason"] == "L2_PEDESTRIAN_YIELD"
+    assert all(
+        point["metadata"]["navigation"]["plan_id"] == "robot_alpha:mission_001"
+        for point in job["camera"]["trajectory"]
+    )
 
 
 def test_selected_render_plan_preserves_stationary_frame_samples(tmp_path: Path) -> None:

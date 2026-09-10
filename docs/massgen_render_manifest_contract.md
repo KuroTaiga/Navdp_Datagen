@@ -111,6 +111,11 @@ The generated JSON has:
   records, and visibility bounds;
 - `missions`: renderer-relevant mission fields plus original mission metadata;
 - `events`: normalized scenario event log;
+- `navigation_supervision`: deterministic scenario-level instruction and
+  decision-label provenance copied from Pathplanner;
+- `rendering_metadata_contract`: declares complete-path availability,
+  stationary-sample preservation, metadata paths, and consumer-defined frame
+  selection;
 - `jobs`: one render job per active/training robot viewpoint;
 - `warnings`: non-fatal conversion warnings for missing assets or unsupported
   families.
@@ -140,6 +145,13 @@ job:
 - rewrites renderer-local frame/sample ids to `0..32`;
 - preserves source frame indices in point and camera metadata;
 - sets `camera.preserve_frame_samples=true`.
+
+Source jobs carry `frame_catalog.trajectory_scope=complete_source_path` and can
+be rendered in full or filtered by any downstream policy. Selected jobs carry
+`frame_catalog.trajectory_scope=selected_past_context_window`; their complete
+robot tracks remain available under `actors.robots[*].trajectory`. The built-in
+selector is therefore one supported consumer, not a restriction in the dataset
+format.
 
 Render executors and label-path helpers must honor
 `camera.preserve_frame_samples` and `metadata.preserve_frame_samples`. This
