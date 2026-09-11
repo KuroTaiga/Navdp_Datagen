@@ -2,10 +2,11 @@
 
 ## Decision
 
-Use event-aware `anchor_aware_semantic_center_balance/v0.5` as the canonical
+Use event-aware `anchor_aware_semantic_center_balance/v0.6` as the canonical
 production selection policy. Preserve every sparse semantic-episode
 representative plus all mandatory anchors; do not replace semantic recall with
-an artificial fixed number of POIs per path.
+an artificial fixed number of POIs per path. The default target count is zero,
+meaning no minimum POI floor is added beyond event representatives.
 
 The fixed budgets remain comparison baselines. Because the current renderer
 materializes every 33-frame window independently, event-aware production runs

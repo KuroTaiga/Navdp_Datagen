@@ -2,10 +2,12 @@
 
 ## Result
 
-`anchor_aware_semantic_center_balance/v0.5` passed the limited H100 validation
+`anchor_aware_semantic_center_balance/v0.6` passed the limited H100 validation
 and is now the canonical selector default. The default
 `semantic_episode_policy` is `guarantee_representative`; fixed-budget selection
 remains available explicitly as `none` for comparisons and ablations.
+The default target count is zero, so no artificial POI floor is added; detected
+episode representatives define the scored count.
 
 The test completed with zero cohort errors, zero malformed selected paths, zero
 selected-source frames missing navigation metadata, and 100% coverage of all
@@ -18,6 +20,7 @@ mandatory endpoint-anchor instances. No Gaussian or RGB rendering was run.
 - Sampling: one deterministically ranked nonempty scene from each of 13
   corpus/mission-family groups, up to 10 complete source paths per scene.
 - Seed: `20260911`.
+- Configured average scored-POI floor: `0`.
 - Sample: 127 complete paths and 31,160 source frames.
 - Path lengths: mean 245.35, median 301, P25 143, P75 301, P90 366,
   P95/P99 381, minimum 66, maximum 381 frames.
@@ -83,11 +86,13 @@ belongs to the mandatory-anchor pool. Their any-center coverage is 100%.
 
 ## Validation and Visual QA
 
-- Focused selector tests: 35 passed.
-- The default-policy test verifies that a one-POI floor expands to cover two
-  distinct collision-avoidance episodes.
+- Focused selector tests: 36 passed.
+- Maintained Datagen suite: 154 passed, 1 skipped.
+- The default-policy test verifies that a zero-POI floor selects the two
+  detected collision-avoidance episodes instead of all eligible frames.
 - All 13 representative JSON files report
-  `semantic_episode_policy=guarantee_representative` and policy v0.5.
+  `semantic_episode_policy=guarantee_representative`, a zero configured floor,
+  and policy v0.6.
 - All 283 representative chunks have 33 source indices, end at the target,
   contain no future frames, and use `target_window_index=32`.
 - All 13 mission-family BEV overlays and GIFs were generated. Each GIF is
@@ -100,12 +105,13 @@ belongs to the mandatory-anchor pool. Their any-center coverage is 100%.
 ## Artifacts
 
 Local root:
-`out/poi_policy_survey_20260911/event_aware_default_limited_20260911`
+`out/poi_policy_survey_20260911/event_aware_pure_default_limited_20260911`
 
 Remote root:
-`/private_lxh/dongjk/navdata/mass_generation_runs/poi_policy_survey_20260911/event_aware_default_limited_20260911`
+`/private_lxh/dongjk/navdata/mass_generation_runs/poi_policy_survey_20260911/event_aware_pure_default_limited_20260911`
 
 The roots contain the JSON, CSV, and Markdown summaries. The remote root also
-contains the compressed renderer-independent `event_aware.jsonl.gz` selection
-manifest. The local `visualizations` directory contains four statistical plots,
-13 BEV overlays, 13 GIFs, 13 instruction/metadata companions, and a JSON index.
+contains the compressed renderer-independent
+`selection_manifests/event_aware.jsonl.gz` selection manifest. The local
+`visualizations` directory contains four statistical plots, 13 BEV overlays,
+13 GIFs, 13 instruction/metadata companions, and a JSON index.

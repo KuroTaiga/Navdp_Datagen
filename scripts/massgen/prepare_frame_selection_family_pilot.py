@@ -85,7 +85,12 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Prepare only this mission family. Defaults to all active families.",
     )
-    parser.add_argument("--targets-per-family", type=int, default=2)
+    parser.add_argument(
+        "--targets-per-family",
+        type=int,
+        default=0,
+        help="Minimum scored-POI floor; zero uses pure event-aware selection.",
+    )
     parser.add_argument("--past-frames", type=int, default=DEFAULT_PAST_FRAMES)
     parser.add_argument("--future-frames", type=int, default=DEFAULT_FUTURE_FRAMES)
     parser.add_argument("--edge-window-policy", choices=["reject", "clamp"], default="reject")

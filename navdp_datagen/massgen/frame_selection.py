@@ -116,7 +116,7 @@ class FrameSelectionConfig:
             "bucket_deficit_weight": float(self.bucket_deficit_weight),
             "enforce_action_minimums": bool(self.enforce_action_minimums),
             "semantic_episode_policy": str(self.semantic_episode_policy),
-            "distribution_policy": "anchor_aware_semantic_center_balance/v0.5",
+            "distribution_policy": "anchor_aware_semantic_center_balance/v0.6",
         }
 
 
@@ -223,11 +223,12 @@ def select_frame_interest_windows(
         candidates,
         lambda candidate: candidate.mandatory_anchor_types,
     )
-    requested_target_count = (
-        int(cfg.target_count)
-        if int(cfg.target_count) > 0
-        else len(interest_candidates)
-    )
+    if int(cfg.target_count) > 0:
+        requested_target_count = int(cfg.target_count)
+    elif str(cfg.semantic_episode_policy) == "none":
+        requested_target_count = len(interest_candidates)
+    else:
+        requested_target_count = 0
     requested_target_count = min(requested_target_count, len(interest_candidates))
     episode_representatives = _semantic_episode_representatives(candidates, cfg)
     target_count = min(

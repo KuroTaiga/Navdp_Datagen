@@ -33,7 +33,7 @@ SOCIAL_FAMILY_VARIANT_LAW_IDS = {
 @dataclass(frozen=True)
 class MissionFamilyPilotConfig:
     mission_families: tuple[str, ...]
-    targets_per_family: int = 2
+    targets_per_family: int = 0
     past_frames: int = DEFAULT_PAST_FRAMES
     future_frames: int = DEFAULT_FUTURE_FRAMES
     edge_window_policy: str = "reject"
@@ -68,8 +68,8 @@ def prepare_mission_family_pilot(
 
     if not config.mission_families:
         raise ValueError("at least one mission family is required")
-    if int(config.targets_per_family) <= 0:
-        raise ValueError("targets_per_family must be positive")
+    if int(config.targets_per_family) < 0:
+        raise ValueError("targets_per_family must be non-negative")
     if config.window_frame_count <= 0:
         raise ValueError("pilot window size must be positive")
 

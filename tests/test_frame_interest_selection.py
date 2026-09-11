@@ -329,7 +329,7 @@ def test_event_aware_policy_adapts_budget_to_sparse_episode_representatives(
 
     assert selection["config"]["semantic_episode_policy"] == "guarantee_representative"
     assert selection["config"]["distribution_policy"] == (
-        "anchor_aware_semantic_center_balance/v0.5"
+        "anchor_aware_semantic_center_balance/v0.6"
     )
     assert selection["distribution"]["guaranteed_episode_representative_count"] == 2
     assert selection["selection_summary"]["requested_target_count"] == 1
@@ -337,6 +337,39 @@ def test_event_aware_policy_adapts_budget_to_sparse_episode_representatives(
     assert selection["selection_summary"][
         "selected_interest_navigation_signal_episode_counts"
     ]["collision_avoidance"] == 2
+
+
+def test_default_event_aware_policy_has_no_artificial_target_floor(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    manifest["events"] = []
+    manifest["missions"] = []
+    for index, point in enumerate(manifest["jobs"][0]["camera"]["trajectory"]):
+        point["motion_state"] = "moving"
+        point["metadata"] = {
+            "navigation": {
+                "decision": {
+                    "primary_reason": (
+                        "HUMAN_COLLISION_AVOIDANCE"
+                        if 32 <= index <= 39 or 60 <= index <= 99
+                        else "FOLLOW_PLANNED_ROUTE"
+                    )
+                }
+            }
+        }
+
+    selection = select_frame_interest_windows(
+        [manifest],
+        config=FrameSelectionConfig(
+            preserve_mission_endpoints=False,
+            target_action_ratios={"move": 1.0},
+        ),
+    )
+
+    assert selection["selection_summary"]["requested_target_count"] == 0
+    assert selection["selection_summary"]["selected_interest_target_count"] == 2
+    assert selection["selection_summary"]["candidate_count"] > 2
 
 
 def test_selected_render_plan_preserves_stationary_frame_samples(tmp_path: Path) -> None:
@@ -724,7 +757,6 @@ def test_empty_family_pilot_records_remote_source_wait_state(tmp_path: Path) -> 
     output_root = tmp_path / "pilot"
     config = MissionFamilyPilotConfig(
         mission_families=tuple(ACTIVE_MASS_MISSION_FAMILIES),
-        targets_per_family=1,
     )
 
     plan = prepare_mission_family_pilot([], output_root=output_root, config=config)
@@ -732,6 +764,7 @@ def test_empty_family_pilot_records_remote_source_wait_state(tmp_path: Path) -> 
     assert plan["status"] == "waiting_for_sources"
     assert plan["execution_authorized"] is False
     assert plan["remote_sources_connected"] is False
+    assert plan["config"]["targets_per_family"] == 0
     assert plan["config"]["semantic_episode_policy"] == "guarantee_representative"
     assert plan["summary"]["family_count"] == len(ACTIVE_MASS_MISSION_FAMILIES)
     assert plan["summary"]["status_counts"] == {

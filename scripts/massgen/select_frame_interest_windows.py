@@ -59,7 +59,16 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Optional selected-window render manifest. Supported when one --manifest-json is provided.",
     )
-    parser.add_argument("--target-count", type=int, default=0, help="0 means select every eligible target frame.")
+    parser.add_argument(
+        "--target-count",
+        type=int,
+        default=0,
+        help=(
+            "Minimum scored-POI floor. Zero selects only semantic-episode "
+            "representatives in event-aware mode, or every eligible frame when "
+            "--semantic-episode-policy=none."
+        ),
+    )
     parser.add_argument("--past-frames", type=int, default=DEFAULT_PAST_FRAMES)
     parser.add_argument("--future-frames", type=int, default=DEFAULT_FUTURE_FRAMES)
     parser.add_argument("--edge-window-policy", choices=["reject", "clamp"], default="reject")

@@ -45,7 +45,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--scenes-per-family", type=int, default=25)
     parser.add_argument("--paths-per-scene", type=int, default=50)
-    parser.add_argument("--scored-pois-per-source-path", type=int, default=2)
+    parser.add_argument(
+        "--scored-pois-per-source-path",
+        type=int,
+        default=0,
+        help="Minimum average POI floor; zero uses pure event-aware selection.",
+    )
     parser.add_argument(
         "--semantic-episode-policy",
         choices=["none", "guarantee_representative"],
@@ -472,7 +477,7 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
         f"- Deterministic seed: `{config['seed']}`.",
         f"- Random scene cohorts per family: up to `{config['scenes_per_family']}`.",
         f"- Random robot source paths per selected scene: up to `{config['paths_per_scene']}`.",
-        f"- Scored POI budget: `{config['scored_pois_per_source_path']}` per sampled source path.",
+        f"- Minimum scored POI floor: `{config['scored_pois_per_source_path']}` per sampled source path.",
         f"- Semantic episode policy: `{config['semantic_episode_policy']}`.",
         f"- Scene survey workers: `{config['workers']}`.",
         "- Mandatory mission/checkpoint/path endpoints remain additive and are reported separately.",

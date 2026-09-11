@@ -45,7 +45,7 @@ EXPERIMENTS = {
     "budget_4": {"average_scored_pois_per_path": 4, "semantic_episode_policy": "none"},
     "budget_8": {"average_scored_pois_per_path": 8, "semantic_episode_policy": "none"},
     "event_aware": {
-        "average_scored_pois_per_path": 2,
+        "average_scored_pois_per_path": 0,
         "semantic_episode_policy": "guarantee_representative",
     },
 }

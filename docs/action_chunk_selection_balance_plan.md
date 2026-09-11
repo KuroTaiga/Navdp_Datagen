@@ -58,7 +58,7 @@ Primary references:
 
 ## Default Distribution Policy
 
-Implemented policy: `anchor_aware_semantic_center_balance/v0.5`.
+Implemented policy: `anchor_aware_semantic_center_balance/v0.6`.
 
 Primary interest buckets:
 
@@ -131,7 +131,7 @@ position, time, and wrapped yaw across those frame-id gaps before applying the
 metadata. `--no-densify-frame-gaps` is available only for compatibility audits.
 
 Score components include actor/robot proximity, event proximity, stop/turn
-transitions, turn magnitude, and representative clean-motion coverage. The v0.5
+transitions, turn magnitude, and representative clean-motion coverage. The v0.6
 policy also derives the following auditable navigation signals from Pathplanner
 metadata:
 
@@ -151,12 +151,14 @@ covered by at least one scored POI. Episode coverage prevents a long stop or
 avoidance interval from being misread as many independent events.
 
 The production default uses `guarantee_representative` and chooses one scored
-apex per important
-contiguous episode. A long episode receives approach or completion centers only
+apex per important contiguous episode. A long episode receives approach or
+completion centers only
 when its action, instruction, room, decision reason, or visible-human context
-changes. This is intentionally an adaptive global budget rather than a per-path
-or per-action cap. `semantic_episode_policy=none` remains available only for
-fixed-budget comparisons and ablations.
+changes. With the default zero target count there is no artificial scored-POI
+floor: the event representatives define the count. A positive target count is
+an optional global minimum, never a per-path or per-action cap.
+`semantic_episode_policy=none` remains available only for fixed-budget
+comparisons and ablations.
 
 ## Selection Algorithm
 
@@ -168,13 +170,15 @@ fixed-budget comparisons and ablations.
    and the end of each contiguous physical stop episode as mandatory anchors.
    A long stationary interval contributes one stopping-point anchor, not one
    anchor per stopped frame.
-5. Derive adaptive interest-bucket targets for the requested scored POI budget.
-6. Add mandatory anchors first. They are additive and do not consume the scored
-   POI budget, per-path POI cap, or action-deficit counts.
-7. Select scored POIs by bucket score, soft action deficit, deterministic seed
-   jitter, and minimum spacing. Multiple POIs may come from the same path;
+5. Derive sparse representatives of every guaranteed semantic episode.
+6. Treat a positive target count as an optional global minimum; the default zero
+   count adds no artificial floor in event-aware mode.
+7. Add mandatory anchors first. They are additive and do not consume the scored
+   POI count, per-path POI cap, or action-deficit counts.
+8. Select all episode representatives, then fill only a positive unmet minimum
+   using bucket score, soft action deficit, deterministic seed jitter, and
+   spacing. Multiple POIs may come from the same path;
    `--max-targets-per-job 0` leaves that unlimited.
-8. Fill any remaining scored POI budget from the globally best eligible frames.
 9. Emit 33-frame windows and both selection and selected-render manifests.
 
 The manifest separately reports actions at all selected centers, scored POI
@@ -195,7 +199,7 @@ No per-path action maximum is imposed.
     "past_frames": 32,
     "future_frames": 0,
     "window_frame_count": 33,
-    "distribution_policy": "anchor_aware_semantic_center_balance/v0.5"
+    "distribution_policy": "anchor_aware_semantic_center_balance/v0.6"
   },
   "distribution": {
     "target_bucket_ratios": {
