@@ -115,6 +115,15 @@ def _parse_args() -> argparse.Namespace:
         default=True,
         help="Meet availability-aware scored-center action targets before unconstrained filling.",
     )
+    parser.add_argument(
+        "--semantic-episode-policy",
+        choices=["none", "guarantee_representative"],
+        default="none",
+        help=(
+            "Optional adaptive experiment: retain sparse scored representatives for "
+            "important contiguous semantic episodes. The production default is none."
+        ),
+    )
     parser.add_argument("--json", action="store_true", help="Print the selection summary as JSON.")
     return parser.parse_args()
 
@@ -148,6 +157,7 @@ def main() -> int:
         action_deficit_weight=float(args.action_deficit_weight),
         bucket_deficit_weight=float(args.bucket_deficit_weight),
         enforce_action_minimums=bool(args.enforce_action_minimums),
+        semantic_episode_policy=str(args.semantic_episode_policy),
     )
     selection = select_frame_interest_windows_from_paths(args.manifest_json, config=config)
     selection["selection_path"] = str(args.output_selection_json)
@@ -172,6 +182,18 @@ def main() -> int:
         "unique_source_render_frame_count": selection["selection_summary"]["unique_source_render_frame_count"],
         "selected_bucket_counts": selection["selection_summary"]["selected_bucket_counts"],
         "selected_action_counts": selection["selection_summary"]["selected_action_counts"],
+        "selected_navigation_signal_counts": selection["selection_summary"].get(
+            "selected_navigation_signal_counts", {}
+        ),
+        "selected_interest_navigation_signal_counts": selection["selection_summary"].get(
+            "selected_interest_navigation_signal_counts", {}
+        ),
+        "available_navigation_signal_episode_counts": selection["distribution"].get(
+            "available_navigation_signal_episode_counts", {}
+        ),
+        "selected_interest_navigation_signal_episode_counts": selection[
+            "selection_summary"
+        ].get("selected_interest_navigation_signal_episode_counts", {}),
     }
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))

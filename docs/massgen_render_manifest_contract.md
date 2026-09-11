@@ -131,10 +131,18 @@ Selection manifests use schema `navdp_frame_interest_selection/v0.1` and store:
 
 - source manifest records and fingerprints;
 - adaptive interest-bucket and secondary action distributions;
-- selected chunks with target frame, action, bucket, score, reasons, and source
-  frame indices;
+- selected chunks with target frame, renderer-local target index, action,
+  bucket, score, reasons, navigation signals, and source frame indices;
 - a render contract requiring all 33 window frames to be rendered;
-- a render frame index with unique source frames for future sparse rendering.
+- a render frame index with unique source frames for future sparse rendering;
+- frame-level navigation-signal counts and contiguous-event coverage summaries.
+
+Large policy surveys may store the same renderer-independent chunk fields in
+gzip-compressed JSON Lines (`navdp_poi_survey_selection/v1.0`), one cohort per
+line. Each record keeps source manifest/job identity, the complete-path sample,
+target frame and target-window index, 33 source indices, semantic signals,
+target role, and mandatory-anchor types; downstream consumers can construct
+their own render jobs without replaying POI scoring.
 
 The selected-window render manifest keeps the original source manifest metadata
 but replaces `jobs` with one job per selected frame of interest. Each selected
@@ -143,6 +151,8 @@ job:
 - has `job_id` suffixed with `__m<source_manifest_index>__foi_<target_frame>`;
 - carries only the selected 33 camera trajectory samples;
 - rewrites renderer-local frame/sample ids to `0..32`;
+- declares `target_window_index=32`, identifying the current frame as the final
+  sample in the default past-only window;
 - preserves source frame indices in point and camera metadata;
 - sets `camera.preserve_frame_samples=true`.
 

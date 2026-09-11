@@ -20,14 +20,14 @@ The model contract for each selected frame of interest is:
 {
   "past_context_frame_count": 32,
   "current_frame_count": 1,
-  "future_context_frame_count": 32,
-  "render_window_frame_count": 65
+  "future_context_frame_count": 0,
+  "render_window_frame_count": 33
 }
 ```
 
 If frame `t` is selected for training or testing, the renderer must preserve and
-render all frames `t-32..t+32`. At a required path endpoint, the nearest edge
-sample is repeated so the endpoint remains at index 32. Stationary, yield,
+render all frames `t-32..t`. At a required path endpoint, the nearest edge
+sample is repeated when needed so the endpoint remains the final sample. Stationary, yield,
 edge-padded, and repeated-pose frames are valid context and must not be
 deduplicated away.
 
@@ -43,8 +43,9 @@ not as an optimal distribution.
 For NavDP-style navigation training, the selector uses two levels of guidance:
 
 1. Primary interest buckets decide which planning moments are worth rendering.
-2. Secondary action ratios provide a soft tie-breaker and survey reference.
-   They are not quotas and do not reject an otherwise valuable point.
+2. Secondary action ratios provide selection priority and availability-aware
+   scored-center minimums. They impose no per-action maximum and do not affect
+   the additive mandatory endpoints.
 
 Primary references:
 
@@ -57,7 +58,7 @@ Primary references:
 
 ## Default Distribution Policy
 
-Implemented policy: `anchor_aware_center_balance/v0.3`.
+Implemented policy: `anchor_aware_semantic_center_balance/v0.4`.
 
 Primary interest buckets:
 
@@ -84,9 +85,11 @@ Secondary action target ratios default to:
 | turn right | `3` | 15% |
 
 These ratios are configurable with `--action-ratio`, but currently affect only
-soft selection priority. The survey reports action distributions at selected
-centers and across the complete retained 33-frame windows. This avoids mistaking
-a critical-state-heavy center distribution for a dataset with no forward motion.
+soft selection priority and availability-aware scored-center minimums. They do
+not impose per-path or per-action maximums. The survey reports action
+distributions at selected centers and across the complete retained 33-frame
+windows. This avoids mistaking a critical-state-heavy center distribution for a
+dataset with no forward motion.
 
 ## Inputs
 
@@ -96,10 +99,10 @@ from Pathplanner scenarios. It uses:
 - `jobs[*].camera.trajectory` for frame, time, pose, yaw, and motion state;
 - mission release/deadline times and event logs for route-decision salience;
 - manifest human trajectories and peer-robot pose tracks for proximity scores;
-- job family and actor ids for chunk metadata and downstream filtering.
-
-Future Pathplanner candidate-quality metadata can be added as another feature
-source without changing the selected-window render contract.
+- job family and actor ids for chunk metadata and downstream filtering;
+- deterministic Pathplanner navigation supervision on every trajectory sample,
+  including instruction sections, room membership, planned/executed actions,
+  route deviation, decision provenance, and target-human visibility.
 
 ## Candidate Scoring
 
@@ -128,7 +131,31 @@ position, time, and wrapped yaw across those frame-id gaps before applying the
 metadata. `--no-densify-frame-gaps` is available only for compatibility audits.
 
 Score components include actor/robot proximity, event proximity, stop/turn
-transitions, turn magnitude, and representative clean-motion coverage.
+transitions, turn magnitude, and representative clean-motion coverage. The v0.4
+policy also derives the following auditable navigation signals from Pathplanner
+metadata:
+
+- instruction turns, semantic stops, and instruction-section boundaries;
+- room transitions;
+- collision avoidance and primary or secondary L1-L4 social-law decisions;
+- human-interaction decisions, traffic waits, and visible relevant/target humans;
+- mission endpoint stops;
+- route deviation and planned/executed action mismatch.
+
+These signals boost the applicable interest-bucket score and are emitted on each
+selected chunk. They are not separate quotas. This keeps the configured action
+distribution effective while choosing semantically stronger points within each
+action and interest stratum. Reports include both signal-bearing frame counts
+and contiguous per-path signal episodes, plus the number of distinct episodes
+covered by at least one scored POI. Episode coverage prevents a long stop or
+avoidance interval from being misread as many independent events.
+
+The production default does not force semantic-episode coverage. The opt-in
+`guarantee_representative` experiment chooses one scored apex per important
+contiguous episode. A long episode receives approach or completion centers only
+when its action, instruction, room, decision reason, or visible-human context
+changes. This is intentionally an adaptive global budget rather than a per-path
+or per-action cap.
 
 ## Selection Algorithm
 
@@ -136,8 +163,10 @@ transitions, turn magnitude, and representative clean-motion coverage.
 2. Deterministically random-rank complete source paths using the run seed, then
    retain all paths or the requested `--max-source-paths` subset.
 3. Densify each selected path and score every eligible frame on the full path.
-4. Mark assigned sub-mission completion/checkpoint frames and each trajectory end
-   as mandatory anchors.
+4. Mark assigned sub-mission completion/checkpoint frames, each trajectory end,
+   and the end of each contiguous physical stop episode as mandatory anchors.
+   A long stationary interval contributes one stopping-point anchor, not one
+   anchor per stopped frame.
 5. Derive adaptive interest-bucket targets for the requested scored POI budget.
 6. Add mandatory anchors first. They are additive and do not consume the scored
    POI budget, per-path POI cap, or action-deficit counts.
@@ -165,7 +194,7 @@ No per-path action maximum is imposed.
     "past_frames": 32,
     "future_frames": 0,
     "window_frame_count": 33,
-    "distribution_policy": "anchor_aware_center_balance/v0.3"
+    "distribution_policy": "anchor_aware_semantic_center_balance/v0.4"
   },
   "distribution": {
     "target_bucket_ratios": {
@@ -185,15 +214,22 @@ No per-path action maximum is imposed.
     {
       "target_role": "frame_of_interest",
       "target_frame": 120,
+      "target_window_index": 32,
       "target_action_name": "turn_left",
       "target_bucket": "route_decision",
+      "navigation_signals": [
+        "instruction_turn",
+        "instruction_section_boundary",
+        "room_transition"
+      ],
       "window": {
         "source_frame_indices": [88, 89, 90],
-        "render_frame_count": 65
+        "render_frame_count": 33
       },
       "render_contract": {
         "must_render_all_window_frames": true,
-        "preserve_stationary_frames": true
+        "preserve_stationary_frames": true,
+        "target_renderer_frame_index": 32
       }
     }
   ]
@@ -201,7 +237,8 @@ No per-path action maximum is imposed.
 ```
 
 The sample shortens `source_frame_indices` for readability. Real manifests write
-all 65 indices.
+all 33 indices. `target_window_index` identifies the current frame explicitly;
+with the default past-only contract it is the final window frame.
 
 ## CLI
 
@@ -266,6 +303,30 @@ python3 scripts/massgen/visualize_frame_selection_outputs.py \
   --source-manifest-root out/frame_selection_family_pilot/source_render_manifests \
   --output-root out/frame_sampling_visualization
 ```
+
+The visualization output includes path/selected-window BEV GIFs, action and
+interest-bucket distributions, and `navigation_signal_coverage.png` for the
+metadata-grounded signal populations and scored-POI retention rates.
+
+Run the all-cohort fixed/adaptive policy comparison without rendering:
+
+```bash
+python3 scripts/analysis/survey_poi_policy_matrix.py \
+  --formal-fast-root /path/to/formal_fast_v1 \
+  --formal-slow-root /path/to/formal_slow_v1 \
+  --formal-social-root /path/to/formal_social_slow_v1 \
+  --output-dir out/poi_policy_matrix \
+  --paths-per-cohort 50 \
+  --scenes-per-family 0 \
+  --seed 20260911 \
+  --workers 119
+```
+
+The matrix compares average global scored-POI budgets of 2, 4, and 8 per
+sampled path with the adaptive episode-representative policy. It discovers
+cohorts once, reads only deterministically selected scenarios, emits compressed
+renderer-independent selection manifests, and reports all-source, center,
+independent-window, and unique-retained populations separately.
 
 Write both selection and selected-window render manifest:
 
@@ -335,6 +396,10 @@ out/frame_interest_selection/<run_id>/
 - `navdp_datagen/massgen/frame_selection_pilot.py`
 - `scripts/massgen/prepare_frame_selection_family_pilot.py`
 - `scripts/massgen/visualize_frame_selection_outputs.py`
+- `scripts/analysis/survey_poi_policy_matrix.py`
+- `scripts/analysis/visualize_poi_policy_matrix.py`
+- `scripts/analysis/run_poi_policy_matrix_remote.sh`
+- `scripts/analysis/watch_remote_poi_policy_survey.sh`
 - `scripts/massgen/render_manifest_jobs.py`
 - `navdp_datagen/massgen/render_executor.py`
 - `render_label_paths_telesim.py`

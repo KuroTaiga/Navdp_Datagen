@@ -27,8 +27,8 @@ The renderer must support:
   description instead of hard-coded per-script camera constants;
 - multi-GPU server scheduling.
 - frame-interest selection before rendering, so each selected train/test target
-  renders its required 32-past/current/32-future context instead of rendering
-  full paths by default.
+  renders its required 32-past-plus-current causal context, with no future
+  frames, instead of rendering full paths by default.
 
 ## Mission Family Rendering Needs
 
@@ -277,6 +277,14 @@ Remaining:
   plan/render only selected 33-frame window jobs.
 - [x] Add explicit mission-family filtering to candidate generation and report
   available/selected family membership counts.
+- [x] Use deterministic per-frame navigation supervision to prioritize
+  instruction boundaries, room transitions, collision/social decisions,
+  human-interaction visibility, and planned-route deviations; preserve the
+  derived signals in selected chunks and distribution summaries.
+- [x] Add a deterministic all-cohort POI policy matrix comparing global average
+  budgets 2/4/8 against sparse adaptive semantic-episode representatives, with
+  compressed renderer-independent selection manifests and BEV/statistical
+  visualization inputs.
 - [x] Add `scripts/massgen/prepare_frame_selection_family_pilot.py` to prepare
   non-executing selections, selected render manifests, acceptance criteria, and
   plan/execute command arrays for every active family.

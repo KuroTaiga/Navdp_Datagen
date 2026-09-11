@@ -172,30 +172,169 @@ def test_apply_frame_selection_rewrites_jobs_to_selected_windows(tmp_path: Path)
 
 def test_frame_selection_exports_target_and_window_navigation_metadata(tmp_path: Path) -> None:
     manifest = _manifest(_scene(tmp_path))
-    for point in manifest["jobs"][0]["camera"]["trajectory"]:
+    for index, point in enumerate(manifest["jobs"][0]["camera"]["trajectory"]):
         point["metadata"] = {
             "navigation": {
                 "plan_id": "robot_alpha:mission_001",
-                "instruction_section_id": "section_002",
-                "instruction_section_type": "turn",
-                "decision": {"primary_reason": "L2_PEDESTRIAN_YIELD"},
+                "instruction_section_id": "section_002" if index >= 50 else "section_001",
+                "instruction_section_type": "turn" if index == 50 else "straight",
+                "current_room": {
+                    "room_id": "scene_001.room_002" if index >= 50 else "scene_001.room_001",
+                    "room_type": "hallway" if index >= 50 else "living room",
+                },
+                "planned_action": "MOVE",
+                "executed_action": "STOP" if index == 50 else "MOVE",
+                "deviation_from_planned_route_m": 0.4 if index == 50 else 0.0,
+                "decision": {
+                    "primary_reason": (
+                        "HUMAN_COLLISION_AVOIDANCE" if index == 50 else "FOLLOW_PLANNED_ROUTE"
+                    ),
+                    "secondary_reasons": ["L3_GROUP_INTEGRITY"] if index == 50 else [],
+                },
+                "visible_human_ids": ["human_target"] if index == 50 else [],
+                "target_human": {
+                    "human_id": "human_target",
+                    "visibility": "geometry_estimated_visible" if index == 50 else "not_visible",
+                },
             }
         }
     selection = select_frame_interest_windows(
         [manifest],
         manifest_paths=["manifest.json"],
-        config=FrameSelectionConfig(target_count=1, seed=77, preserve_mission_endpoints=False),
+        config=FrameSelectionConfig(
+            target_count=1,
+            seed=77,
+            preserve_mission_endpoints=False,
+            target_action_ratios={"stop": 1.0},
+        ),
     )
 
     chunk = selection["chunks"][0]
     assert chunk["target_navigation"]["instruction_section_id"] == "section_002"
+    assert chunk["target_frame"] == 50
+    assert chunk["target_window_index"] == DEFAULT_PAST_FRAMES
+    assert chunk["render_contract"]["target_renderer_frame_index"] == DEFAULT_PAST_FRAMES
+    assert {
+        "instruction_turn",
+        "instruction_section_boundary",
+        "room_transition",
+        "collision_avoidance",
+        "social_law_decision",
+        "relevant_human_visible",
+        "target_human_visible",
+        "route_deviation",
+        "planned_execution_mismatch",
+    }.issubset(chunk["navigation_signals"])
+    assert selection["selection_summary"]["selected_navigation_signal_counts"]["room_transition"] == 1
+    assert selection["distribution"]["available_navigation_signal_counts"]["room_transition"] == 1
+    assert selection["distribution"]["available_navigation_signal_episode_counts"]["room_transition"] == 1
+    assert (
+        selection["selection_summary"]["selected_interest_navigation_signal_episode_counts"][
+            "room_transition"
+        ]
+        == 1
+    )
     selected = apply_frame_selection_to_manifest(manifest, selection, manifest_path="manifest.json")
     job = selected["jobs"][0]
-    assert job["frame_selection"]["target_navigation"]["decision"]["primary_reason"] == "L2_PEDESTRIAN_YIELD"
+    assert (
+        job["frame_selection"]["target_navigation"]["decision"]["primary_reason"]
+        == "HUMAN_COLLISION_AVOIDANCE"
+    )
+    assert "room_transition" in job["frame_selection"]["navigation_signals"]
+    assert job["frame_selection"]["target_window_index"] == DEFAULT_PAST_FRAMES
+    assert job["camera"]["metadata"]["target_window_index"] == DEFAULT_PAST_FRAMES
+    assert job["frame_catalog"]["target_window_index"] == DEFAULT_PAST_FRAMES
     assert all(
         point["metadata"]["navigation"]["plan_id"] == "robot_alpha:mission_001"
         for point in job["camera"]["trajectory"]
     )
+
+
+def test_navigation_signal_coverage_counts_distinct_contiguous_episodes(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    manifest["events"] = []
+    manifest["missions"][0].pop("release_time_s")
+    manifest["missions"][0].pop("deadline_s")
+    for index, point in enumerate(manifest["jobs"][0]["camera"]["trajectory"]):
+        collision_episode = 40 <= index <= 45 or 64 <= index <= 69
+        point["metadata"] = {
+            "navigation": {
+                "decision": {
+                    "primary_reason": (
+                        "HUMAN_COLLISION_AVOIDANCE"
+                        if collision_episode
+                        else "FOLLOW_PLANNED_ROUTE"
+                    )
+                }
+            }
+        }
+
+    selection = select_frame_interest_windows(
+        [manifest],
+        manifest_paths=["manifest.json"],
+        config=FrameSelectionConfig(
+            target_count=2,
+            seed=13,
+            preserve_mission_endpoints=False,
+            min_target_spacing_frames=16,
+            target_action_ratios={"move": 1.0},
+        ),
+    )
+
+    assert selection["distribution"]["available_navigation_signal_counts"][
+        "collision_avoidance"
+    ] == 12
+    assert selection["distribution"]["available_navigation_signal_episode_counts"][
+        "collision_avoidance"
+    ] == 2
+    assert selection["selection_summary"][
+        "selected_interest_navigation_signal_episode_counts"
+    ]["collision_avoidance"] == 2
+
+
+def test_event_aware_policy_adapts_budget_to_sparse_episode_representatives(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    manifest["events"] = []
+    manifest["missions"] = []
+    for index, point in enumerate(manifest["jobs"][0]["camera"]["trajectory"]):
+        point["motion_state"] = "moving"
+        collision_episode = 32 <= index <= 39 or 60 <= index <= 99
+        point["metadata"] = {
+            "navigation": {
+                "decision": {
+                    "primary_reason": (
+                        "HUMAN_COLLISION_AVOIDANCE"
+                        if collision_episode
+                        else "FOLLOW_PLANNED_ROUTE"
+                    )
+                }
+            }
+        }
+
+    selection = select_frame_interest_windows(
+        [manifest],
+        manifest_paths=["manifest.json"],
+        config=FrameSelectionConfig(
+            target_count=1,
+            seed=19,
+            preserve_mission_endpoints=False,
+            min_target_spacing_frames=16,
+            target_action_ratios={"move": 1.0},
+            semantic_episode_policy="guarantee_representative",
+        ),
+    )
+
+    assert selection["config"]["semantic_episode_policy"] == "guarantee_representative"
+    assert selection["distribution"]["guaranteed_episode_representative_count"] == 2
+    assert selection["selection_summary"]["requested_target_count"] == 1
+    assert selection["selection_summary"]["selected_interest_target_count"] == 2
+    assert selection["selection_summary"][
+        "selected_interest_navigation_signal_episode_counts"
+    ]["collision_avoidance"] == 2
 
 
 def test_selected_render_plan_preserves_stationary_frame_samples(tmp_path: Path) -> None:
@@ -346,11 +485,13 @@ def test_final_trajectory_endpoint_is_a_mandatory_past_and_current_anchor(tmp_pa
     )
 
     chunk = next(
-        chunk for chunk in selection["chunks"] if chunk["target_role"] == "mandatory_anchor"
+        chunk
+        for chunk in selection["chunks"]
+        if "trajectory_end" in chunk["mandatory_anchor_types"]
     )
-    assert selection["selection_summary"]["mandatory_anchor_count"] == 1
+    assert selection["selection_summary"]["mandatory_anchor_count"] == 2
     assert selection["selection_summary"]["selected_interest_target_count"] == 1
-    assert selection["selection_summary"]["selected_target_count"] == 2
+    assert selection["selection_summary"]["selected_target_count"] == 3
     assert sum(
         selection["selection_summary"]["selected_interest_action_counts"].values()
     ) == 1
@@ -359,12 +500,35 @@ def test_final_trajectory_endpoint_is_a_mandatory_past_and_current_anchor(tmp_pa
     ) == 1
     assert chunk["target_frame"] == 99
     assert chunk["target_role"] == "mandatory_anchor"
-    assert chunk["mandatory_anchor_types"] == ["trajectory_end"]
+    assert "trajectory_end" in chunk["mandatory_anchor_types"]
     assert chunk["window"]["edge_policy"] == "reject"
     assert chunk["window"]["source_frame_indices"][0] == 99 - DEFAULT_PAST_FRAMES
     assert chunk["window"]["source_frame_indices"][32] == 99
     assert chunk["window"]["source_frame_indices"][-1] == 99
     assert len(chunk["window"]["source_frame_indices"]) == DEFAULT_PAST_FRAMES + 1
+
+
+def test_stop_episode_end_is_one_additive_anchor_not_one_per_stopped_frame(
+    tmp_path: Path,
+) -> None:
+    manifest = _manifest(_scene(tmp_path))
+    selection = select_frame_interest_windows(
+        [manifest],
+        manifest_paths=["manifest.json"],
+        config=FrameSelectionConfig(
+            target_count=1,
+            preserve_mission_endpoints=True,
+            seed=22,
+        ),
+    )
+
+    stopping_points = [
+        chunk
+        for chunk in selection["chunks"]
+        if "stopping_point" in chunk["mandatory_anchor_types"]
+    ]
+    assert [chunk["target_frame"] for chunk in stopping_points] == [53]
+    assert selection["selection_summary"]["selected_interest_target_count"] == 1
 
 
 def test_assigned_sub_mission_completions_are_always_selected(tmp_path: Path) -> None:
@@ -388,6 +552,13 @@ def test_assigned_sub_mission_completions_are_always_selected(tmp_path: Path) ->
             "actor_id": "robot_alpha",
             "t": 7.0,
         },
+        {
+            "event_id": "checkpoint_a",
+            "event_type": "checkpoint_reached",
+            "mission_id": "child_a",
+            "actor_id": "robot_alpha",
+            "t": 6.0,
+        },
     ]
     manifest["jobs"][0]["assigned_mission_ids"] = ["child_a", "child_b"]
 
@@ -401,13 +572,14 @@ def test_assigned_sub_mission_completions_are_always_selected(tmp_path: Path) ->
         chunk for chunk in selection["chunks"] if chunk["target_role"] == "mandatory_anchor"
     ]
     chunks_by_frame = {chunk["target_frame"]: chunk for chunk in mandatory_chunks}
-    assert set(chunks_by_frame) == {40, 70, 99}
+    assert set(chunks_by_frame) == {40, 53, 60, 70, 99}
     assert "mission_section_end:child_a" in chunks_by_frame[40]["mandatory_anchor_types"]
     assert "mission_section_end:child_b" in chunks_by_frame[70]["mandatory_anchor_types"]
+    assert "mission_section_end:child_a" in chunks_by_frame[60]["mandatory_anchor_types"]
     assert "trajectory_end" in chunks_by_frame[99]["mandatory_anchor_types"]
-    assert selection["selection_summary"]["mandatory_anchor_count"] == 3
+    assert selection["selection_summary"]["mandatory_anchor_count"] == 5
     assert selection["selection_summary"]["selected_interest_target_count"] == 1
-    assert selection["selection_summary"]["selected_target_count"] == 4
+    assert selection["selection_summary"]["selected_target_count"] == 6
 
 
 def test_summary_separates_center_actions_from_retained_window_actions(tmp_path: Path) -> None:
@@ -479,7 +651,7 @@ def test_scored_center_action_minimums_exclude_mandatory_anchors(tmp_path: Path)
         "turn_left": 3,
         "turn_right": 3,
     }
-    assert summary["mandatory_anchor_action_counts"] == {"stop": 1}
+    assert summary["mandatory_anchor_action_counts"] == {"stop": 2}
     assert summary["action_deficits"] == {
         "move": 0,
         "stop": 0,
@@ -669,9 +841,9 @@ def test_family_pilot_prepares_one_poi_plus_endpoint_render_tests(
     assert plan["status"] == "ready_to_plan"
     assert record["status"] == "ready"
     assert record["selected_interest_target_count"] == 1
-    assert record["mandatory_anchor_count"] == 1
-    assert record["selected_target_count"] == 2
-    assert record["requested_window_frame_renders"] == 2 * (DEFAULT_PAST_FRAMES + 1)
+    assert record["mandatory_anchor_count"] == 2
+    assert record["selected_target_count"] == 3
+    assert record["requested_window_frame_renders"] == 3 * (DEFAULT_PAST_FRAMES + 1)
     assert len(record["selected_render_manifests"]) == 1
     assert record["commands"][0]["execution_authorized"] is False
     assert "--execute" not in record["commands"][0]["plan_argv"]

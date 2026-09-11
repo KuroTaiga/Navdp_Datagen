@@ -110,7 +110,19 @@ def _progress_records(roots: Sequence[tuple[Path, str]]) -> list[JsonDict]:
 def _describe(values: Sequence[int | float]) -> JsonDict:
     ordered = sorted(float(value) for value in values)
     if not ordered:
-        return {"count": 0, "min": None, "mean": None, "median": None, "p95": None, "max": None, "total": 0}
+        return {
+            "count": 0,
+            "min": None,
+            "mean": None,
+            "median": None,
+            "p25": None,
+            "p75": None,
+            "p90": None,
+            "p95": None,
+            "p99": None,
+            "max": None,
+            "total": 0,
+        }
 
     def percentile(fraction: float) -> float:
         index = min(len(ordered) - 1, max(0, int(math.ceil(fraction * len(ordered))) - 1))
@@ -121,7 +133,11 @@ def _describe(values: Sequence[int | float]) -> JsonDict:
         "min": ordered[0],
         "mean": statistics.fmean(ordered),
         "median": statistics.median(ordered),
+        "p25": percentile(0.25),
+        "p75": percentile(0.75),
+        "p90": percentile(0.90),
         "p95": percentile(0.95),
+        "p99": percentile(0.99),
         "max": ordered[-1],
         "total": sum(ordered),
     }
@@ -230,6 +246,26 @@ def _survey_scene(
     anchor_actions = dict(summary.get("mandatory_anchor_action_counts", {}))
     retained_actions = dict(summary.get("selected_window_action_counts", {}))
     unique_actions = dict(summary.get("selected_unique_window_action_counts", {}))
+    navigation_signals = {
+        "available_centers": dict(
+            selection["distribution"].get("available_navigation_signal_counts", {})
+        ),
+        "selected_centers": dict(summary.get("selected_navigation_signal_counts", {})),
+        "scored_poi_centers": dict(
+            summary.get("selected_interest_navigation_signal_counts", {})
+        ),
+        "available_episodes": dict(
+            selection["distribution"].get(
+                "available_navigation_signal_episode_counts", {}
+            )
+        ),
+        "selected_episodes": dict(
+            summary.get("selected_navigation_signal_episode_counts", {})
+        ),
+        "scored_poi_covered_episodes": dict(
+            summary.get("selected_interest_navigation_signal_episode_counts", {})
+        ),
+    }
     return {
         "family": family,
         "dataset": str(scene.get("dataset") or ""),
@@ -263,6 +299,7 @@ def _survey_scene(
             "repeated_window_frames": {"counts": retained_actions, "ratios": _ratios(retained_actions)},
             "unique_retained_frames": {"counts": unique_actions, "ratios": _ratios(unique_actions)},
         },
+        "navigation_signals": navigation_signals,
         "target_action_counts": dict(selection["distribution"].get("target_action_counts", {})),
         "action_deficits": dict(summary.get("action_deficits", {})),
         "training_center_sampling": dict(summary.get("training_center_sampling", {})),
@@ -362,6 +399,17 @@ def _survey_family(
             "unique_retained_frames",
         )
     }
+    navigation_signals = {
+        name: _sum_counts([record["navigation_signals"][name] for record in scene_results])
+        for name in (
+            "available_centers",
+            "selected_centers",
+            "scored_poi_centers",
+            "available_episodes",
+            "selected_episodes",
+            "scored_poi_covered_episodes",
+        )
+    }
     family_result = {
         "family": family,
         "sampled_scene_count": sum(1 for record in scene_results if record["sampled_source_path_count"]),
@@ -382,6 +430,7 @@ def _survey_family(
             name: {"counts": counts, "ratios": _ratios(counts)}
             for name, counts in actions.items()
         },
+        "navigation_signals": navigation_signals,
         "action_deficits": _sum_counts([record["action_deficits"] for record in scene_results]),
         "training_center_sampling": {
             "population": "scored_poi_centers",
@@ -491,6 +540,33 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
             f"{int(thresholds.get('10', 0)):,} ({100.0 * int(thresholds.get('10', 0)) / max(1, windows):.2f}%) |"
         )
     deficits = totals["action_deficits"]
+    signal_available = totals["navigation_signals"]["available_centers"]
+    signal_available_episodes = totals["navigation_signals"]["available_episodes"]
+    signal_covered_episodes = totals["navigation_signals"][
+        "scored_poi_covered_episodes"
+    ]
+    lines.extend(
+        [
+            "",
+            "## Navigation-Signal Coverage",
+            "",
+            "Signals can overlap at one center. Event coverage groups contiguous frames carrying the same signal on one source path.",
+            "",
+            "| Navigation signal | Eligible frames | Distinct episodes | Episodes covered by scored POIs | Event coverage |",
+            "| --- | ---: | ---: | ---: | ---: |",
+        ]
+    )
+    for signal in sorted(
+        set(signal_available) | set(signal_available_episodes) | set(signal_covered_episodes)
+    ):
+        available_frames = int(signal_available.get(signal, 0))
+        available_episodes = int(signal_available_episodes.get(signal, 0))
+        covered_episodes = int(signal_covered_episodes.get(signal, 0))
+        lines.append(
+            f"| `{signal}` | {available_frames:,} | {available_episodes:,} | "
+            f"{covered_episodes:,} | "
+            f"{100.0 * covered_episodes / max(1, available_episodes):.2f}% |"
+        )
     lines.extend(
         [
             "",
@@ -569,7 +645,7 @@ def main() -> int:
         [item["actions"]["unique_retained_frames"]["counts"] for item in family_sampling]
     )
     payload = {
-        "schema_version": "navdp_path_sampling_corpus_survey/v0.2",
+        "schema_version": "navdp_path_sampling_corpus_survey/v0.3",
         "config": {
             "roots": [str(root) for root, _layout in roots],
             "scenes_per_family": int(args.scenes_per_family),
@@ -622,6 +698,19 @@ def main() -> int:
                     "counts": unique_actions,
                     "ratios": _ratios(unique_actions),
                 },
+                "navigation_signals": {
+                    name: _sum_counts(
+                        [item["navigation_signals"][name] for item in family_sampling]
+                    )
+                    for name in (
+                        "available_centers",
+                        "selected_centers",
+                        "scored_poi_centers",
+                        "available_episodes",
+                        "selected_episodes",
+                        "scored_poi_covered_episodes",
+                    )
+                },
                 "action_deficits": _sum_counts(
                     [item["action_deficits"] for item in family_sampling]
                 ),
@@ -672,6 +761,21 @@ def main() -> int:
         for population in ("scored_poi_centers", "mandatory_anchors", "unique_retained_frames"):
             for action in ("move", "stop", "turn_left", "turn_right"):
                 row[f"{population}_{action}_ratio"] = item["actions"][population]["ratios"].get(action, 0.0)
+        row["available_navigation_signals_json"] = json.dumps(
+            item["navigation_signals"]["available_centers"], sort_keys=True
+        )
+        row["selected_navigation_signals_json"] = json.dumps(
+            item["navigation_signals"]["selected_centers"], sort_keys=True
+        )
+        row["scored_poi_navigation_signals_json"] = json.dumps(
+            item["navigation_signals"]["scored_poi_centers"], sort_keys=True
+        )
+        row["available_navigation_signal_episodes_json"] = json.dumps(
+            item["navigation_signals"]["available_episodes"], sort_keys=True
+        )
+        row["scored_poi_covered_navigation_signal_episodes_json"] = json.dumps(
+            item["navigation_signals"]["scored_poi_covered_episodes"], sort_keys=True
+        )
         row["error_count"] = len(item["errors"])
         sampling_rows.append(row)
     with args.output_sampling_csv.open("w", encoding="utf-8", newline="") as handle:

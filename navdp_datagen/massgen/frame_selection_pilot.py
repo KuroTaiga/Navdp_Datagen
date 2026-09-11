@@ -316,8 +316,26 @@ def _prepare_family(
             "unique_source_render_frame_count": int(summary["unique_source_render_frame_count"]),
             "available_bucket_counts": selection["distribution"]["available_bucket_counts"],
             "available_action_counts": selection["distribution"]["available_action_counts"],
+            "available_navigation_signal_counts": selection["distribution"].get(
+                "available_navigation_signal_counts", {}
+            ),
+            "available_navigation_signal_episode_counts": selection["distribution"].get(
+                "available_navigation_signal_episode_counts", {}
+            ),
             "selected_bucket_counts": summary["selected_bucket_counts"],
             "selected_action_counts": summary["selected_action_counts"],
+            "selected_navigation_signal_counts": summary.get(
+                "selected_navigation_signal_counts", {}
+            ),
+            "selected_interest_navigation_signal_counts": summary.get(
+                "selected_interest_navigation_signal_counts", {}
+            ),
+            "selected_navigation_signal_episode_counts": summary.get(
+                "selected_navigation_signal_episode_counts", {}
+            ),
+            "selected_interest_navigation_signal_episode_counts": summary.get(
+                "selected_interest_navigation_signal_episode_counts", {}
+            ),
             "selection_json": str(selection_path),
             "selected_render_manifests": render_manifests,
             "commands": commands,

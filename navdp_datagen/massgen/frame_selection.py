@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from bisect import bisect_left
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,6 +49,20 @@ DEFAULT_ACTION_RATIOS = {
     "turn_left": 0.15,
     "turn_right": 0.15,
 }
+SEMANTIC_EPISODE_POLICIES = ("none", "guarantee_representative")
+GUARANTEED_EPISODE_SIGNALS = (
+    "instruction_turn",
+    "semantic_stop",
+    "instruction_section_boundary",
+    "room_transition",
+    "collision_avoidance",
+    "social_law_decision",
+    "human_interaction_decision",
+    "traffic_wait",
+    "target_human_visible",
+    "route_deviation",
+    "planned_execution_mismatch",
+)
 
 
 @dataclass(frozen=True)
@@ -69,6 +85,7 @@ class FrameSelectionConfig:
     action_deficit_weight: float = 0.35
     bucket_deficit_weight: float = 0.35
     enforce_action_minimums: bool = True
+    semantic_episode_policy: str = "none"
 
     @property
     def window_frame_count(self) -> int:
@@ -97,7 +114,8 @@ class FrameSelectionConfig:
             "action_deficit_weight": float(self.action_deficit_weight),
             "bucket_deficit_weight": float(self.bucket_deficit_weight),
             "enforce_action_minimums": bool(self.enforce_action_minimums),
-            "distribution_policy": "anchor_aware_center_balance/v0.3",
+            "semantic_episode_policy": str(self.semantic_episode_policy),
+            "distribution_policy": "anchor_aware_semantic_center_balance/v0.4",
         }
 
 
@@ -118,6 +136,7 @@ class FrameCandidate:
     yaw_rad: float
     motion_state: str
     navigation: Mapping[str, Any]
+    navigation_signals: tuple[str, ...]
     mission_families: tuple[str, ...]
     human_actor_ids: tuple[str, ...]
     peer_robot_ids: tuple[str, ...]
@@ -195,12 +214,25 @@ def select_frame_interest_windows(
         candidates,
         lambda candidate: candidate.mission_families,
     )
-    target_count = (
+    navigation_signal_candidate_counts = _count_memberships(
+        candidates,
+        lambda candidate: candidate.navigation_signals,
+    )
+    available_mandatory_anchor_type_counts = _count_memberships(
+        candidates,
+        lambda candidate: candidate.mandatory_anchor_types,
+    )
+    requested_target_count = (
         int(cfg.target_count)
         if int(cfg.target_count) > 0
         else len(interest_candidates)
     )
-    target_count = min(target_count, len(interest_candidates))
+    requested_target_count = min(requested_target_count, len(interest_candidates))
+    episode_representatives = _semantic_episode_representatives(candidates, cfg)
+    target_count = min(
+        len(interest_candidates),
+        max(requested_target_count, len(episode_representatives)),
+    )
     bucket_ratios = _derive_bucket_ratios(
         interest_bucket_counts,
         override=cfg.target_bucket_ratios,
@@ -218,8 +250,14 @@ def select_frame_interest_windows(
         bucket_targets=bucket_targets,
         action_targets=action_targets,
         action_candidate_counts=interest_action_candidate_counts,
+        episode_representatives=episode_representatives,
         config=cfg,
     )
+    (
+        available_navigation_signal_episode_counts,
+        selected_navigation_signal_episode_counts,
+        selected_interest_navigation_signal_episode_counts,
+    ) = _navigation_signal_episode_coverage(candidates, selected)
     chunks = [
         _chunk_record(candidate, index=index, config=cfg)
         for index, candidate in enumerate(selected)
@@ -248,11 +286,18 @@ def select_frame_interest_windows(
             "available_action_counts": action_candidate_counts,
             "available_interest_action_counts": interest_action_candidate_counts,
             "available_mission_family_counts": mission_family_candidate_counts,
+            "available_navigation_signal_counts": navigation_signal_candidate_counts,
+            "available_mandatory_anchor_type_counts": available_mandatory_anchor_type_counts,
+            "available_navigation_signal_episode_counts": (
+                available_navigation_signal_episode_counts
+            ),
             "target_bucket_ratios": bucket_ratios,
             "target_bucket_counts": bucket_targets,
             "target_action_ratios": action_ratios,
             "target_action_counts": action_targets,
             "action_selection_policy": "availability_aware_scored_center_minimums",
+            "semantic_episode_policy": str(cfg.semantic_episode_policy),
+            "guaranteed_episode_representative_count": len(episode_representatives),
         },
         "selection_summary": _selection_summary(
             candidates=candidates,
@@ -261,6 +306,15 @@ def select_frame_interest_windows(
             target_count=target_count,
             bucket_targets=bucket_targets,
             action_targets=action_targets,
+            available_navigation_signal_episode_counts=(
+                available_navigation_signal_episode_counts
+            ),
+            selected_navigation_signal_episode_counts=(
+                selected_navigation_signal_episode_counts
+            ),
+            selected_interest_navigation_signal_episode_counts=(
+                selected_interest_navigation_signal_episode_counts
+            ),
             config=cfg,
         ),
         "chunks": chunks,
@@ -356,6 +410,10 @@ def _validate_config(config: FrameSelectionConfig) -> None:
         raise ValueError("target_count must be non-negative")
     if int(config.max_source_paths) < 0:
         raise ValueError("max_source_paths must be non-negative")
+    if str(config.semantic_episode_policy) not in SEMANTIC_EPISODE_POLICIES:
+        raise ValueError(
+            f"semantic_episode_policy must be one of {SEMANTIC_EPISODE_POLICIES}"
+        )
     if any(not str(family).strip() for family in config.mission_families):
         raise ValueError("mission_families cannot contain empty values")
 
@@ -441,6 +499,11 @@ def _build_candidates(
         manifest_path = manifest_paths[manifest_index] if manifest_index < len(manifest_paths) else None
         actors = manifest.get("actors", {}) if isinstance(manifest.get("actors"), Mapping) else {}
         humans = [human for human in actors.get("humans", []) if isinstance(human, Mapping)]
+        human_tracks = [
+            _position_samples(human.get("trajectory", []), fallback=human.get("start_pose"))
+            for human in humans
+        ]
+        human_tracks = [track for track in human_tracks if track]
         jobs = [job for job in manifest.get("jobs", []) if isinstance(job, Mapping)]
         event_times = _event_times(manifest)
         for job in jobs:
@@ -450,6 +513,18 @@ def _build_candidates(
             trajectory = _job_trajectory(job, densify_frame_gaps=bool(config.densify_frame_gaps))
             if not trajectory:
                 continue
+            action_names = tuple(
+                _action_name(trajectory, index) for index in range(len(trajectory))
+            )
+            navigation_signals_by_index = tuple(
+                _navigation_signals(trajectory, index) for index in range(len(trajectory))
+            )
+            peer_tracks = [
+                _position_samples(track.get("trajectory", []))
+                for track in job.get("peer_robot_pose_tracks", [])
+                if isinstance(track, Mapping)
+            ]
+            peer_tracks = [track for track in peer_tracks if track]
             mandatory_anchors = _mandatory_anchor_indices(
                 manifest,
                 job,
@@ -473,22 +548,30 @@ def _build_candidates(
                     window_edge_policy = str(config.endpoint_window_policy)
                 if not source_window_indices:
                     continue
-                target_action_name = _action_name(trajectory, frame_index)
+                target_action_name = action_names[frame_index]
+                navigation_signals = navigation_signals_by_index[frame_index]
                 source_window_actions = tuple(
-                    _action_name(trajectory, int(source_index))
+                    action_names[int(source_index)]
                     for source_index in source_window_indices
                 )
+                point_position = _point_position(point)
+                point_time = _point_time(point, frame_index)
                 bucket_scores = _bucket_scores(
-                    manifest,
-                    job,
                     trajectory,
                     frame_index,
-                    humans,
                     event_times=event_times,
                     target_action_name=target_action_name,
+                    navigation_signals=navigation_signals,
+                    human_min=_min_track_distance(point_position, point_time, human_tracks),
+                    peer_min=_min_track_distance(point_position, point_time, peer_tracks),
                 )
                 target_bucket = max(INTEREST_BUCKETS, key=lambda bucket: bucket_scores.get(bucket, 0.0))
-                reasons = _candidate_reasons(target_bucket, bucket_scores, target_action_name)
+                reasons = _candidate_reasons(
+                    target_bucket,
+                    bucket_scores,
+                    target_action_name,
+                    navigation_signals,
+                )
                 score = _interest_score(bucket_scores)
                 source_frame_id = _int_or(point.get("frame"), frame_index)
                 stable_key = _stable_key(
@@ -510,11 +593,12 @@ def _build_candidates(
                         source_window_indices=tuple(int(item) for item in source_window_indices),
                         source_window_actions=source_window_actions,
                         window_edge_policy=window_edge_policy,
-                        time_s=_point_time(point, frame_index),
-                        position=_point_position(point),
+                        time_s=point_time,
+                        position=point_position,
                         yaw_rad=float(point.get("yaw_rad", 0.0) or 0.0),
                         motion_state=str(point.get("motion_state") or ""),
                         navigation=_point_navigation(point),
+                        navigation_signals=navigation_signals,
                         mission_families=family_tuple,
                         human_actor_ids=human_ids,
                         peer_robot_ids=peer_robot_ids,
@@ -663,6 +747,7 @@ def _select_candidates(
     bucket_targets: Mapping[str, int],
     action_targets: Mapping[str, int],
     action_candidate_counts: Mapping[str, int],
+    episode_representatives: Sequence[FrameCandidate],
     config: FrameSelectionConfig,
 ) -> list[FrameCandidate]:
     selected: list[FrameCandidate] = []
@@ -671,12 +756,26 @@ def _select_candidates(
     selected_by_job: dict[str, list[int]] = {}
     action_counts: dict[str, int] = {name: 0 for name in ACTION_NAMES}
     bucket_counts: dict[str, int] = {name: 0 for name in INTEREST_BUCKETS}
+    candidate_pool = _CandidatePool(candidates, config)
 
     mandatory = sorted(
         (candidate for candidate in candidates if candidate.mandatory_anchor_types),
         key=lambda item: (item.manifest_index, item.scene_id, item.job_id, item.source_frame_index),
     )
     for candidate in mandatory:
+        _mark_selected(
+            candidate,
+            selected,
+            selected_keys,
+            selected_by_job,
+            per_job_counts,
+            action_counts,
+            bucket_counts,
+        )
+
+    for candidate in episode_representatives:
+        if candidate.stable_key in selected_keys:
+            continue
         _mark_selected(
             candidate,
             selected,
@@ -702,7 +801,7 @@ def _select_candidates(
                 and int(action_counts.get(action, 0)) < int(action_targets.get(action, 0))
             ):
                 candidate = _best_candidate(
-                    candidates,
+                    candidate_pool,
                     selected_keys=selected_keys,
                     selected_by_job=selected_by_job,
                     per_job_counts=per_job_counts,
@@ -732,7 +831,7 @@ def _select_candidates(
             and int(bucket_counts.get(bucket, 0)) < int(bucket_targets.get(bucket, 0))
         ):
             candidate = _best_candidate(
-                candidates,
+                candidate_pool,
                 selected_keys=selected_keys,
                 selected_by_job=selected_by_job,
                 per_job_counts=per_job_counts,
@@ -758,7 +857,7 @@ def _select_candidates(
 
     while _interest_selected_count(selected) < target_count:
         candidate = _best_candidate(
-            candidates,
+            candidate_pool,
             selected_keys=selected_keys,
             selected_by_job=selected_by_job,
             per_job_counts=per_job_counts,
@@ -772,7 +871,7 @@ def _select_candidates(
         )
         if candidate is None:
             candidate = _best_candidate(
-                candidates,
+                candidate_pool,
                 selected_keys=selected_keys,
                 selected_by_job=selected_by_job,
                 per_job_counts=per_job_counts,
@@ -802,8 +901,187 @@ def _select_candidates(
     )
 
 
-def _best_candidate(
+def _semantic_episode_representatives(
     candidates: Sequence[FrameCandidate],
+    config: FrameSelectionConfig,
+) -> list[FrameCandidate]:
+    """Choose sparse scored centers that explicitly cover important signal episodes.
+
+    One apex representative is retained per contiguous episode. Long episodes only
+    receive approach/completion representatives when their surrounding semantic
+    context actually changes, preventing long stationary intervals from becoming
+    one-POI-per-frame expansions.
+    """
+
+    if str(config.semantic_episode_policy) == "none":
+        return []
+    guaranteed_signals = set(GUARANTEED_EPISODE_SIGNALS)
+    by_path_signal: dict[tuple[int, str, str], list[FrameCandidate]] = {}
+    for candidate in candidates:
+        if candidate.mandatory_anchor_types:
+            continue
+        for signal in candidate.navigation_signals:
+            if signal in guaranteed_signals:
+                by_path_signal.setdefault(
+                    (candidate.manifest_index, candidate.job_id, signal), []
+                ).append(candidate)
+
+    selected: dict[str, FrameCandidate] = {}
+    for path_signal, members in sorted(by_path_signal.items()):
+        ordered = sorted(members, key=lambda item: item.source_frame_index)
+        episode: list[FrameCandidate] = []
+        previous_frame: int | None = None
+        for candidate in ordered:
+            if previous_frame is not None and candidate.source_frame_index != previous_frame + 1:
+                _add_episode_representatives(episode, selected)
+                episode = []
+            episode.append(candidate)
+            previous_frame = candidate.source_frame_index
+        _add_episode_representatives(episode, selected)
+    return sorted(
+        selected.values(),
+        key=lambda item: (item.manifest_index, item.scene_id, item.job_id, item.source_frame_index),
+    )
+
+
+def _add_episode_representatives(
+    episode: Sequence[FrameCandidate],
+    selected: dict[str, FrameCandidate],
+) -> None:
+    if not episode:
+        return
+
+    def priority(candidate: FrameCandidate) -> tuple[float, int, int]:
+        return (
+            float(candidate.interest_score) + 0.02 * len(candidate.navigation_signals),
+            -abs(candidate.source_frame_index - episode[len(episode) // 2].source_frame_index),
+            -candidate.source_frame_index,
+        )
+
+    apex = max(episode, key=priority)
+    selected[apex.stable_key] = apex
+    if len(episode) < 64:
+        return
+    first_signature = _episode_context_signature(episode[0])
+    apex_signature = _episode_context_signature(apex)
+    last_signature = _episode_context_signature(episode[-1])
+    if first_signature != apex_signature:
+        selected[episode[0].stable_key] = episode[0]
+    if last_signature != apex_signature:
+        selected[episode[-1].stable_key] = episode[-1]
+
+
+def _episode_context_signature(candidate: FrameCandidate) -> tuple[object, ...]:
+    decision = candidate.navigation.get("decision")
+    decision = decision if isinstance(decision, Mapping) else {}
+    room = candidate.navigation.get("current_room")
+    room = room if isinstance(room, Mapping) else {}
+    visible = candidate.navigation.get("visible_human_ids")
+    visible_ids = (
+        tuple(sorted(str(item) for item in visible))
+        if isinstance(visible, Sequence) and not isinstance(visible, (str, bytes))
+        else ()
+    )
+    return (
+        candidate.target_action_name,
+        str(candidate.navigation.get("instruction_section_id") or ""),
+        str(room.get("room_id") or ""),
+        str(decision.get("primary_reason") or ""),
+        visible_ids,
+    )
+
+
+class _CandidatePool:
+    """Monotonic action/bucket queues for sublinear repeated best-candidate lookup."""
+
+    def __init__(
+        self,
+        candidates: Sequence[FrameCandidate],
+        config: FrameSelectionConfig,
+    ) -> None:
+        cells: dict[tuple[str, str], list[FrameCandidate]] = {}
+        for candidate in candidates:
+            if candidate.mandatory_anchor_types:
+                continue
+            cells.setdefault(
+                (candidate.target_action_name, candidate.target_bucket), []
+            ).append(candidate)
+        self.cells = {
+            key: sorted(
+                values,
+                key=lambda candidate: (
+                    _static_candidate_priority(candidate, config),
+                    candidate.stable_key,
+                ),
+                reverse=True,
+            )
+            for key, values in cells.items()
+        }
+        self.offsets = {
+            True: {key: 0 for key in self.cells},
+            False: {key: 0 for key in self.cells},
+        }
+
+    def best(
+        self,
+        *,
+        selected_keys: set[str],
+        selected_by_job: Mapping[str, Sequence[int]],
+        per_job_counts: Mapping[str, int],
+        action_counts: Mapping[str, int],
+        bucket_counts: Mapping[str, int],
+        bucket_targets: Mapping[str, int],
+        config: FrameSelectionConfig,
+        bucket: str | None,
+        target_action: str | None,
+        enforce_spacing: bool,
+    ) -> FrameCandidate | None:
+        best: tuple[float, FrameCandidate] | None = None
+        offsets = self.offsets[bool(enforce_spacing)]
+        for cell, values in self.cells.items():
+            action_name, bucket_name = cell
+            if bucket is not None and bucket_name != bucket:
+                continue
+            if target_action is not None and action_name != target_action:
+                continue
+            offset = offsets[cell]
+            while offset < len(values):
+                candidate = values[offset]
+                job_key = _candidate_job_key(candidate)
+                invalid = candidate.stable_key in selected_keys
+                invalid = invalid or (
+                    int(config.max_targets_per_job) > 0
+                    and per_job_counts.get(job_key, 0) >= int(config.max_targets_per_job)
+                )
+                invalid = invalid or (
+                    enforce_spacing
+                    and _violates_spacing(
+                        candidate,
+                        selected_by_job,
+                        int(config.min_target_spacing_frames),
+                    )
+                )
+                if not invalid:
+                    break
+                offset += 1
+            offsets[cell] = offset
+            if offset >= len(values):
+                continue
+            candidate = values[offset]
+            priority = _selection_priority(
+                candidate,
+                action_counts=action_counts,
+                bucket_counts=bucket_counts,
+                bucket_targets=bucket_targets,
+                config=config,
+            )
+            if best is None or priority > best[0]:
+                best = (priority, candidate)
+        return best[1] if best is not None else None
+
+
+def _best_candidate(
+    candidate_pool: _CandidatePool,
     *,
     selected_keys: set[str],
     selected_by_job: Mapping[str, Sequence[int]],
@@ -816,29 +1094,30 @@ def _best_candidate(
     target_action: str | None,
     enforce_spacing: bool,
 ) -> FrameCandidate | None:
-    best: tuple[float, FrameCandidate] | None = None
-    for candidate in candidates:
-        if candidate.stable_key in selected_keys:
-            continue
-        if bucket is not None and candidate.target_bucket != bucket:
-            continue
-        if target_action is not None and candidate.target_action_name != target_action:
-            continue
-        job_key = _candidate_job_key(candidate)
-        if int(config.max_targets_per_job) > 0 and per_job_counts.get(job_key, 0) >= int(config.max_targets_per_job):
-            continue
-        if enforce_spacing and _violates_spacing(candidate, selected_by_job, int(config.min_target_spacing_frames)):
-            continue
-        priority = _selection_priority(
-            candidate,
-            action_counts=action_counts,
-            bucket_counts=bucket_counts,
-            bucket_targets=bucket_targets,
-            config=config,
-        )
-        if best is None or priority > best[0]:
-            best = (priority, candidate)
-    return best[1] if best is not None else None
+    return candidate_pool.best(
+        selected_keys=selected_keys,
+        selected_by_job=selected_by_job,
+        per_job_counts=per_job_counts,
+        action_counts=action_counts,
+        bucket_counts=bucket_counts,
+        bucket_targets=bucket_targets,
+        config=config,
+        bucket=bucket,
+        target_action=target_action,
+        enforce_spacing=enforce_spacing,
+    )
+
+
+def _static_candidate_priority(
+    candidate: FrameCandidate,
+    config: FrameSelectionConfig,
+) -> float:
+    jitter_key = f"{int(config.seed)}::{candidate.stable_key}"
+    jitter_seed = int.from_bytes(
+        hashlib.sha256(jitter_key.encode("utf-8")).digest()[:8], "big"
+    )
+    jitter = float(jitter_seed) / float(1 << 64) * 1e-6
+    return float(candidate.interest_score) + jitter
 
 
 def _selection_priority(
@@ -857,14 +1136,10 @@ def _selection_priority(
     bucket_target = int(bucket_targets.get(candidate.target_bucket, 0))
     bucket_deficit = max(0, bucket_target - int(bucket_counts.get(candidate.target_bucket, 0)))
     bucket_deficit_share = float(bucket_deficit) / float(max(1, bucket_target))
-    jitter_key = f"{int(config.seed)}::{candidate.stable_key}"
-    jitter_seed = int.from_bytes(hashlib.sha256(jitter_key.encode("utf-8")).digest()[:8], "big")
-    jitter = float(jitter_seed) / float(1 << 64) * 1e-6
     return (
-        float(candidate.interest_score)
+        _static_candidate_priority(candidate, config)
         + float(config.action_deficit_weight) * deficit
         + float(config.bucket_deficit_weight) * bucket_deficit_share
-        + jitter
     )
 
 
@@ -931,10 +1206,12 @@ def _chunk_record(candidate: FrameCandidate, *, index: int, config: FrameSelecti
         "peer_robot_ids": list(candidate.peer_robot_ids),
         "target_frame": int(candidate.source_frame_index),
         "target_source_frame_id": int(candidate.source_frame_id),
+        "target_window_index": int(config.past_frames),
         "target_time_s": float(candidate.time_s),
         "target_action_name": candidate.target_action_name,
         "target_bucket": candidate.target_bucket,
         "target_navigation": dict(candidate.navigation),
+        "navigation_signals": list(candidate.navigation_signals),
         "target_role": "mandatory_anchor" if candidate.mandatory_anchor_types else "frame_of_interest",
         "mandatory_anchor_types": list(candidate.mandatory_anchor_types),
         "window_action_counts": _count_by(candidate.source_window_actions, lambda action: action),
@@ -953,6 +1230,7 @@ def _chunk_record(candidate: FrameCandidate, *, index: int, config: FrameSelecti
             "preserve_stationary_frames": True,
             "densify_frame_gaps": bool(config.densify_frame_gaps),
             "renderer_frame_indices": list(range(len(window_indices))),
+            "target_renderer_frame_index": int(config.past_frames),
         },
     }
 
@@ -965,6 +1243,9 @@ def _selection_summary(
     target_count: int,
     bucket_targets: Mapping[str, int],
     action_targets: Mapping[str, int],
+    available_navigation_signal_episode_counts: Mapping[str, int],
+    selected_navigation_signal_episode_counts: Mapping[str, int],
+    selected_interest_navigation_signal_episode_counts: Mapping[str, int],
     config: FrameSelectionConfig,
 ) -> JsonDict:
     selected_bucket_counts = _count_by(selected, lambda candidate: candidate.target_bucket)
@@ -1007,6 +1288,18 @@ def _selection_summary(
         selected,
         lambda candidate: candidate.mission_families,
     )
+    available_navigation_signal_counts = _count_memberships(
+        candidates,
+        lambda candidate: candidate.navigation_signals,
+    )
+    selected_navigation_signal_counts = _count_memberships(
+        selected,
+        lambda candidate: candidate.navigation_signals,
+    )
+    selected_interest_navigation_signal_counts = _count_memberships(
+        selected_interest,
+        lambda candidate: candidate.navigation_signals,
+    )
     selected_targets_per_source_path = _count_by(
         selected,
         lambda candidate: _candidate_job_key(candidate),
@@ -1047,6 +1340,18 @@ def _selection_summary(
         "selected_window_action_ratios": _count_ratios(selected_window_action_counts),
         "selected_unique_window_action_ratios": _count_ratios(selected_unique_window_action_counts),
         "selected_mission_family_counts": selected_mission_family_counts,
+        "available_navigation_signal_counts": available_navigation_signal_counts,
+        "selected_navigation_signal_counts": selected_navigation_signal_counts,
+        "selected_interest_navigation_signal_counts": selected_interest_navigation_signal_counts,
+        "available_navigation_signal_episode_counts": dict(
+            available_navigation_signal_episode_counts
+        ),
+        "selected_navigation_signal_episode_counts": dict(
+            selected_navigation_signal_episode_counts
+        ),
+        "selected_interest_navigation_signal_episode_counts": dict(
+            selected_interest_navigation_signal_episode_counts
+        ),
         "selected_targets_per_source_path": selected_targets_per_source_path,
         "bucket_deficits": {
             bucket: max(
@@ -1259,10 +1564,12 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "source_frame_indices": source_indices,
         "target_frame": chunk.get("target_frame"),
         "target_source_frame_id": chunk.get("target_source_frame_id"),
+        "target_window_index": chunk.get("target_window_index"),
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
         "target_navigation": dict(chunk.get("target_navigation", {})),
+        "navigation_signals": list(chunk.get("navigation_signals", [])),
         "target_role": chunk.get("target_role"),
         "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
         "preserve_frame_samples": True,
@@ -1278,6 +1585,7 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "sample_index_range": [0, len(selected_points) - 1] if selected_points else None,
         "source_frame_indices": source_indices,
         "target_frame": chunk.get("target_frame"),
+        "target_window_index": chunk.get("target_window_index"),
         "trajectory_path": "camera.trajectory",
         "point_supervision_path": "camera.trajectory[*].metadata.navigation",
         "preserve_stationary_samples": True,
@@ -1298,10 +1606,12 @@ def _windowed_job(source_job: Mapping[str, Any], chunk: Mapping[str, Any]) -> Js
         "source_job_id": chunk.get("source_job_id"),
         "target_frame": chunk.get("target_frame"),
         "target_source_frame_id": chunk.get("target_source_frame_id"),
+        "target_window_index": chunk.get("target_window_index"),
         "target_time_s": chunk.get("target_time_s"),
         "target_action_name": chunk.get("target_action_name"),
         "target_bucket": chunk.get("target_bucket"),
         "target_navigation": dict(chunk.get("target_navigation", {})),
+        "navigation_signals": list(chunk.get("navigation_signals", [])),
         "target_role": chunk.get("target_role"),
         "mandatory_anchor_types": list(chunk.get("mandatory_anchor_types", [])),
         "window_action_counts": dict(chunk.get("window_action_counts", {})),
@@ -1450,7 +1760,22 @@ def _mandatory_anchor_indices(
         if anchor_type not in labels:
             labels.append(anchor_type)
 
+    def add_index(index: int, anchor_type: str) -> None:
+        labels = anchors.setdefault(int(index), [])
+        if anchor_type not in labels:
+            labels.append(anchor_type)
+
     anchors[len(trajectory) - 1] = ["trajectory_end"]
+    stop_episode_end: int | None = None
+    for index in range(len(trajectory)):
+        if _action_name(trajectory, index) == "stop":
+            stop_episode_end = index
+            continue
+        if stop_episode_end is not None:
+            add_index(stop_episode_end, "stopping_point")
+            stop_episode_end = None
+    if stop_episode_end is not None:
+        add_index(stop_episode_end, "stopping_point")
     assigned_mission_ids = {
         str(item) for item in job.get("assigned_mission_ids", []) if str(item)
     }
@@ -1464,7 +1789,19 @@ def _mandatory_anchor_indices(
         if not isinstance(event, Mapping) or event.get("t") is None:
             continue
         event_type = str(event.get("event_type") or "").lower().replace("-", "_")
-        if not any(token in event_type for token in ("completion", "complete", "robot_eos", "mission_end", "section_end")):
+        if not any(
+            token in event_type
+            for token in (
+                "completion",
+                "complete",
+                "robot_eos",
+                "mission_end",
+                "section_end",
+                "checkpoint",
+                "route_end",
+                "sub_mission_end",
+            )
+        ):
             continue
         mission_id = str(event.get("mission_id") or "")
         if assigned_mission_ids and mission_id and mission_id not in assigned_mission_ids:
@@ -1503,14 +1840,14 @@ def _mandatory_anchor_indices(
 
 
 def _bucket_scores(
-    manifest: Mapping[str, Any],
-    job: Mapping[str, Any],
     trajectory: Sequence[Mapping[str, Any]],
     frame_index: int,
-    humans: Sequence[Mapping[str, Any]],
     *,
     event_times: Sequence[float],
     target_action_name: str,
+    navigation_signals: Sequence[str],
+    human_min: float | None,
+    peer_min: float | None,
 ) -> JsonDict:
     point = trajectory[frame_index]
     time_s = _point_time(point, frame_index)
@@ -1519,8 +1856,7 @@ def _bucket_scores(
     decision = navigation.get("decision") if isinstance(navigation.get("decision"), Mapping) else {}
     decision_reason = str(decision.get("primary_reason") or "")
     section_type = str(navigation.get("instruction_section_type") or "")
-    human_min = _min_actor_distance(position, time_s, humans)
-    peer_min = _min_peer_distance(position, time_s, job)
+    navigation_signal_set = set(navigation_signals)
     turn_delta = abs(_turn_delta(trajectory, frame_index))
     event_score = _event_proximity_score(time_s, event_times)
     stop_transition_score = _stop_transition_score(trajectory, frame_index)
@@ -1538,7 +1874,7 @@ def _bucket_scores(
         event_score,
     )
     if decision_reason in {"HUMAN_COLLISION_AVOIDANCE", "ROBOT_COLLISION_AVOIDANCE"}:
-        critical_margin = max(critical_margin, 0.95)
+        critical_margin = max(critical_margin, 0.98)
     if decision_reason in {
         "L2_PEDESTRIAN_YIELD",
         "HUMAN_GUIDANCE_APPROACH",
@@ -1548,8 +1884,30 @@ def _bucket_scores(
         human_interaction = max(human_interaction, 0.90)
     elif decision_reason.startswith(("L1_", "L3_", "L4_")):
         human_interaction = max(human_interaction, 0.65)
-    if section_type == "turn":
-        route_decision = max(route_decision, 0.85)
+    if "relevant_human_visible" in navigation_signal_set:
+        human_interaction = max(human_interaction, 0.75)
+    if "target_human_visible" in navigation_signal_set:
+        human_interaction = max(human_interaction, 0.82)
+    if "social_law_decision" in navigation_signal_set:
+        human_interaction = max(human_interaction, 0.72)
+    if "human_interaction_decision" in navigation_signal_set:
+        human_interaction = max(human_interaction, 0.90)
+    if "traffic_wait" in navigation_signal_set:
+        human_interaction = max(human_interaction, 0.78)
+    if "route_deviation" in navigation_signal_set:
+        critical_margin = max(critical_margin, 0.90)
+    if "planned_execution_mismatch" in navigation_signal_set:
+        critical_margin = max(critical_margin, 0.85)
+    if section_type == "turn" or "instruction_turn" in navigation_signal_set:
+        route_decision = max(route_decision, 0.90)
+    if "semantic_stop" in navigation_signal_set:
+        route_decision = max(route_decision, 0.88)
+    if "instruction_section_boundary" in navigation_signal_set:
+        route_decision = max(route_decision, 0.82)
+    if "room_transition" in navigation_signal_set:
+        route_decision = max(route_decision, 0.95)
+    if "mission_endpoint" in navigation_signal_set:
+        route_decision = max(route_decision, 0.92)
     representative = 0.25
     if target_action_name == "move":
         representative += 0.20
@@ -1581,6 +1939,7 @@ def _candidate_reasons(
     target_bucket: str,
     bucket_scores: Mapping[str, float],
     action_name: str,
+    navigation_signals: Sequence[str],
 ) -> tuple[str, ...]:
     reasons = [target_bucket]
     if float(bucket_scores.get("critical_margin", 0.0)) >= 0.55:
@@ -1589,8 +1948,87 @@ def _candidate_reasons(
         reasons.append("near_human_or_target_actor")
     if float(bucket_scores.get("route_decision", 0.0)) >= 0.55:
         reasons.append("turn_stop_transition_or_event")
+    reasons.extend(f"navigation:{signal}" for signal in navigation_signals)
     reasons.append(f"action:{action_name}")
     return tuple(dict.fromkeys(reasons))
+
+
+def _navigation_signals(
+    trajectory: Sequence[Mapping[str, Any]],
+    frame_index: int,
+) -> tuple[str, ...]:
+    navigation = _point_navigation(trajectory[frame_index])
+    previous_navigation = (
+        _point_navigation(trajectory[frame_index - 1]) if frame_index > 0 else {}
+    )
+    signals: list[str] = []
+    section_type = str(navigation.get("instruction_section_type") or "")
+    if section_type == "turn":
+        signals.append("instruction_turn")
+    elif section_type == "stop":
+        signals.append("semantic_stop")
+
+    section_id = str(navigation.get("instruction_section_id") or "")
+    previous_section_id = str(previous_navigation.get("instruction_section_id") or "")
+    if frame_index > 0 and section_id and section_id != previous_section_id:
+        signals.append("instruction_section_boundary")
+
+    room = navigation.get("current_room")
+    room = room if isinstance(room, Mapping) else {}
+    previous_room = previous_navigation.get("current_room")
+    previous_room = previous_room if isinstance(previous_room, Mapping) else {}
+    room_id = str(room.get("room_id") or "")
+    previous_room_id = str(previous_room.get("room_id") or "")
+    if frame_index > 0 and room_id != previous_room_id and (room_id or previous_room_id):
+        signals.append("room_transition")
+
+    decision = navigation.get("decision")
+    decision = decision if isinstance(decision, Mapping) else {}
+    decision_reason = str(decision.get("primary_reason") or "")
+    secondary_reasons = decision.get("secondary_reasons")
+    decision_reasons = [decision_reason]
+    if isinstance(secondary_reasons, Sequence) and not isinstance(secondary_reasons, (str, bytes)):
+        decision_reasons.extend(str(reason) for reason in secondary_reasons)
+    if decision_reason in {"HUMAN_COLLISION_AVOIDANCE", "ROBOT_COLLISION_AVOIDANCE"}:
+        signals.append("collision_avoidance")
+    if any(reason.startswith(("L1_", "L2_", "L3_", "L4_")) for reason in decision_reasons):
+        signals.append("social_law_decision")
+    if decision_reason in {
+        "HUMAN_GUIDANCE_APPROACH",
+        "HUMAN_GUIDANCE_CONVERSATION",
+        "TARGET_HUMAN_APPROACH",
+    }:
+        signals.append("human_interaction_decision")
+    if decision_reason == "TRAFFIC_RESERVATION_WAIT":
+        signals.append("traffic_wait")
+    if decision_reason == "MISSION_ENDPOINT_STOP":
+        signals.append("mission_endpoint")
+
+    visible_human_ids = navigation.get("visible_human_ids")
+    if (
+        isinstance(visible_human_ids, Sequence)
+        and not isinstance(visible_human_ids, (str, bytes))
+        and any(str(human_id) for human_id in visible_human_ids)
+    ):
+        signals.append("relevant_human_visible")
+
+    target_human = navigation.get("target_human")
+    target_human = target_human if isinstance(target_human, Mapping) else {}
+    visibility = str(target_human.get("visibility") or "")
+    if visibility in {"geometry_estimated_visible", "render_verified_visible", "seen"}:
+        signals.append("target_human_visible")
+
+    try:
+        deviation_m = float(navigation.get("deviation_from_planned_route_m") or 0.0)
+    except (TypeError, ValueError):
+        deviation_m = 0.0
+    if deviation_m >= 0.25:
+        signals.append("route_deviation")
+    planned_action = str(navigation.get("planned_action") or "")
+    executed_action = str(navigation.get("executed_action") or "")
+    if planned_action and executed_action and planned_action != executed_action:
+        signals.append("planned_execution_mismatch")
+    return tuple(dict.fromkeys(signals))
 
 
 def _action_name(trajectory: Sequence[Mapping[str, Any]], frame_index: int) -> str:
@@ -1677,32 +2115,15 @@ def _event_proximity_score(time_s: float, event_times: Sequence[float]) -> float
     return _clamp01((2.0 - nearest) / 2.0)
 
 
-def _min_actor_distance(
+def _min_track_distance(
     position: tuple[float, float, float],
     time_s: float,
-    actors: Sequence[Mapping[str, Any]],
+    tracks: Sequence[Sequence[tuple[float, tuple[float, float, float]]]],
 ) -> float | None:
     distances: list[float] = []
-    for actor in actors:
-        actor_position = _position_at_time(actor.get("trajectory", []), time_s, fallback=actor.get("start_pose"))
-        if actor_position is None:
-            continue
+    for track in tracks:
+        actor_position = _position_from_samples(track, time_s)
         distances.append(math.dist(position[:2], actor_position[:2]))
-    return min(distances) if distances else None
-
-
-def _min_peer_distance(
-    position: tuple[float, float, float],
-    time_s: float,
-    job: Mapping[str, Any],
-) -> float | None:
-    distances: list[float] = []
-    for track in job.get("peer_robot_pose_tracks", []):
-        if not isinstance(track, Mapping):
-            continue
-        peer_position = _position_at_time(track.get("trajectory", []), time_s)
-        if peer_position is not None:
-            distances.append(math.dist(position[:2], peer_position[:2]))
     return min(distances) if distances else None
 
 
@@ -1712,27 +2133,58 @@ def _position_at_time(
     *,
     fallback: Any = None,
 ) -> tuple[float, float, float] | None:
-    points = [point for point in trajectory if isinstance(point, Mapping)] if isinstance(trajectory, list) else []
+    samples = _position_samples(trajectory, fallback=fallback)
+    if not samples:
+        return None
+    return _position_from_samples(samples, time_s)
+
+
+def _position_samples(
+    trajectory: Any,
+    *,
+    fallback: Any = None,
+) -> list[tuple[float, tuple[float, float, float]]]:
+    points = (
+        [point for point in trajectory if isinstance(point, Mapping)]
+        if isinstance(trajectory, list)
+        else []
+    )
     if not points:
         if isinstance(fallback, Mapping):
-            return (
-                float(fallback.get("x", 0.0) or 0.0),
-                float(fallback.get("y", 0.0) or 0.0),
-                0.0,
-            )
-        return None
-    samples = sorted((_point_time(point, index), _point_position(point)) for index, point in enumerate(points))
+            return [
+                (
+                    0.0,
+                    (
+                        float(fallback.get("x", 0.0) or 0.0),
+                        float(fallback.get("y", 0.0) or 0.0),
+                        float(fallback.get("z", 0.0) or 0.0),
+                    ),
+                )
+            ]
+        return []
+    return sorted(
+        (_point_time(point, index), _point_position(point))
+        for index, point in enumerate(points)
+    )
+
+
+def _position_from_samples(
+    samples: Sequence[tuple[float, tuple[float, float, float]]],
+    time_s: float,
+) -> tuple[float, float, float]:
     if float(time_s) <= samples[0][0]:
         return samples[0][1]
     if float(time_s) >= samples[-1][0]:
         return samples[-1][1]
-    for index in range(len(samples) - 1):
-        t0, p0 = samples[index]
-        t1, p1 = samples[index + 1]
-        if t0 <= float(time_s) <= t1:
-            alpha = (float(time_s) - t0) / max(t1 - t0, 1e-6)
-            return tuple(float(p0[axis] + (p1[axis] - p0[axis]) * alpha) for axis in range(3))  # type: ignore[return-value]
-    return samples[-1][1]
+    right = bisect_left(samples, float(time_s), key=lambda item: item[0])
+    left = max(0, right - 1)
+    t0, p0 = samples[left]
+    t1, p1 = samples[right]
+    alpha = (float(time_s) - t0) / max(t1 - t0, 1e-6)
+    return tuple(
+        float(p0[axis] + (p1[axis] - p0[axis]) * alpha)
+        for axis in range(3)
+    )  # type: ignore[return-value]
 
 
 def _distance_score(value: float | None, *, close: float, far: float) -> float:
@@ -1791,6 +2243,65 @@ def _count_memberships(items: Sequence[Any], key_fn) -> JsonDict:
             key = str(raw_key)
             counts[key] = counts.get(key, 0) + 1
     return dict(sorted(counts.items()))
+
+
+def _navigation_signal_episode_coverage(
+    candidates: Sequence[FrameCandidate],
+    selected: Sequence[FrameCandidate],
+) -> tuple[JsonDict, JsonDict, JsonDict]:
+    selected_keys = {candidate.stable_key for candidate in selected}
+    selected_interest_keys = {
+        candidate.stable_key
+        for candidate in selected
+        if not candidate.mandatory_anchor_types
+    }
+    memberships = sorted(
+        (
+            candidate.manifest_index,
+            candidate.job_id,
+            signal,
+            candidate.source_frame_index,
+            candidate.stable_key,
+        )
+        for candidate in candidates
+        for signal in candidate.navigation_signals
+    )
+    available: Counter[str] = Counter()
+    selected_covered: Counter[str] = Counter()
+    selected_interest_covered: Counter[str] = Counter()
+    episode_key: tuple[int, str, str] | None = None
+    previous_frame: int | None = None
+    episode_selected = False
+    episode_interest_selected = False
+
+    def finish_episode() -> None:
+        if episode_key is None:
+            return
+        signal = episode_key[2]
+        available[signal] += 1
+        if episode_selected:
+            selected_covered[signal] += 1
+        if episode_interest_selected:
+            selected_interest_covered[signal] += 1
+
+    for manifest_index, job_id, signal, frame_index, stable_key in memberships:
+        key = (manifest_index, job_id, signal)
+        if key != episode_key or previous_frame is None or frame_index != previous_frame + 1:
+            finish_episode()
+            episode_key = key
+            episode_selected = False
+            episode_interest_selected = False
+        episode_selected = episode_selected or stable_key in selected_keys
+        episode_interest_selected = (
+            episode_interest_selected or stable_key in selected_interest_keys
+        )
+        previous_frame = frame_index
+    finish_episode()
+    return (
+        dict(sorted(available.items())),
+        dict(sorted(selected_covered.items())),
+        dict(sorted(selected_interest_covered.items())),
+    )
 
 
 def _count_ratios(counts: Mapping[str, int]) -> JsonDict:

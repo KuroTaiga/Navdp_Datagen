@@ -43,6 +43,21 @@ ROLE_COLORS = {
     "frame_of_interest": "#087E8B",
     "mandatory_anchor": "#C33C54",
 }
+NAVIGATION_SIGNAL_COLORS = {
+    "instruction_turn": "#6C5CE7",
+    "semantic_stop": "#C33C54",
+    "instruction_section_boundary": "#3F88C5",
+    "room_transition": "#087E8B",
+    "collision_avoidance": "#D1495B",
+    "social_law_decision": "#E07A3F",
+    "human_interaction_decision": "#2A9D5B",
+    "traffic_wait": "#D99000",
+    "mission_endpoint": "#7A5195",
+    "relevant_human_visible": "#4D908E",
+    "target_human_visible": "#277DA1",
+    "route_deviation": "#B56576",
+    "planned_execution_mismatch": "#8C564B",
+}
 
 
 @dataclass(frozen=True)
@@ -52,6 +67,7 @@ class PathSeries:
     target_bucket: str | None = None
     target_action: str | None = None
     target_frame: int | None = None
+    target_window_index: int | None = None
     target_role: str | None = None
 
 
@@ -71,6 +87,10 @@ class FamilyVisualization:
     selected_actions: Mapping[str, int]
     retained_window_actions: Mapping[str, int]
     selected_roles: Mapping[str, int]
+    available_navigation_signals: Mapping[str, int]
+    selected_navigation_signals: Mapping[str, int]
+    available_navigation_signal_episodes: Mapping[str, int]
+    selected_interest_navigation_signal_episodes: Mapping[str, int]
 
 
 def _parse_args() -> argparse.Namespace:
@@ -152,6 +172,8 @@ def _family_data(
     family = str(record["mission_family"])
     family_root = pilot_root / _safe_id(family)
     selection = _read_json(family_root / "selection.json")
+    selection_config = selection.get("config", {})
+    selection_config = selection_config if isinstance(selection_config, Mapping) else {}
     selected_source_job_ids = {
         str(item.get("source_job_id"))
         for item in selection.get("distribution", {})
@@ -202,6 +224,9 @@ def _family_data(
             frame_selection = job.get("frame_selection", {})
             frame_selection = frame_selection if isinstance(frame_selection, Mapping) else {}
             target_frame = frame_selection.get("target_source_frame_id")
+            target_window_index = frame_selection.get("target_window_index")
+            if target_window_index is None:
+                target_window_index = selection_config.get("past_frames")
             selected_paths.append(
                 PathSeries(
                     str(job.get("job_id", "selected_window")),
@@ -209,6 +234,9 @@ def _family_data(
                     target_bucket=str(frame_selection.get("target_bucket", "unknown")),
                     target_action=str(frame_selection.get("target_action_name", "unknown")),
                     target_frame=int(target_frame) if target_frame is not None else None,
+                    target_window_index=(
+                        int(target_window_index) if target_window_index is not None else None
+                    ),
                     target_role=str(frame_selection.get("target_role", "frame_of_interest")),
                 )
             )
@@ -237,6 +265,18 @@ def _family_data(
             "frame_of_interest": max(0, selected_count - mandatory_count),
             "mandatory_anchor": mandatory_count,
         },
+        available_navigation_signals=dict(
+            distribution.get("available_navigation_signal_counts", {})
+        ),
+        selected_navigation_signals=dict(
+            summary.get("selected_navigation_signal_counts", {})
+        ),
+        available_navigation_signal_episodes=dict(
+            distribution.get("available_navigation_signal_episode_counts", {})
+        ),
+        selected_interest_navigation_signal_episodes=dict(
+            summary.get("selected_interest_navigation_signal_episode_counts", {})
+        ),
     )
 
 
@@ -314,7 +354,12 @@ def _draw_bev(ax: plt.Axes, family: FamilyVisualization, fraction: float) -> Non
                 zorder=5,
             )
         if fraction >= 1.0:
-            center = xy[len(xy) // 2]
+            target_index = (
+                int(series.target_window_index)
+                if series.target_window_index is not None
+                else len(xy) // 2
+            )
+            center = xy[min(max(0, target_index), len(xy) - 1)]
             is_anchor = series.target_role == "mandatory_anchor"
             ax.scatter(
                 center[0],
@@ -515,6 +560,126 @@ def write_distributions(families: Sequence[FamilyVisualization], output_root: Pa
     plt.close(fig)
 
 
+def write_navigation_signal_coverage(
+    families: Sequence[FamilyVisualization],
+    output_root: Path,
+) -> None:
+    categories = tuple(
+        signal
+        for signal in NAVIGATION_SIGNAL_COLORS
+        if any(
+            int(family.available_navigation_signals.get(signal, 0)) > 0
+            or int(family.selected_navigation_signals.get(signal, 0)) > 0
+            for family in families
+        )
+    )
+    if not categories:
+        return
+
+    fig_height = max(7.0, 0.42 * len(categories) + 3.0)
+    fig, axes = plt.subplots(1, 2, figsize=(17, fig_height), dpi=120)
+    fig.subplots_adjust(left=0.25, right=0.98, bottom=0.10, top=0.86, wspace=0.28)
+    y = np.arange(len(categories))
+    available = np.asarray(
+        [
+            sum(int(family.available_navigation_signals.get(signal, 0)) for family in families)
+            for signal in categories
+        ],
+        dtype=float,
+    )
+    selected = np.asarray(
+        [
+            sum(int(family.selected_navigation_signals.get(signal, 0)) for family in families)
+            for signal in categories
+        ],
+        dtype=float,
+    )
+    colors = [NAVIGATION_SIGNAL_COLORS[signal] for signal in categories]
+
+    axes[0].barh(y, available, color=colors, alpha=0.32, label="Eligible centers")
+    axes[0].barh(y, selected, color=colors, alpha=0.95, label="All selected centers")
+    axes[0].set_xscale("log")
+    axes[0].set_xlabel("Center count (log scale)")
+    axes[0].set_title("Navigation-signal populations", loc="left", fontweight="bold")
+    axes[0].legend(frameon=False)
+
+    available_episodes = np.asarray(
+        [
+            sum(
+                int(family.available_navigation_signal_episodes.get(signal, 0))
+                for family in families
+            )
+            for signal in categories
+        ],
+        dtype=float,
+    )
+    selected_interest_episodes = np.asarray(
+        [
+            sum(
+                int(family.selected_interest_navigation_signal_episodes.get(signal, 0))
+                for family in families
+            )
+            for signal in categories
+        ],
+        dtype=float,
+    )
+    retention = np.divide(
+        selected_interest_episodes,
+        available_episodes,
+        out=np.zeros_like(selected_interest_episodes),
+        where=available_episodes > 0,
+    )
+    axes[1].barh(y, retention, color=colors)
+    axes[1].xaxis.set_major_formatter(matplotlib.ticker.PercentFormatter(1.0))
+    axes[1].set_xlabel("Episodes covered by scored POIs / eligible episodes")
+    axes[1].set_title("Distinct-event coverage", loc="left", fontweight="bold")
+    for index, (picked, total) in enumerate(
+        zip(selected_interest_episodes, available_episodes)
+    ):
+        axes[1].text(
+            min(1.0, retention[index]) + 0.01,
+            index,
+            f"{int(picked):,}/{int(total):,}",
+            va="center",
+            fontsize=8,
+            color="#49545E",
+        )
+    axes[1].set_xlim(0.0, max(0.1, float(retention.max()) * 1.30))
+
+    labels = [_pretty(signal) for signal in categories]
+    for ax in axes:
+        ax.set_yticks(y, labels)
+        ax.invert_yaxis()
+        ax.grid(axis="x", color="#D6DCE2", linewidth=0.7, alpha=0.8)
+        ax.set_axisbelow(True)
+        for spine in ("top", "right", "left"):
+            ax.spines[spine].set_visible(False)
+    axes[1].tick_params(axis="y", labelleft=False)
+    fig.suptitle(
+        "Metadata-grounded point-selection coverage",
+        x=0.25,
+        y=0.97,
+        ha="left",
+        fontsize=17,
+        fontweight="bold",
+    )
+    fig.text(
+        0.25,
+        0.925,
+        "Left: signal-bearing frames. Right: contiguous signal episodes covered by at least one scored POI.",
+        ha="left",
+        fontsize=10,
+        color="#49545E",
+    )
+    fig.savefig(
+        output_root / "navigation_signal_coverage.png",
+        dpi=150,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+    plt.close(fig)
+
+
 def main() -> int:
     args = _parse_args()
     pilot_root = args.pilot_root.resolve()
@@ -532,10 +697,13 @@ def main() -> int:
         for family in families:
             write_family_bev(family, output_root, args)
     write_distributions(families, output_root)
+    write_navigation_signal_coverage(families, output_root)
+    signal_graph = output_root / "navigation_signal_coverage.png"
     summary = {
         "ready_family_count": len(families),
         "combined_bev_gif": str(output_root / "all_mission_families_bev_sampling.gif"),
         "distribution_graphs": str(output_root / "sampling_distribution_graphs.png"),
+        "navigation_signal_graph": str(signal_graph) if signal_graph.is_file() else None,
         "per_family_output_root": str(output_root / "families") if args.per_family else None,
         "gaussian_rendering_executed": False,
     }
