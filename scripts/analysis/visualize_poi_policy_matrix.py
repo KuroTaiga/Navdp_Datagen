@@ -48,7 +48,11 @@ def _read(path: Path) -> JsonDict:
 
 
 def _pretty(value: str) -> str:
-    return value.replace("_", " ").replace(":", ": ").title()
+    return (
+        value.replace("_", " ").replace(":", ": ").title()
+        .replace("Poi", "POI")
+        .replace("Bev", "BEV")
+    )
 
 
 def _safe(value: str) -> str:
@@ -58,7 +62,9 @@ def _safe(value: str) -> str:
 def _write_action_graph(payload: Mapping[str, Any], output_dir: Path) -> None:
     experiments = payload["experiments"]
     populations = ("all_source_frames", "poi_centers", "independent_windows", "unique_retained_frames")
-    fig, axes = plt.subplots(len(experiments), 1, figsize=(13, 2.8 * len(experiments)), dpi=120)
+    single_policy = len(experiments) == 1
+    figure_height = 4.5 if single_policy else 2.8 * len(experiments)
+    fig, axes = plt.subplots(len(experiments), 1, figsize=(13, figure_height), dpi=120)
     axes = np.atleast_1d(axes)
     for ax, experiment in zip(axes, experiments):
         bottom = np.zeros(len(populations), dtype=float)
@@ -76,9 +82,28 @@ def _write_action_graph(payload: Mapping[str, Any], output_dir: Path) -> None:
         ax.grid(axis="x", alpha=0.2)
         ax.invert_yaxis()
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
-    fig.suptitle("Action distributions by policy and retained population", x=0.13, ha="left", fontsize=17, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    if single_policy:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=4,
+            frameon=False,
+        )
+        fig.suptitle(
+            "Action distributions by policy and retained population",
+            x=0.02,
+            y=0.99,
+            ha="left",
+            fontsize=17,
+            fontweight="bold",
+        )
+        fig.tight_layout(rect=(0, 0.14, 1, 0.88))
+    else:
+        fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
+        fig.suptitle("Action distributions by policy and retained population", x=0.13, ha="left", fontsize=17, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.95))
     fig.savefig(output_dir / "action_distributions.png", dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(fig)
 
@@ -259,18 +284,37 @@ def _write_representative(representative_path: Path, output_dir: Path, gif_fps: 
     target_dir = output_dir / "representatives" / name
     target_dir.mkdir(parents=True, exist_ok=True)
     experiments = tuple(representative["experiments"])
-    cols = 2
+    single_policy = len(experiments) == 1
+    cols = 1 if single_policy else 2
     rows = int(math.ceil(len(experiments) / cols))
-    fig, axes = plt.subplots(rows, cols, figsize=(14, 6 * rows), dpi=120)
+    fig, axes = plt.subplots(
+        rows,
+        cols,
+        figsize=((10, 8) if single_policy else (14, 6 * rows)),
+        dpi=120,
+    )
     axes = np.atleast_1d(axes).ravel()
     for ax, experiment in zip(axes, experiments):
         _draw_path(ax, representative, experiment)
     for ax in axes[len(experiments):]:
         ax.set_visible(False)
     handles, labels = axes[0].get_legend_handles_labels()
-    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
-    fig.suptitle(f"{cohort['family']} — {cohort['corpus']} / {cohort['scene']}", x=0.08, ha="left", fontsize=16, fontweight="bold")
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    title = f"{cohort['family']} — {cohort['corpus']} / {cohort['scene']}"
+    if single_policy:
+        fig.legend(
+            handles,
+            labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, 0.01),
+            ncol=2,
+            frameon=False,
+        )
+        fig.suptitle(title, x=0.04, y=0.99, ha="left", fontsize=16, fontweight="bold")
+        fig.tight_layout(rect=(0, 0.12, 1, 0.92))
+    else:
+        fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False)
+        fig.suptitle(title, x=0.08, ha="left", fontsize=16, fontweight="bold")
+        fig.tight_layout(rect=(0, 0, 1, 0.94))
     png_path = target_dir / "bev_policy_comparison.png"
     fig.savefig(png_path, dpi=160, bbox_inches="tight", facecolor="white")
     plt.close(fig)

@@ -22,6 +22,7 @@ from navdp_datagen.massgen.frame_selection import (  # noqa: E402
     DEFAULT_ACTION_RATIOS,
     DEFAULT_FUTURE_FRAMES,
     DEFAULT_PAST_FRAMES,
+    DEFAULT_SEMANTIC_EPISODE_POLICY,
     FrameSelectionConfig,
     select_frame_interest_windows,
 )
@@ -45,6 +46,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--scenes-per-family", type=int, default=25)
     parser.add_argument("--paths-per-scene", type=int, default=50)
     parser.add_argument("--scored-pois-per-source-path", type=int, default=2)
+    parser.add_argument(
+        "--semantic-episode-policy",
+        choices=["none", "guarantee_representative"],
+        default=DEFAULT_SEMANTIC_EPISODE_POLICY,
+    )
     parser.add_argument("--past-frames", type=int, default=DEFAULT_PAST_FRAMES)
     parser.add_argument("--future-frames", type=int, default=DEFAULT_FUTURE_FRAMES)
     parser.add_argument("--fps", type=float, default=10.0)
@@ -231,6 +237,7 @@ def _survey_scene(
             endpoint_window_policy="clamp",
             target_action_ratios=DEFAULT_ACTION_RATIOS,
             enforce_action_minimums=True,
+            semantic_episode_policy=str(args.semantic_episode_policy),
             seed=int(args.seed),
             split="survey",
         ),
@@ -466,6 +473,7 @@ def _write_report(payload: Mapping[str, Any], output_path: Path) -> None:
         f"- Random scene cohorts per family: up to `{config['scenes_per_family']}`.",
         f"- Random robot source paths per selected scene: up to `{config['paths_per_scene']}`.",
         f"- Scored POI budget: `{config['scored_pois_per_source_path']}` per sampled source path.",
+        f"- Semantic episode policy: `{config['semantic_episode_policy']}`.",
         f"- Scene survey workers: `{config['workers']}`.",
         "- Mandatory mission/checkpoint/path endpoints remain additive and are reported separately.",
         f"- Every selected center contributes `{config['past_frames']}` past frames plus the current frame "
@@ -651,6 +659,7 @@ def main() -> int:
             "scenes_per_family": int(args.scenes_per_family),
             "paths_per_scene": int(args.paths_per_scene),
             "scored_pois_per_source_path": int(args.scored_pois_per_source_path),
+            "semantic_episode_policy": str(args.semantic_episode_policy),
             "past_frames": int(args.past_frames),
             "future_frames": int(args.future_frames),
             "window_frame_count": int(args.past_frames) + 1 + int(args.future_frames),

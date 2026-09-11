@@ -50,6 +50,7 @@ DEFAULT_ACTION_RATIOS = {
     "turn_right": 0.15,
 }
 SEMANTIC_EPISODE_POLICIES = ("none", "guarantee_representative")
+DEFAULT_SEMANTIC_EPISODE_POLICY = "guarantee_representative"
 GUARANTEED_EPISODE_SIGNALS = (
     "instruction_turn",
     "semantic_stop",
@@ -85,7 +86,7 @@ class FrameSelectionConfig:
     action_deficit_weight: float = 0.35
     bucket_deficit_weight: float = 0.35
     enforce_action_minimums: bool = True
-    semantic_episode_policy: str = "none"
+    semantic_episode_policy: str = DEFAULT_SEMANTIC_EPISODE_POLICY
 
     @property
     def window_frame_count(self) -> int:
@@ -115,7 +116,7 @@ class FrameSelectionConfig:
             "bucket_deficit_weight": float(self.bucket_deficit_weight),
             "enforce_action_minimums": bool(self.enforce_action_minimums),
             "semantic_episode_policy": str(self.semantic_episode_policy),
-            "distribution_policy": "anchor_aware_semantic_center_balance/v0.4",
+            "distribution_policy": "anchor_aware_semantic_center_balance/v0.5",
         }
 
 

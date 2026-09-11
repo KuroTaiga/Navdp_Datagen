@@ -15,6 +15,7 @@ from navdp_datagen.massgen.frame_selection import (  # noqa: E402
     DEFAULT_FUTURE_FRAMES,
     DEFAULT_PAST_FRAMES,
     DEFAULT_SEED,
+    DEFAULT_SEMANTIC_EPISODE_POLICY,
 )
 from navdp_datagen.massgen.frame_selection_pilot import (  # noqa: E402
     MissionFamilyPilotConfig,
@@ -121,6 +122,12 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--endpoint-window-policy", choices=["reject", "clamp"], default="clamp")
     parser.add_argument(
+        "--semantic-episode-policy",
+        choices=["none", "guarantee_representative"],
+        default=DEFAULT_SEMANTIC_EPISODE_POLICY,
+        help="Event-aware by default; use none only for fixed-budget comparisons.",
+    )
+    parser.add_argument(
         "--max-source-paths",
         type=int,
         default=0,
@@ -179,6 +186,7 @@ def main() -> int:
         max_source_paths=int(args.max_source_paths),
         preserve_mission_endpoints=bool(args.preserve_mission_endpoints),
         endpoint_window_policy=str(args.endpoint_window_policy),
+        semantic_episode_policy=str(args.semantic_episode_policy),
         render_repo_root=args.render_repo_root,
     )
     manifest_paths = [*_manifest_paths(args), *_scenario_render_manifests(args)]

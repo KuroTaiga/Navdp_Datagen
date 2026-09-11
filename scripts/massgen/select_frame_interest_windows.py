@@ -15,6 +15,7 @@ from navdp_datagen.massgen.frame_selection import (  # noqa: E402
     DEFAULT_FUTURE_FRAMES,
     DEFAULT_PAST_FRAMES,
     DEFAULT_SEED,
+    DEFAULT_SEMANTIC_EPISODE_POLICY,
     FrameSelectionConfig,
     apply_frame_selection_to_manifest,
     load_json,
@@ -118,10 +119,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--semantic-episode-policy",
         choices=["none", "guarantee_representative"],
-        default="none",
+        default=DEFAULT_SEMANTIC_EPISODE_POLICY,
         help=(
-            "Optional adaptive experiment: retain sparse scored representatives for "
-            "important contiguous semantic episodes. The production default is none."
+            "Retain sparse scored representatives for important contiguous semantic "
+            "episodes. Use none only for fixed-budget comparison experiments."
         ),
     )
     parser.add_argument("--json", action="store_true", help="Print the selection summary as JSON.")

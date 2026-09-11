@@ -324,11 +324,13 @@ def test_event_aware_policy_adapts_budget_to_sparse_episode_representatives(
             preserve_mission_endpoints=False,
             min_target_spacing_frames=16,
             target_action_ratios={"move": 1.0},
-            semantic_episode_policy="guarantee_representative",
         ),
     )
 
     assert selection["config"]["semantic_episode_policy"] == "guarantee_representative"
+    assert selection["config"]["distribution_policy"] == (
+        "anchor_aware_semantic_center_balance/v0.5"
+    )
     assert selection["distribution"]["guaranteed_episode_representative_count"] == 2
     assert selection["selection_summary"]["requested_target_count"] == 1
     assert selection["selection_summary"]["selected_interest_target_count"] == 2
@@ -730,6 +732,7 @@ def test_empty_family_pilot_records_remote_source_wait_state(tmp_path: Path) -> 
     assert plan["status"] == "waiting_for_sources"
     assert plan["execution_authorized"] is False
     assert plan["remote_sources_connected"] is False
+    assert plan["config"]["semantic_episode_policy"] == "guarantee_representative"
     assert plan["summary"]["family_count"] == len(ACTIVE_MASS_MISSION_FAMILIES)
     assert plan["summary"]["status_counts"] == {
         "waiting_for_source_manifest": len(ACTIVE_MASS_MISSION_FAMILIES)

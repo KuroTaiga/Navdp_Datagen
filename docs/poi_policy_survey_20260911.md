@@ -2,25 +2,22 @@
 
 ## Decision
 
-Use `anchor_aware_semantic_center_balance/v0.4` with an average global budget of
-four scored POIs per selected source path, plus all mandatory anchors, for the
-first production render pass. Keep `semantic_episode_policy=none` for that
-pass. This is the best tested operating point for the current renderer, which
-materializes every 33-frame window independently.
+Use event-aware `anchor_aware_semantic_center_balance/v0.5` as the canonical
+production selection policy. Preserve every sparse semantic-episode
+representative plus all mandatory anchors; do not replace semantic recall with
+an artificial fixed number of POIs per path.
 
-Do not use the two-POI setting as the production budget. It remains a baseline.
-Do not use the full `guarantee_representative` event-aware policy for bulk
-rendering yet: it is the semantic-recall upper bound, but it creates excessive
-overlapping window volume. Preserve it as an opt-in metadata/export policy and
-as the reference for the next selective-event experiment.
+The fixed budgets remain comparison baselines. Because the current renderer
+materializes every 33-frame window independently, event-aware production runs
+should render/cache each unique source frame once and reference it from every
+selected causal window. Until that optimization is available, use the
+renderer-independent selection manifest to schedule bounded shards without
+discarding the canonical semantic selection.
 
-The next policy experiment should start from budget four and add guaranteed
-representatives for the rare, decision-critical episode classes: traffic waits,
-collision avoidance, human-interaction decisions, route deviations, instruction
-turns, and target-human visibility. It should not blanket-guarantee every
-instruction-section boundary or planned-execution-mismatch episode. Target at
-most roughly eight scored POIs per path on average, without a per-path or
-per-action cap, and measure the result on the same deterministic cohort sample.
+The next storage experiment should measure unique-frame caching and referenced
+window packaging for the same event-aware manifest. If additional tiers are
+introduced later, they must remain explicit downstream render priorities rather
+than deleting semantic representatives from the canonical selection metadata.
 
 ## Survey Scope
 

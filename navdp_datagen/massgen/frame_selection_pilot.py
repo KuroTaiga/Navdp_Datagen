@@ -10,6 +10,7 @@ from navdp_datagen.massgen.frame_selection import (
     DEFAULT_FUTURE_FRAMES,
     DEFAULT_PAST_FRAMES,
     DEFAULT_SEED,
+    DEFAULT_SEMANTIC_EPISODE_POLICY,
     FrameSelectionConfig,
     apply_frame_selection_to_manifest,
     load_json,
@@ -49,6 +50,7 @@ class MissionFamilyPilotConfig:
     max_source_paths: int = 0
     preserve_mission_endpoints: bool = True
     endpoint_window_policy: str = "clamp"
+    semantic_episode_policy: str = DEFAULT_SEMANTIC_EPISODE_POLICY
     render_repo_root: str | Path | None = None
 
     @property
@@ -106,6 +108,7 @@ def prepare_mission_family_pilot(
             "max_source_paths": int(config.max_source_paths),
             "preserve_mission_endpoints": bool(config.preserve_mission_endpoints),
             "endpoint_window_policy": str(config.endpoint_window_policy),
+            "semantic_episode_policy": str(config.semantic_episode_policy),
             "render_repo_root": str(
                 Path(config.render_repo_root).resolve()
                 if config.render_repo_root is not None
@@ -227,6 +230,7 @@ def _prepare_family(
         target_bucket_ratios=config.target_bucket_ratios,
         target_action_ratios=dict(config.target_action_ratios or DEFAULT_ACTION_RATIOS),
         action_deficit_weight=float(config.action_deficit_weight),
+        semantic_episode_policy=str(config.semantic_episode_policy),
     )
     selection = select_frame_interest_windows(
         family_manifests,

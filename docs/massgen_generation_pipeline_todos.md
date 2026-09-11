@@ -285,6 +285,8 @@ Remaining:
   budgets 2/4/8 against sparse adaptive semantic-episode representatives, with
   compressed renderer-independent selection manifests and BEV/statistical
   visualization inputs.
+- [x] Make sparse event-aware episode representatives the canonical selection
+  default; retain fixed budgets only as explicit comparison/ablation policies.
 - [x] Add `scripts/massgen/prepare_frame_selection_family_pilot.py` to prepare
   non-executing selections, selected render manifests, acceptance criteria, and
   plan/execute command arrays for every active family.

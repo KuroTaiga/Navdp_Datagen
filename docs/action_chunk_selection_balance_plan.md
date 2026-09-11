@@ -58,7 +58,7 @@ Primary references:
 
 ## Default Distribution Policy
 
-Implemented policy: `anchor_aware_semantic_center_balance/v0.4`.
+Implemented policy: `anchor_aware_semantic_center_balance/v0.5`.
 
 Primary interest buckets:
 
@@ -131,7 +131,7 @@ position, time, and wrapped yaw across those frame-id gaps before applying the
 metadata. `--no-densify-frame-gaps` is available only for compatibility audits.
 
 Score components include actor/robot proximity, event proximity, stop/turn
-transitions, turn magnitude, and representative clean-motion coverage. The v0.4
+transitions, turn magnitude, and representative clean-motion coverage. The v0.5
 policy also derives the following auditable navigation signals from Pathplanner
 metadata:
 
@@ -150,12 +150,13 @@ and contiguous per-path signal episodes, plus the number of distinct episodes
 covered by at least one scored POI. Episode coverage prevents a long stop or
 avoidance interval from being misread as many independent events.
 
-The production default does not force semantic-episode coverage. The opt-in
-`guarantee_representative` experiment chooses one scored apex per important
+The production default uses `guarantee_representative` and chooses one scored
+apex per important
 contiguous episode. A long episode receives approach or completion centers only
 when its action, instruction, room, decision reason, or visible-human context
 changes. This is intentionally an adaptive global budget rather than a per-path
-or per-action cap.
+or per-action cap. `semantic_episode_policy=none` remains available only for
+fixed-budget comparisons and ablations.
 
 ## Selection Algorithm
 
@@ -194,7 +195,7 @@ No per-path action maximum is imposed.
     "past_frames": 32,
     "future_frames": 0,
     "window_frame_count": 33,
-    "distribution_policy": "anchor_aware_semantic_center_balance/v0.4"
+    "distribution_policy": "anchor_aware_semantic_center_balance/v0.5"
   },
   "distribution": {
     "target_bucket_ratios": {

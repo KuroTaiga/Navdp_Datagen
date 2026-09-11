@@ -127,6 +127,11 @@ export and rendering. It chooses target frames for training/testing, expands
 each selected target to the required `32 past + current` window, and passes only
 those window jobs to the renderer. Future frames are not packaged.
 
+The canonical v0.5 selector is event-aware: it keeps sparse representatives of
+important contiguous semantic episodes and all mandatory anchors. Fixed target
+budgets remain available only for controlled comparisons; they are not a
+per-path cap and do not replace the canonical semantic selection.
+
 Selection manifests use schema `navdp_frame_interest_selection/v0.1` and store:
 
 - source manifest records and fingerprints;
